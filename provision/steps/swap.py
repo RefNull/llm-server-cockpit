@@ -135,10 +135,20 @@ def _generate_config(host_profile: dict[str, Any], models: dict[str, Any]) -> st
     return yaml.safe_dump(config, sort_keys=False)
 
 
-def _install_unit(repo_root: Path, binary_path: Path, config_path: Path, listen_addr: str, runner: Runner) -> bool:
+def _install_unit(repo_root: Path, binary_path: Path, config_path: Path, listen_addr: str, host_profile: dict[str, Any], runner: Runner) -> bool:
+    service = host_profile.get("service", {})
+    restart_policy = service.get("restart_policy", "on-failure")
+    restart_sec = service.get("restart_sec", 5)
+
     tmpl_path = repo_root / "systemd" / "llama-swap.service.tmpl"
     template = Template(tmpl_path.read_text())
-    content = template.substitute(binary_path=str(binary_path), config_path=str(config_path), listen_addr=listen_addr)
+    content = template.substitute(
+        binary_path=str(binary_path),
+        config_path=str(config_path),
+        listen_addr=listen_addr,
+        restart_policy=restart_policy,
+        restart_sec=str(restart_sec),
+    )
 
     existing = _UNIT_PATH.read_text() if _UNIT_PATH.exists() else None
     unit_changed = existing != content
@@ -151,6 +161,68 @@ def _install_unit(repo_root: Path, binary_path: Path, config_path: Path, listen_
 def _is_active(unit: str) -> bool:
     result = subprocess.run(["systemctl", "is-active", unit], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     return result.returncode == 0 and result.stdout.strip() == "active"
+
+
+def _is_enabled(unit: str) -> bool:
+    result = subprocess.run(["systemctl", "is-enabled", unit], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    return result.returncode == 0 and result.stdout.strip() == "enabled"
+
+
+def _sync_timer_pair(
+    name: str,
+    service_content: str,
+    timer_content: str,
+    enabled: bool,
+    runner: Runner,
+) -> None:
+    """Install/remove a <name>.service + <name>.timer pair as one unit, driven by a single
+    `enabled` flag — used for both scheduled restart and scheduled update-check, which are
+    identical in shape (a oneshot service triggered by a timer, toggled on/off as a pair).
+    """
+    service_path = Path(f"/etc/systemd/system/{name}.service")
+    timer_path = Path(f"/etc/systemd/system/{name}.timer")
+    timer_unit = f"{name}.timer"
+
+    if not enabled:
+        if _is_enabled(timer_unit) or _is_active(timer_unit):
+            log.info("swap: disabling %s (scheduled feature turned off)", timer_unit)
+            runner.run(["systemctl", "disable", "--now", timer_unit], check=False)
+        return
+
+    existing_service = service_path.read_text() if service_path.exists() else None
+    existing_timer = timer_path.read_text() if timer_path.exists() else None
+    changed = existing_service != service_content or existing_timer != timer_content
+
+    runner.write_file(service_path, service_content)
+    runner.write_file(timer_path, timer_content)
+    if changed:
+        runner.run(["systemctl", "daemon-reload"])
+    if not _is_enabled(timer_unit):
+        log.info("swap: enabling %s", timer_unit)
+        runner.run(["systemctl", "enable", "--now", timer_unit])
+    elif changed:
+        runner.run(["systemctl", "restart", timer_unit])
+
+
+def sync_scheduled_restart(host_profile: dict[str, Any], repo_root: Path, runner: Runner) -> None:
+    cfg = host_profile.get("service", {}).get("scheduled_restart", {})
+    enabled = cfg.get("enabled", False)
+    on_calendar = cfg.get("on_calendar", "daily")
+    service_content = (repo_root / "systemd" / "llama-swap-restart.service.tmpl").read_text()
+    timer_content = Template((repo_root / "systemd" / "llama-swap-restart.timer.tmpl").read_text()).substitute(on_calendar=on_calendar)
+    _sync_timer_pair("llama-swap-restart", service_content, timer_content, enabled, runner)
+
+
+def sync_update_check_timer(host_profile: dict[str, Any], repo_root: Path, runner: Runner) -> None:
+    cfg = host_profile.get("update_check", {})
+    enabled = cfg.get("enabled", False)
+    on_calendar = cfg.get("on_calendar", "daily")
+    check_updates_path = repo_root / "bin" / "check-updates"
+    service_content = Template((repo_root / "systemd" / "update-check.service.tmpl").read_text()).substitute(
+        check_updates_path=str(check_updates_path), hostname=host_profile["hostname"]
+    )
+    timer_content = Template((repo_root / "systemd" / "update-check.timer.tmpl").read_text()).substitute(on_calendar=on_calendar)
+    _sync_timer_pair("llm-server-cockpit-update-check", service_content, timer_content, enabled, runner)
 
 
 def run(host_profile: dict[str, Any], manifest: dict[str, Any], models: dict[str, Any], runner: Runner, repo_root: Path) -> None:
@@ -187,7 +259,9 @@ def run(host_profile: dict[str, Any], manifest: dict[str, Any], models: dict[str
     runner.write_file(config_path, new_config)
 
     listen_addr = _resolve_listen_addr(host_profile)
-    unit_changed = _install_unit(repo_root, binary_path, config_path, listen_addr, runner)
+    unit_changed = _install_unit(repo_root, binary_path, config_path, listen_addr, host_profile, runner)
+    sync_scheduled_restart(host_profile, repo_root, runner)
+    sync_update_check_timer(host_profile, repo_root, runner)
 
     was_active = _is_active(_UNIT_NAME)
     if was_active and (unit_changed or config_changed):

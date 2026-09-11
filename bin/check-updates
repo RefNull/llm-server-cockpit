@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+"""Headless entry point for the scheduled-update-check systemd timer (see the Settings tab).
+Writes a result file the cockpit reads on next launch — this never bumps a pin or rebuilds
+anything itself, same detect-and-surface-only rule as the Installs tab's manual check.
+"""
+import argparse
+import json
+import socket
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_VENV_DIR = _REPO_ROOT / ".venv"
+
+
+def _add_venv_site_packages() -> None:
+    """See bin/cockpit for why this adds the path directly instead of re-exec'ing into
+    .venv/bin/python3 (which can be a no-op symlink to system python3)."""
+    lib_dir = _VENV_DIR / "lib"
+    if not lib_dir.is_dir():
+        return
+    for py_dir in sorted(lib_dir.glob("python3.*"), reverse=True):
+        site_packages = py_dir / "site-packages"
+        if site_packages.is_dir():
+            sys.path.insert(0, str(site_packages))
+            return
+
+
+_add_venv_site_packages()
+sys.path.insert(0, str(_REPO_ROOT))
+
+try:
+    from cockpit import update_check
+    from provision import schema
+except ImportError as e:
+    sys.exit(
+        f"missing dependency ({e}). Set up the tool's venv first:\n"
+        f"  python3 -m venv {_VENV_DIR}\n"
+        f"  {_VENV_DIR}/bin/pip install -r {_REPO_ROOT}/requirements.txt"
+    )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(prog="check-updates")
+    parser.add_argument("--host", default=socket.gethostname())
+    args = parser.parse_args()
+
+    host_profile = schema.load_host_profile(_REPO_ROOT / "hosts" / f"{args.host}.yaml")
+    manifest = schema.load_manifest(_REPO_ROOT / "manifest.yaml")
+
+    result = {
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        **update_check.check_all(manifest),
+    }
+    result_path = Path(host_profile["paths"]["state_dir"]) / "update-check-result.json"
+    result_path.parent.mkdir(parents=True, exist_ok=True)
+    result_path.write_text(json.dumps(result, indent=2))
+
+
+if __name__ == "__main__":
+    main()

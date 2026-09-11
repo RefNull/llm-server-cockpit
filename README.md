@@ -1,108 +1,108 @@
 # llm-server-cockpit
 
-Provisions and updates a local LLM inference stack — llama.cpp (bare metal,
-one build per GPU backend) + llama-swap — on a Debian-family Linux host, from
-clean or partially-configured state. Runs on the target machine itself.
+Provisioning + a Textual TUI for a bare-metal local LLM inference stack —
+llama.cpp (one build per GPU backend) and llama-swap — on a Debian-family
+Linux host. Runs on the target machine itself, from a clean or
+partially-configured state.
 
-## Design
+Bare metal, not containers, for anything GPU-adjacent — containers bundle
+their own GPU userspace and fight the host driver stack. Everything is
+version-pinned in `manifest.yaml`; there's no "install latest" anywhere.
+Every mutating action is idempotent and runs through a dry-run gate.
 
-- **Bare metal, not containers**, for anything GPU-adjacent. Containers
-  bundle their own GPU userspace and fight the host driver stack.
-- **Everything version-pinned** in `manifest.yaml`. No "install latest."
-  Updating means editing a pin.
-- **Idempotent, `--dry-run` everywhere.** Safe to re-run on a live machine.
-  One deliberate exception: `provision build --dry-run` still runs the real
-  smoke test (real GPU inference, up to a few minutes) against any backend
-  that was already built in a prior real run — it's genuinely read-only, and
-  more useful as a live diagnostic than skipped, but it does mean dry-run
-  isn't always fast.
-- **Atomic switchover with rollback.** Build into a versioned prefix per
-  backend, smoke-test it, then flip a symlink. Previous builds are retained.
-- **Driver drift is detected, never auto-corrected.** `provision drivers`
-  fails loudly on drift against a committed lockfile; it never upgrades or
-  fixes anything.
-- **No secrets in the repo.** Hugging Face auth comes from an environment
-  variable named in the host profile, never a file.
-- **Private-network only.** The gateway binds to the host's VPN interface
-  address, resolved at config-generation time — never `0.0.0.0`.
-
-## Layout
+## Install
 
 ```
-bin/provision                executable entrypoint (CLI)
-bin/cockpit                   executable entrypoint (TUI)
-provision/                    python package (cli, schema validation, steps)
-cockpit/                        python package (Textual TUI over provision/steps/*)
-hosts/example.yaml               template host profile — TRACKED by git, contains no real facts
-hosts/<hostname>.yaml            your real host profile — gitignored, never committed
-hosts/<hostname>.lock.yaml       generated: observed GPU driver versions — gitignored
-manifest.yaml                     version pins + per-backend build recipes
-models.example.yaml                template model list — TRACKED by git
-models.yaml                         your real model list — gitignored, never committed
-smoke/smoke.yaml                     pinned tiny model + prompt used to smoke-test every backend build
-systemd/                             unit template for llama-swap
-```
-
-`hosts/<hostname>.yaml` and `models.yaml` hold real, per-deployment facts —
-hostnames, MACs, filesystem paths — and are gitignored on purpose (see
-`.gitignore`). Copy the `.example` files to get started; git will never see
-your copies.
-
-## Setup
-
-`provision/` and `cockpit/` need `PyYAML`, `jsonschema`, and (for the TUI) `textual` —
-pinned in `requirements.txt`, matching `manifest.yaml`'s `textual` pin. One dedicated venv
-at `.venv` in the repo root (separate from `venv-hf`, which `provision hf` creates on its
-own for the Hugging Face side):
-
-```
+git clone https://github.com/RefNull/llm-server-cockpit
+cd llm-server-cockpit
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
 
-`bin/provision` and `bin/cockpit` auto-detect `.venv` at the repo root and re-exec
-themselves under it — once it exists, run them directly (`bin/provision ...`,
-`bin/cockpit`), no need to prefix with `.venv/bin/python` or activate it.
+`bin/provision` and `bin/cockpit` auto-detect `.venv` and re-exec themselves
+under it, so once it exists you run them directly — no need to activate it
+or prefix with `.venv/bin/python`.
 
-## Usage
+Then set up your host:
 
 ```
-cp hosts/example.yaml hosts/$(hostname).yaml   # fill in the TODOs — see below
-cp models.example.yaml models.yaml             # fill in the TODOs — see below
-
-bin/provision --dry-run all      # preview every action, take none
-bin/provision wol                 # wake-on-LAN: enable + persist + verify
-bin/provision drivers              # capture/verify GPU driver version lockfile
-bin/provision hf                    # HF CLI + auth + declarative model downloads
-bin/provision build                  # llama.cpp build per backend, smoke-tested, atomic swap
-bin/provision swap                    # llama-swap install + config + systemd unit
-bin/provision all                      # all of the above, in dependency order
-
-bin/cockpit                             # interactive TUI over the same steps — starts in dry-run
+cp hosts/example.yaml hosts/$(hostname).yaml
+cp models.example.yaml models.yaml
+bin/cockpit   # Settings tab walks you through the rest, or edit the YAML directly
 ```
 
-Requires root (installs apt packages, writes under `/opt`, `/etc`,
-`/var/lib`). `--host` (both `provision` and `cockpit`) defaults to the
-machine's own hostname — pass it explicitly to target a different host
-profile.
+## Requirements
 
-## Before first run
+- Debian-family, apt-based — no assumptions about a specific release.
+- Root, for everything except `--dry-run` (installs apt packages, writes
+  under `/opt`, `/etc`, `/var/lib`).
+- One or more GPUs from any mix of vendors — CUDA, ROCm, Vulkan, SYCL are
+  all supported backends, bound per-model, per-device, in `models.yaml`.
+- A Hugging Face token in an env var (named in your host profile) for model
+  downloads. Never written to disk, never in the repo.
+- Reachable only over your own VPN — the gateway binds to that interface's
+  address specifically, never `0.0.0.0`.
 
-These are real gaps in the example files, not oversights — left as
-placeholders rather than guessed values. Fill in on your own copies:
+## CLI
 
-- `hosts/<hostname>.yaml`: VPN provider/interface, WoL NIC/MAC — all `TODO`.
-- `models.yaml`: any model whose `repo_id` you haven't sourced yet.
-- `manifest.yaml`: `huggingface_hub` version pin is a `TODO` (not researched
-  — check PyPI before first run).
-- Export the token named by your host profile's `hf.token_env`
-  (`HF_TOKEN`) before running `provision hf` or the cockpit's Downloads tab.
+```
+bin/provision --dry-run all   # preview every action, take none
+bin/provision wol              # wake-on-LAN: enable, persist across reboot, verify
+bin/provision drivers           # capture/verify GPU driver version lockfile — detects drift, never fixes it
+bin/provision hf                 # HF auth + declarative model downloads
+bin/provision build               # llama.cpp build per backend: smoke-tested, then atomic symlink swap
+bin/provision swap                 # llama-swap install, config generation, systemd unit
+bin/provision all                   # all of the above, in dependency order
+```
 
-## Out of scope
+`--host` defaults to the machine's own hostname; pass it to target a
+different host profile.
 
-Other machines on the network. Model selection and tuning. Orchestration
-and frontend layers above the model server. STT/TTS (`speaches-stt-tts` in
-`models.yaml` is carried over as an unmanaged passthrough entry only, so
-config generation doesn't drop it — see the `engine: unmanaged` note in
-`provision/schema.py`) — scoped so it can slot in later as pinned, bare-metal
-components (Piper, faster-whisper, Chatterbox) without restructuring.
+## Cockpit
+
+`bin/cockpit` — starts in dry-run. Toggle with `d`, refresh with `r`.
+
+- **Installs** — per-backend build status, retained builds with one-click
+  rollback, real build/smoke-test history, and a manual upstream-version
+  check against the pinned llama.cpp/llama-swap versions (surfaces
+  "update available", never applies one — bumping a pin stays your call).
+- **Deploy** — add/edit/delete `models.yaml` entries with GPU/backend
+  dropdowns constrained to what the host profile actually has, a
+  config.yaml preview, and apply (install + restart llama-swap).
+- **Downloads** — per-model Hugging Face download status and triggers, plus
+  disk usage.
+- **Settings** — host profile fields (network, paths, HF token env var
+  name), WoL status and enable, driver-drift status, llama-swap's restart
+  policy, and two optional systemd timers: scheduled restart and scheduled
+  update checks (detect-only, same rule as the Installs tab). On first run,
+  with no host profile yet, this is the only tab shown, and it creates one.
+
+## Layout
+
+```
+bin/provision, bin/cockpit    entrypoints
+provision/                     CLI + schema validation + steps (wol, drivers, hf, build, swap)
+cockpit/                        Textual TUI, one screen per tab, calling into provision/steps
+hosts/example.yaml               tracked template — no real facts
+hosts/<hostname>.yaml            your real host profile — gitignored
+models.example.yaml               tracked template
+models.yaml                        your real model list — gitignored
+manifest.yaml                       version pins + per-backend build recipes
+smoke/smoke.yaml                     pinned model + prompt, smoke-tests every backend build
+systemd/                             unit templates: llama-swap, scheduled restart, update-check timer
+```
+
+`hosts/<hostname>.yaml` and `models.yaml` hold real per-deployment facts —
+hostnames, MACs, filesystem paths — so they're gitignored. Copy the
+`.example` files to get your own.
+
+## Scope
+
+In scope: wake-on-LAN, driver drift detection, Hugging Face auth/downloads,
+bare-metal multi-backend llama.cpp builds, llama-swap deployment. Out of
+scope: other machines on the network, model selection/tuning, anything
+above the model server. STT/TTS isn't built by this repo — `models.yaml`'s
+`engine: unmanaged` type exists so an external service (docker or otherwise)
+can still be listed in the generated config without this repo owning its
+lifecycle; it's the seam a future bare-metal STT/TTS backend would slot
+into.

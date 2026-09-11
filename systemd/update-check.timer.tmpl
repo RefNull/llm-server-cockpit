@@ -1,0 +1,9 @@
+[Unit]
+Description=Scheduled check for newer upstream llama.cpp/llama-swap versions
+
+[Timer]
+OnCalendar=$on_calendar
+Persistent=true
+
+[Install]
+WantedBy=timers.target

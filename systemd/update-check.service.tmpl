@@ -1,0 +1,8 @@
+[Unit]
+Description=Check for newer upstream llama.cpp/llama-swap versions (detect only, never applies)
+
+[Service]
+Type=oneshot
+# Runs as root, same as every other systemd unit this repo installs — state_dir (where the
+# result file lands) is root-owned like the rest of the tool's managed state.
+ExecStart=$check_updates_path --host $hostname

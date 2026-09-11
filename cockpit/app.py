@@ -20,6 +20,7 @@ from provision.common import Runner
 from cockpit.screens.builds import BuildsScreen
 from cockpit.screens.deploy import DeployScreen
 from cockpit.screens.downloads import DownloadsScreen
+from cockpit.screens.settings import SettingsScreen
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -29,6 +30,12 @@ class CockpitApp(App):
     repo_root, app_ref) — see cockpit/screens/*.py. `models` is reloaded via reload_models()
     after any edit to models.yaml so every tab observes fresh state; screens should call
     self.cockpit_app.reload_models() (not re-implement their own loader) after a config edit.
+
+    First run (no hosts/<hostname>.yaml yet): host_profile is None, and only the Settings tab
+    is shown — it offers to create one. The other tabs all assume a real host_profile (gpus,
+    paths, etc.), so rather than pushing None-handling into every screen, first-run just asks
+    for a restart once the profile is created (see SettingsScreen) — a one-time step, not
+    something that needs to be seamless.
     """
 
     TITLE = "llm-server-cockpit"
@@ -42,20 +49,30 @@ class CockpitApp(App):
         super().__init__()
         self.host_name = host or socket.gethostname()
         self.repo_root = REPO_ROOT
-        self.host_profile = schema.load_host_profile(REPO_ROOT / "hosts" / f"{self.host_name}.yaml")
+        self.host_profile = schema.try_load_host_profile(REPO_ROOT / "hosts" / f"{self.host_name}.yaml")
         self.manifest = schema.load_manifest(REPO_ROOT / "manifest.yaml")
-        self.models = schema.load_models(REPO_ROOT / "models.yaml", self.host_profile, self.manifest)
+        if self.host_profile is not None:
+            self.models = schema.load_models(REPO_ROOT / "models.yaml", self.host_profile, self.manifest)
+        else:
+            self.models = {"models": []}
         self.runner = Runner(dry_run=True)
 
     def compose(self) -> ComposeResult:
         yield Header()
-        with TabbedContent(initial="installs"):
-            with TabPane("Installs", id="installs"):
-                yield BuildsScreen(self.host_profile, self.manifest, self.models, self.runner, self.repo_root, self)
-            with TabPane("Deploy", id="deploy"):
-                yield DeployScreen(self.host_profile, self.manifest, self.models, self.runner, self.repo_root, self)
-            with TabPane("Downloads", id="downloads"):
-                yield DownloadsScreen(self.host_profile, self.manifest, self.models, self.runner, self.repo_root, self)
+        if self.host_profile is None:
+            with TabbedContent(initial="settings"):
+                with TabPane("Settings", id="settings"):
+                    yield SettingsScreen(self.host_profile, self.manifest, self.models, self.runner, self.repo_root, self)
+        else:
+            with TabbedContent(initial="installs"):
+                with TabPane("Installs", id="installs"):
+                    yield BuildsScreen(self.host_profile, self.manifest, self.models, self.runner, self.repo_root, self)
+                with TabPane("Deploy", id="deploy"):
+                    yield DeployScreen(self.host_profile, self.manifest, self.models, self.runner, self.repo_root, self)
+                with TabPane("Downloads", id="downloads"):
+                    yield DownloadsScreen(self.host_profile, self.manifest, self.models, self.runner, self.repo_root, self)
+                with TabPane("Settings", id="settings"):
+                    yield SettingsScreen(self.host_profile, self.manifest, self.models, self.runner, self.repo_root, self)
         yield Footer()
 
     def on_mount(self) -> None:
@@ -71,11 +88,13 @@ class CockpitApp(App):
 
     def action_refresh_all(self) -> None:
         self.reload_models()
-        for widget in self.query("BuildsScreen, DeployScreen, DownloadsScreen"):
+        for widget in self.query("BuildsScreen, DeployScreen, DownloadsScreen, SettingsScreen"):
             if hasattr(widget, "on_refresh_requested"):
                 widget.on_refresh_requested()
 
     def reload_models(self) -> None:
+        if self.host_profile is None:
+            return
         self.models = schema.load_models(self.repo_root / "models.yaml", self.host_profile, self.manifest)
 
 

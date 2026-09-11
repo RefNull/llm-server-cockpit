@@ -15,6 +15,8 @@ log = logging.getLogger("provision")
 
 
 def _read_iface_mac(iface: str) -> str | None:
+    if shutil.which("ip") is None:  # iproute2 isn't guaranteed present on a minimal image
+        return None
     result = subprocess.run(
         ["ip", "link", "show", iface],
         stdout=subprocess.PIPE,
@@ -28,6 +30,8 @@ def _read_iface_mac(iface: str) -> str | None:
 
 
 def _read_wake_flags(iface: str) -> str | None:
+    if shutil.which("ethtool") is None:  # often not preinstalled on minimal Debian images
+        return None
     result = subprocess.run(
         ["ethtool", iface],
         stdout=subprocess.PIPE,
@@ -125,6 +129,24 @@ def _arm_networkmanager(iface: str, runner: Runner) -> None:
     log.info("wol: arming wake-on-lan=magic on NetworkManager connection %r", conn)
     runner.run(["nmcli", "con", "mod", conn, "802-3-ethernet.wake-on-lan", "magic"])
     runner.run(["nmcli", "con", "up", conn])
+
+
+def status(host_profile: dict[str, Any]) -> dict[str, Any]:
+    """Read-only WOL facts for display (e.g. the cockpit's Settings tab) — reuses run()'s own
+    verification helpers but never mutates anything (no ethtool -s, no systemctl enable)."""
+    wol_cfg = host_profile["network"]["wol"]
+    iface = wol_cfg["interface"]
+    expected_mac = wol_cfg["mac"]
+    actual_mac = _read_iface_mac(iface)
+    mac_matches = actual_mac is not None and actual_mac.lower() == expected_mac.lower()
+    wake_flags = _read_wake_flags(iface)
+    unit_enabled = _is_enabled(f"wol-{iface}.service")
+    return {
+        "mac_matches": mac_matches,
+        "actual_mac": actual_mac,
+        "wake_flags": wake_flags,
+        "unit_enabled": unit_enabled,
+    }
 
 
 def run(host_profile: dict[str, Any], manifest: dict[str, Any], models: dict[str, Any], runner: Runner, repo_root: Path) -> None:

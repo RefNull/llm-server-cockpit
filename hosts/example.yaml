@@ -32,3 +32,16 @@ retain_builds: 3
 
 hf:
   token_env: HF_TOKEN   # name of the env var holding your HF token — never the token itself
+
+# Both sections below are optional — omit either entirely to keep the defaults
+# (restart_policy: on-failure, restart_sec: 5, scheduled restart/update-check off).
+service:
+  restart_policy: on-failure   # on-failure | always | no
+  restart_sec: 5
+  scheduled_restart:
+    enabled: false
+    on_calendar: daily         # systemd OnCalendar= syntax, e.g. "daily", "*-*-* 04:00:00"
+
+update_check:
+  enabled: false                # periodic check only — never bumps a pin or rebuilds anything
+  on_calendar: daily

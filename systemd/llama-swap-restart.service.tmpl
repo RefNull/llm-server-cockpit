@@ -1,0 +1,7 @@
+[Unit]
+Description=Scheduled restart of llama-swap
+After=llama-swap.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl restart llama-swap.service

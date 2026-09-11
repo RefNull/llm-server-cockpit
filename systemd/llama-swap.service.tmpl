@@ -16,8 +16,8 @@ ExecStartPre=$binary_path -validate -config $config_path
 # -config is required explicitly since PR #790 (2026-05-29) removed the implicit
 # ./config.yaml default — never omit it.
 ExecStart=$binary_path -config $config_path -listen $listen_addr
-Restart=on-failure
-RestartSec=5
+Restart=$restart_policy
+RestartSec=$restart_sec
 
 [Install]
 WantedBy=multi-user.target

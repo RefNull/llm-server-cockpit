@@ -18,6 +18,32 @@ HOST_PROFILE_SCHEMA = {
     "additionalProperties": False,
     "properties": {
         "hostname": {"type": "string"},
+        "service": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "restart_policy": {"type": "string", "enum": ["on-failure", "always", "no"]},
+                "restart_sec": {"type": "integer", "minimum": 0},
+                "scheduled_restart": {
+                    "type": "object",
+                    "required": ["enabled"],
+                    "additionalProperties": False,
+                    "properties": {
+                        "enabled": {"type": "boolean"},
+                        "on_calendar": {"type": "string"},  # systemd OnCalendar= syntax, e.g. "daily"
+                    },
+                },
+            },
+        },
+        "update_check": {
+            "type": "object",
+            "required": ["enabled"],
+            "additionalProperties": False,
+            "properties": {
+                "enabled": {"type": "boolean"},
+                "on_calendar": {"type": "string"},
+            },
+        },
         "network": {
             "type": "object",
             "required": ["vpn", "wol", "gateway"],
@@ -209,6 +235,22 @@ def load_host_profile(path: Path) -> dict:
     if not path.exists():
         sys.exit(f"no host profile at {path} — create hosts/<hostname>.yaml for this machine")
     return _validate(path, HOST_PROFILE_SCHEMA)
+
+
+def try_load_host_profile(path: Path) -> dict | None:
+    """Like load_host_profile, but returns None instead of exiting when the file is missing —
+    for the cockpit's first-run flow, which offers to create one instead of refusing to start.
+    A file that exists but fails validation still exits; that's a real error, not a first run."""
+    if not path.exists():
+        return None
+    return _validate(path, HOST_PROFILE_SCHEMA)
+
+
+def validate_host_profile_dict(data: dict) -> None:
+    """Validate an in-memory host profile dict (e.g. built by the Settings tab's form) without
+    touching disk — raises jsonschema.ValidationError on failure, doesn't sys.exit, so a caller
+    building interactive UI can catch it and show the error inline."""
+    jsonschema.validate(data, HOST_PROFILE_SCHEMA)
 
 
 def load_manifest(path: Path) -> dict:

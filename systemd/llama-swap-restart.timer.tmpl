@@ -1,0 +1,9 @@
+[Unit]
+Description=Periodic llama-swap restart, independent of crash-triggered restarts
+
+[Timer]
+OnCalendar=$on_calendar
+Persistent=true
+
+[Install]
+WantedBy=timers.target
