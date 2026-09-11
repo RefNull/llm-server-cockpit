@@ -52,15 +52,17 @@ your copies.
 
 `provision/` and `cockpit/` need `PyYAML`, `jsonschema`, and (for the TUI) `textual` —
 pinned in `requirements.txt`, matching `manifest.yaml`'s `textual` pin. One dedicated venv
-for the tool itself (separate from `venv-hf`, which `provision hf` creates on its own for
-the Hugging Face side):
+at `.venv` in the repo root (separate from `venv-hf`, which `provision hf` creates on its
+own for the Hugging Face side):
 
 ```
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
-.venv/bin/python bin/provision --dry-run all
-.venv/bin/python bin/cockpit
 ```
+
+`bin/provision` and `bin/cockpit` auto-detect `.venv` at the repo root and re-exec
+themselves under it — once it exists, run them directly (`bin/provision ...`,
+`bin/cockpit`), no need to prefix with `.venv/bin/python` or activate it.
 
 ## Usage
 

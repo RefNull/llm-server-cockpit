@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
+import os
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_VENV_PYTHON = _REPO_ROOT / ".venv" / "bin" / "python3"
+if _VENV_PYTHON.exists() and Path(sys.executable).resolve() != _VENV_PYTHON.resolve():
+    # Re-exec under the repo's own venv (see requirements.txt / README Setup) so
+    # `bin/provision` works regardless of which `python3` was first on PATH when invoked.
+    os.execv(str(_VENV_PYTHON), [str(_VENV_PYTHON), str(Path(__file__).resolve()), *sys.argv[1:]])
+
+sys.path.insert(0, str(_REPO_ROOT))
 
 from provision.cli import main  # noqa: E402
 
