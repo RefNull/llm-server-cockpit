@@ -4,15 +4,34 @@ import sys
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-_VENV_PYTHON = _REPO_ROOT / ".venv" / "bin" / "python3"
-if _VENV_PYTHON.exists() and Path(sys.executable).resolve() != _VENV_PYTHON.resolve():
+_VENV_DIR = _REPO_ROOT / ".venv"
+
+
+def _venv_python() -> Path | None:
+    for name in ("python3", "python"):  # not every venv creates a `python3` symlink
+        candidate = _VENV_DIR / "bin" / name
+        if candidate.exists():
+            return candidate
+    return None
+
+
+_venv = _venv_python()
+if _venv is not None and Path(sys.executable).resolve() != _venv.resolve():
     # Re-exec under the repo's own venv (see requirements.txt / README Setup) so
     # `bin/provision` works regardless of which `python3` was first on PATH when invoked.
-    os.execv(str(_VENV_PYTHON), [str(_VENV_PYTHON), str(Path(__file__).resolve()), *sys.argv[1:]])
+    os.execv(str(_venv), [str(_venv), str(Path(__file__).resolve()), *sys.argv[1:]])
 
 sys.path.insert(0, str(_REPO_ROOT))
 
-from provision.cli import main  # noqa: E402
+try:
+    from provision.cli import main  # noqa: E402
+except ImportError as e:
+    sys.exit(
+        f"missing dependency ({e}). Set up the tool's venv first:\n"
+        f"  python3 -m venv {_VENV_DIR}\n"
+        f"  {_VENV_DIR}/bin/pip install -r {_REPO_ROOT}/requirements.txt\n"
+        "then re-run this script."
+    )
 
 if __name__ == "__main__":
     main()
