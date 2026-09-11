@@ -31,7 +31,6 @@ import logging
 from pathlib import Path
 from typing import Any
 
-import jsonschema
 import yaml
 from textual import work
 from textual.app import ComposeResult
@@ -103,7 +102,7 @@ class _GpuRow(Vertical):
 class SettingsScreen(Widget):
     """Mounted inside a TabPane by cockpit/app.py — not a Textual Screen."""
 
-    # .panel / .panel-title / .button-row / .status-text / .error-text / .accent-button come
+    # .panel / .panel-title / .button-row / .status-text / .error-text / .inline-row come
     # from cockpit/widgets.py's SHARED_CSS (CockpitApp.CSS) — only this screen's own rules
     # live here. Two independently-scrolling columns (#settings-left/#settings-right), each
     # ONE panel, are the structural fix for the old cut-off/no-scroll layout.
@@ -124,6 +123,7 @@ class SettingsScreen(Widget):
     SettingsScreen #settings-left, SettingsScreen #settings-right {
         height: 1fr;
         width: 1fr;
+        min-width: 45;
     }
     SettingsScreen #settings-left {
         margin-right: 1;
@@ -140,12 +140,6 @@ class SettingsScreen(Widget):
     }
     SettingsScreen #vpn-resolve-preview {
         color: $text-muted;
-    }
-    SettingsScreen .inline-row {
-        height: auto;
-    }
-    SettingsScreen .inline-row Input {
-        width: 1fr;
     }
     SettingsScreen .switch-row {
         height: auto;
@@ -246,12 +240,14 @@ class SettingsScreen(Widget):
                     with Vertical(classes="field-group"):
                         yield Static("Wake-on-LAN", classes="panel-title")
                         yield Static("not checked yet", id="wol-status", classes="status-text")
-                        yield Button("Check / Enable WOL", id="btn-wol-check")
+                        with Horizontal(classes="button-row"):
+                            yield Button("Check / Enable WOL", id="btn-wol-check")
 
                     with Vertical(classes="field-group"):
                         yield Static("GPU driver lockfile", classes="panel-title")
                         yield Static("not checked yet", id="drivers-status", classes="status-text")
-                        yield Button("Check drivers", id="btn-drivers-check")
+                        with Horizontal(classes="button-row"):
+                            yield Button("Check drivers", id="btn-drivers-check")
 
                     with Vertical(classes="field-group"):
                         yield Static("Service & update-check settings", classes="panel-title")
@@ -279,7 +275,7 @@ class SettingsScreen(Widget):
                 if first_run:
                     yield Vertical(id="gpu-editor-list")
                     with Horizontal(classes="button-row"):
-                        yield Button("Add GPU", id="btn-add-gpu", classes="accent-button")
+                        yield Button("Add GPU", id="btn-add-gpu", variant="primary")
                         yield Button("List PCIe devices", id="btn-show-pcie")
                 else:
                     yield Vertical(id="gpu-display-list")
@@ -595,8 +591,8 @@ class SettingsScreen(Widget):
             return
         try:
             schema.validate_host_profile_dict(candidate)
-        except jsonschema.ValidationError as e:
-            self._set_profile_error(f"validation failed: {e.message}")
+        except schema.ValidationError as e:
+            self._set_profile_error(f"validation failed: {e}")
             return
         self._set_profile_error("")
 
@@ -747,8 +743,8 @@ class SettingsScreen(Widget):
         candidate["update_check"] = update_check_cfg
         try:
             schema.validate_host_profile_dict(candidate)
-        except jsonschema.ValidationError as e:
-            self._set_service_error(f"validation failed: {e.message}")
+        except schema.ValidationError as e:
+            self._set_service_error(f"validation failed: {e}")
             return
         self._set_service_error("")
 

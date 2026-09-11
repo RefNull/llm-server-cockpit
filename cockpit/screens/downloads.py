@@ -11,6 +11,7 @@ from typing import Any
 from textual import work
 from textual.app import ComposeResult
 from textual.containers import Horizontal, VerticalScroll
+from textual.widget import Widget
 from textual.widgets import Button, DataTable, Label, Static
 
 from provision.common import Runner
@@ -25,7 +26,7 @@ STATUS_ICONS = {
 }
 
 
-class DownloadsScreen(Static):
+class DownloadsScreen(Widget):
     """Not a Textual Screen — mounted inside a TabPane by cockpit/app.py.
 
     Judgment call: per-model download buttons are DISABLED (not just left to fail) for
@@ -41,7 +42,7 @@ class DownloadsScreen(Static):
     # content-sized scroll container (matches builds.py's DataTable convention).
     DEFAULT_CSS = """
     DownloadsScreen {
-        padding: 1 2;
+        padding: 0;
     }
     #auth-banner {
         padding: 1 2;

@@ -121,7 +121,8 @@ class BuildsScreen(Widget):
                 yield Label("Upstream version check", classes="panel-title")
                 yield Static("llama.cpp: not checked yet", id="update-llama-cpp")
                 yield Static("llama-swap: not checked yet", id="update-llama-swap")
-                yield Button("Check for updates", id="check-updates-btn")
+                with Horizontal(classes="button-row"):
+                    yield Button("Check for updates", id="check-updates-btn")
 
             if not self.backends:
                 yield Static(

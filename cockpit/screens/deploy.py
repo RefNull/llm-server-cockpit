@@ -9,7 +9,6 @@ reload. A failed validation never touches the real file.
 """
 from __future__ import annotations
 
-import tempfile
 from pathlib import Path
 
 import yaml
@@ -82,7 +81,7 @@ class DeployScreen(Widget):
             yield Static("Models (models.yaml)", classes="section-title")
             yield DataTable(id="models-table")
             with Horizontal(classes="button-row"):
-                yield Button("Add", id="btn-add")
+                yield Button("Add", id="btn-add", variant="primary")
                 yield Button("Edit", id="btn-edit")
                 yield Button("Delete", id="btn-delete", variant="error")
                 yield Button("Preview config.yaml", id="btn-preview")
@@ -341,26 +340,12 @@ class DeployScreen(Widget):
     # -- validation (authoritative: reuses schema.load_models) -------------------
 
     def _validate_candidate(self, candidate: dict) -> tuple[bool, str, dict | None]:
-        """Write `candidate` to a temp file and run schema.load_models against it — the exact
-        jsonschema + gpu/backend cross-check logic used at process startup, so the rules can
-        never drift from provision/schema.py. load_models calls sys.exit(...) on any failure
-        rather than raising a normal exception; catch that SystemExit here instead of
-        reimplementing the checks (less code, zero chance of the two diverging).
-        """
-        tmp_path: Path | None = None
+        """Run schema.validate_models_dict directly in memory against candidate dict."""
         try:
-            with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as tmp:
-                yaml.safe_dump(candidate, tmp, sort_keys=False)
-                tmp_path = Path(tmp.name)
-            try:
-                validated = schema.load_models(tmp_path, self.host_profile, self.manifest)
-            except SystemExit as e:
-                message = str(e.code) if e.code is not None else "validation failed"
-                return False, message, None
+            validated = schema.validate_models_dict(candidate, self.host_profile, self.manifest, source="models.yaml")
             return True, "", validated
-        finally:
-            if tmp_path is not None:
-                tmp_path.unlink(missing_ok=True)
+        except schema.ValidationError as e:
+            return False, str(e), None
 
     def _write_models_yaml(self, data: dict) -> bool:
         """Routed through Runner so --dry-run actually previews instead of writing for real —

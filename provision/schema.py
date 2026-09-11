@@ -1,4 +1,4 @@
-"""jsonschema validation for hosts/<hostname>.yaml, manifest.yaml, models.yaml.
+"""Configuration validation for hosts/<hostname>.yaml, manifest.yaml, models.yaml.
 
 Cross-file checks (model binds to a GPU/backend the host profile actually has)
 happen here too — the point is a bad configuration should fail at load time,
@@ -6,284 +6,176 @@ not at first use on the live host.
 """
 from __future__ import annotations
 
-import sys
+import re
 from pathlib import Path
 
-import jsonschema
 import yaml
 
-HOST_PROFILE_SCHEMA = {
-    "type": "object",
-    "required": ["hostname", "network", "gpus", "paths", "retain_builds", "hf"],
-    "additionalProperties": False,
-    "properties": {
-        "hostname": {"type": "string"},
-        "service": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "restart_policy": {"type": "string", "enum": ["on-failure", "always", "no"]},
-                "restart_sec": {"type": "integer", "minimum": 0},
-                "scheduled_restart": {
-                    "type": "object",
-                    "required": ["enabled"],
-                    "additionalProperties": False,
-                    "properties": {
-                        "enabled": {"type": "boolean"},
-                        "on_calendar": {"type": "string"},  # systemd OnCalendar= syntax, e.g. "daily"
-                    },
-                },
-            },
-        },
-        "update_check": {
-            "type": "object",
-            "required": ["enabled"],
-            "additionalProperties": False,
-            "properties": {
-                "enabled": {"type": "boolean"},
-                "on_calendar": {"type": "string"},
-            },
-        },
-        "network": {
-            "type": "object",
-            "required": ["vpn", "wol", "gateway"],
-            "additionalProperties": False,
-            "properties": {
-                "vpn": {
-                    "type": "object",
-                    "required": ["interface"],
-                    "additionalProperties": False,
-                    "properties": {
-                        # The overlay NIC name (e.g. tailscale0, wg0) — never an IP. The
-                        # gateway binds to whatever address this interface currently has,
-                        # resolved fresh on every apply (see swap.py's resolve_vpn_ip).
-                        "interface": {"type": "string"},
-                    },
-                },
-                "wol": {
-                    "type": "object",
-                    "required": ["interface", "mac"],
-                    "additionalProperties": False,
-                    "properties": {
-                        "interface": {"type": "string"},
-                        "mac": {"type": "string", "pattern": "^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$"},
-                    },
-                },
-                "gateway": {
-                    "type": "object",
-                    "required": ["port"],
-                    "additionalProperties": False,
-                    "properties": {
-                        "port": {"type": "integer", "minimum": 1, "maximum": 65535},
-                        "health_check_timeout": {"type": "integer", "minimum": 1},
-                    },
-                },
-            },
-        },
-        "gpus": {
-            "type": "array",
-            "minItems": 1,
-            "items": {
-                "type": "object",
-                "required": ["id", "vendor", "backends"],
-                "additionalProperties": False,
-                "properties": {
-                    "id": {"type": "string"},
-                    "vendor": {"type": "string", "enum": ["nvidia", "amd", "intel"]},
-                    "backends": {
-                        "type": "array",
-                        "minItems": 1,
-                        "items": {"type": "string", "enum": ["cuda", "rocm", "vulkan", "sycl"]},
-                    },
-                },
-            },
-        },
-        "paths": {
-            "type": "object",
-            "required": ["models_dir", "state_dir", "prefix_root"],
-            "additionalProperties": False,
-            "properties": {
-                "models_dir": {"type": "string"},
-                "state_dir": {"type": "string"},
-                "prefix_root": {"type": "string"},
-            },
-        },
-        "retain_builds": {"type": "integer", "minimum": 1},
-        "hf": {
-            "type": "object",
-            "required": ["token_env"],
-            "additionalProperties": False,
-            "properties": {"token_env": {"type": "string"}},
-        },
-    },
-}
+__all__ = [
+    "ValidationError",
+    "HOST_PROFILE_SCHEMA",
+    "MANIFEST_SCHEMA",
+    "MODELS_SCHEMA",
+    "load_host_profile",
+    "try_load_host_profile",
+    "validate_host_profile_dict",
+    "validate_models_dict",
+    "load_manifest",
+    "load_models",
+]
 
-MANIFEST_SCHEMA = {
-    "type": "object",
-    "required": ["llama_cpp", "llama_swap", "huggingface_hub", "textual", "backends"],
-    "additionalProperties": False,
-    "properties": {
-        "llama_cpp": {
-            "type": "object",
-            "required": ["ref", "repo"],
-            "additionalProperties": False,
-            "properties": {
-                "ref": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
-                "repo": {"type": "string"},
-            },
-        },
-        "llama_swap": {
-            "type": "object",
-            "required": ["version", "repo"],
-            "additionalProperties": False,
-            "properties": {"version": {"type": "string"}, "repo": {"type": "string"}},
-        },
-        "huggingface_hub": {
-            "type": "object",
-            "required": ["version"],
-            "additionalProperties": False,
-            "properties": {"version": {"type": "string"}},
-        },
-        "textual": {
-            "type": "object",
-            "required": ["version"],
-            "additionalProperties": False,
-            "properties": {"version": {"type": "string"}},
-        },
-        "backends": {
-            "type": "object",
-            "minProperties": 1,
-            "additionalProperties": {
-                "type": "object",
-                "required": ["cmake_flags"],
-                "additionalProperties": False,
-                "properties": {
-                    "cmake_flags": {"type": "array", "items": {"type": "string"}},
-                    "apt_packages": {"type": "array", "items": {"type": "string"}},
-                    "build_env": {"type": "object", "additionalProperties": {"type": "string"}},
-                    "source_script": {"type": "string"},
-                },
-            },
-        },
-    },
-}
 
-_LLAMA_CPP_MODEL = {
-    "type": "object",
-    "required": ["id", "engine", "repo_id", "quant_file", "bind"],
-    "additionalProperties": False,
-    "properties": {
-        "id": {"type": "string"},
-        "engine": {"const": "llama-cpp"},
-        "repo_id": {"type": "string"},
-        "quant_file": {"type": "string"},
-        "mmproj_file": {"type": "string"},
-        "bind": {
-            "type": "object",
-            "required": ["gpu", "backend"],
-            "additionalProperties": False,
-            "properties": {"gpu": {"type": "string"}, "backend": {"type": "string"}},
-        },
-        "llama_server_args": {"type": "array", "items": {"type": "string"}},
-        "env": {"type": "array", "items": {"type": "string"}},
-        "ttl": {"type": "integer", "minimum": 0},
-        "group": {"type": "string"},
-    },
-}
+class ValidationError(Exception):
+    """Raised when configuration fails schema or semantic validation."""
+    pass
 
-_UNMANAGED_MODEL = {
-    "type": "object",
-    "required": ["id", "engine", "cmd"],
-    "additionalProperties": False,
-    "properties": {
-        "id": {"type": "string"},
-        "engine": {"const": "unmanaged"},
-        "cmd": {"type": "string"},
-        "env": {"type": "array", "items": {"type": "string"}},
-        "ttl": {"type": "integer", "minimum": 0},
-        "group": {"type": "string"},
-    },
-}
-
-MODELS_SCHEMA = {
-    "type": "object",
-    "required": ["models"],
-    "additionalProperties": False,
-    "properties": {
-        "models": {
-            "type": "array",
-            "items": {"oneOf": [_LLAMA_CPP_MODEL, _UNMANAGED_MODEL]},
-        },
-    },
-}
+def _require(d: dict, keys: list[str], loc: str) -> None:
+    if not isinstance(d, dict):
+        raise ValidationError(f"{loc}: expected a dictionary, got {type(d).__name__}")
+    for k in keys:
+        if k not in d:
+            raise ValidationError(f"{loc}: missing required key {k!r}")
 
 
 def _load_yaml(path: Path) -> dict:
-    with open(path) as f:
-        return yaml.safe_load(f)
-
-
-def _validate(path: Path, schema_obj: dict) -> dict:
-    data = _load_yaml(path)
     try:
-        jsonschema.validate(data, schema_obj)
-    except jsonschema.ValidationError as e:
-        loc = "/".join(str(p) for p in e.path) or "<root>"
-        sys.exit(f"{path}: schema validation failed at {loc}: {e.message}")
+        with open(path) as f:
+            data = yaml.safe_load(f)
+            if not isinstance(data, dict):
+                raise ValidationError(f"{path}: expected a dictionary at root")
+            return data
+    except FileNotFoundError:
+        raise ValidationError(f"{path}: file not found")
+    except yaml.YAMLError as e:
+        raise ValidationError(f"{path}: invalid YAML: {e}") from e
+
+
+def validate_host_profile_dict(data: dict, source: str = "host profile") -> None:
+    """Validate in-memory host profile dictionary."""
+    _require(data, ["hostname", "network", "gpus", "paths", "retain_builds", "hf"], source)
+
+    net = data["network"]
+    _require(net, ["vpn", "wol", "gateway"], f"{source}.network")
+    _require(net["vpn"], ["interface"], f"{source}.network.vpn")
+    _require(net["wol"], ["interface", "mac"], f"{source}.network.wol")
+    if not re.match(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$", str(net["wol"]["mac"])):
+        raise ValidationError(f"{source}.network.wol.mac: invalid MAC address format {net['wol']['mac']!r}")
+    _require(net["gateway"], ["port"], f"{source}.network.gateway")
+    if not isinstance(net["gateway"]["port"], int) or not (1 <= net["gateway"]["port"] <= 65535):
+        raise ValidationError(f"{source}.network.gateway.port: port must be integer between 1 and 65535")
+
+    gpus = data["gpus"]
+    if not isinstance(gpus, list) or len(gpus) == 0:
+        raise ValidationError(f"{source}.gpus: must be a non-empty list")
+    for i, g in enumerate(gpus):
+        _require(g, ["id", "vendor", "backends"], f"{source}.gpus[{i}]")
+        if g["vendor"] not in ("nvidia", "amd", "intel"):
+            raise ValidationError(f"{source}.gpus[{i}].vendor: invalid vendor {g['vendor']!r}")
+        if not isinstance(g["backends"], list) or len(g["backends"]) == 0:
+            raise ValidationError(f"{source}.gpus[{i}].backends: must be a non-empty list")
+        for b in g["backends"]:
+            if b not in ("cuda", "rocm", "vulkan", "sycl"):
+                raise ValidationError(f"{source}.gpus[{i}].backends: unknown backend {b!r}")
+
+    paths = data["paths"]
+    _require(paths, ["models_dir", "state_dir", "prefix_root"], f"{source}.paths")
+
+    if not isinstance(data["retain_builds"], int) or data["retain_builds"] < 1:
+        raise ValidationError(f"{source}.retain_builds: must be an integer >= 1")
+
+    _require(data["hf"], ["token_env"], f"{source}.hf")
+
+
+def validate_manifest_dict(data: dict, source: str = "manifest.yaml") -> None:
+    """Validate in-memory manifest dictionary."""
+    _require(data, ["llama_cpp", "llama_swap", "huggingface_hub", "textual", "backends"], source)
+    _require(data["llama_cpp"], ["ref", "repo"], f"{source}.llama_cpp")
+    if not re.match(r"^[0-9a-f]{40}$", str(data["llama_cpp"]["ref"])):
+        raise ValidationError(f"{source}.llama_cpp.ref: must be a 40-character hex commit SHA")
+    _require(data["llama_swap"], ["version", "repo"], f"{source}.llama_swap")
+    _require(data["huggingface_hub"], ["version"], f"{source}.huggingface_hub")
+    _require(data["textual"], ["version"], f"{source}.textual")
+
+    backends = data["backends"]
+    if not isinstance(backends, dict) or len(backends) == 0:
+        raise ValidationError(f"{source}.backends: must be a non-empty mapping")
+    for name, b in backends.items():
+        _require(b, ["cmake_flags"], f"{source}.backends.{name}")
+        if not isinstance(b["cmake_flags"], list):
+            raise ValidationError(f"{source}.backends.{name}.cmake_flags: must be a list")
+
+
+def validate_models_dict(data: dict, host_profile: dict, manifest: dict, source: str = "models.yaml") -> dict:
+    """Validate an in-memory models dict without writing to disk."""
+    if not isinstance(data, dict) or "models" not in data or not isinstance(data["models"], list):
+        raise ValidationError(f"{source}: expected 'models' list at root")
+
+    gpu_backends = {g["id"]: set(g["backends"]) for g in host_profile["gpus"]}
+    known_backends = set(manifest["backends"].keys())
+    seen_ids: set[str] = set()
+
+    for i, m in enumerate(data["models"]):
+        _require(m, ["id", "engine"], f"{source}.models[{i}]")
+        mid = m["id"]
+        if mid in seen_ids:
+            raise ValidationError(f"{source}: duplicate model id {mid!r}")
+        seen_ids.add(mid)
+
+        engine = m["engine"]
+        if engine == "llama-cpp":
+            _require(m, ["repo_id", "quant_file", "bind"], f"{source}.models[{i}] ({mid})")
+            bind = m["bind"]
+            _require(bind, ["gpu", "backend"], f"{source}.models[{i}].bind")
+            gpu, backend = bind["gpu"], bind["backend"]
+            if gpu not in gpu_backends:
+                raise ValidationError(
+                    f"{source}: model {mid!r} binds to unknown gpu {gpu!r} "
+                    f"(host profile defines: {sorted(gpu_backends)})"
+                )
+            if backend not in gpu_backends[gpu]:
+                raise ValidationError(
+                    f"{source}: model {mid!r} binds to backend {backend!r} not enabled for gpu {gpu!r} "
+                    f"(gpu {gpu!r} allows: {sorted(gpu_backends[gpu])})"
+                )
+            if backend not in known_backends:
+                raise ValidationError(
+                    f"{source}: model {mid!r} uses backend {backend!r} not defined in manifest.yaml "
+                    f"(manifest defines: {sorted(known_backends)})"
+                )
+        elif engine == "unmanaged":
+            _require(m, ["cmd"], f"{source}.models[{i}] ({mid})")
+        else:
+            raise ValidationError(f"{source}.models[{i}] ({mid}): unknown engine {engine!r} (allowed: 'llama-cpp', 'unmanaged')")
+
     return data
 
 
 def load_host_profile(path: Path) -> dict:
     if not path.exists():
-        sys.exit(f"no host profile at {path} — create hosts/<hostname>.yaml for this machine")
-    return _validate(path, HOST_PROFILE_SCHEMA)
+        raise ValidationError(f"no host profile at {path} — create hosts/<hostname>.yaml for this machine")
+    data = _load_yaml(path)
+    validate_host_profile_dict(data, source=str(path))
+    return data
 
 
 def try_load_host_profile(path: Path) -> dict | None:
-    """Like load_host_profile, but returns None instead of exiting when the file is missing —
-    for the cockpit's first-run flow, which offers to create one instead of refusing to start.
-    A file that exists but fails validation still exits; that's a real error, not a first run."""
     if not path.exists():
         return None
-    return _validate(path, HOST_PROFILE_SCHEMA)
-
-
-def validate_host_profile_dict(data: dict) -> None:
-    """Validate an in-memory host profile dict (e.g. built by the Settings tab's form) without
-    touching disk — raises jsonschema.ValidationError on failure, doesn't sys.exit, so a caller
-    building interactive UI can catch it and show the error inline."""
-    jsonschema.validate(data, HOST_PROFILE_SCHEMA)
+    data = _load_yaml(path)
+    validate_host_profile_dict(data, source=str(path))
+    return data
 
 
 def load_manifest(path: Path) -> dict:
-    return _validate(path, MANIFEST_SCHEMA)
+    if not path.exists():
+        raise ValidationError(f"no manifest at {path}")
+    data = _load_yaml(path)
+    validate_manifest_dict(data, source=str(path))
+    return data
 
 
 def load_models(path: Path, host_profile: dict, manifest: dict) -> dict:
-    data = _validate(path, MODELS_SCHEMA)
-    gpu_backends = {g["id"]: set(g["backends"]) for g in host_profile["gpus"]}
-    known_backends = set(manifest["backends"].keys())
-    seen_ids: set[str] = set()
-    for m in data["models"]:
-        if m["id"] in seen_ids:
-            sys.exit(f"{path}: duplicate model id {m['id']!r}")
-        seen_ids.add(m["id"])
-        if m["engine"] != "llama-cpp":
-            continue
-        gpu, backend = m["bind"]["gpu"], m["bind"]["backend"]
-        if gpu not in gpu_backends:
-            sys.exit(
-                f"{path}: model {m['id']!r} binds to unknown gpu {gpu!r} "
-                f"(host profile defines: {sorted(gpu_backends)})"
-            )
-        if backend not in gpu_backends[gpu]:
-            sys.exit(
-                f"{path}: model {m['id']!r} binds to backend {backend!r} not enabled for gpu {gpu!r} "
-                f"(gpu {gpu!r} allows: {sorted(gpu_backends[gpu])})"
-            )
-        if backend not in known_backends:
-            sys.exit(
-                f"{path}: model {m['id']!r} uses backend {backend!r} not defined in manifest.yaml "
-                f"(manifest defines: {sorted(known_backends)})"
-            )
-    return data
+    if not path.exists():
+        raise ValidationError(f"no models file at {path} — create models.yaml for this machine")
+    data = _load_yaml(path)
+    return validate_models_dict(data, host_profile, manifest, source=str(path))

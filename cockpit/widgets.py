@@ -30,6 +30,32 @@ SHARED_CSS = """
 .panel-title {
     text-style: bold;
 }
+.section-title {
+    text-style: bold;
+    color: $accent;
+    margin-top: 1;
+    margin-bottom: 1;
+}
+.close-button {
+    min-width: 4;
+    width: 4;
+    height: 1;
+    border: none;
+    padding: 0;
+    dock: right;
+}
+.inline-row {
+    height: auto;
+    align-vertical: middle;
+}
+.inline-row Input {
+    width: 1fr;
+    margin-right: 1;
+}
+.inline-row Button {
+    min-width: 10;
+    height: 3;
+}
 .button-row {
     height: auto;
     margin-top: 1;
@@ -45,9 +71,6 @@ SHARED_CSS = """
 .error-text {
     color: $error;
     margin-top: 1;
-}
-.accent-button {
-    background: $accent;
 }
 """
 
@@ -68,6 +91,8 @@ class InfoModal(ModalScreen[None]):
     InfoModal("PCIe devices", run_shell_capture(cmd))) — scrolling is defined once here so
     every such popup (lspci, ip a, future ones) gets it for free instead of reimplementing it.
     """
+
+    BINDINGS = [("escape", "dismiss_modal", "Close")]
 
     DEFAULT_CSS = """
     InfoModal {
@@ -102,9 +127,12 @@ class InfoModal(ModalScreen[None]):
         with Vertical(id="info-dialog"):
             with Horizontal(id="info-header"):
                 yield Static(self.info_title, id="info-title")
-                yield Button("X", id="info-close", variant="error")
+                yield Button("×", id="info-close", classes="close-button", variant="error")
             with VerticalScroll(id="info-body"):
                 yield Static(self.content_text)
+
+    def action_dismiss_modal(self) -> None:
+        self.dismiss(None)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "info-close":
@@ -115,6 +143,8 @@ class ConfirmModal(ModalScreen[bool]):
     """Usage inside a @work async handler: confirmed = await self.app.push_screen_wait(
     ConfirmModal("Rebuild cuda?")); if not confirmed: return
     """
+
+    BINDINGS = [("escape", "cancel", "Cancel")]
 
     DEFAULT_CSS = """
     ConfirmModal {
@@ -141,9 +171,12 @@ class ConfirmModal(ModalScreen[bool]):
     def compose(self) -> ComposeResult:
         with Vertical(id="confirm-dialog"):
             yield Static(self.message, id="confirm-message")
-            with Horizontal():
+            with Horizontal(classes="button-row"):
                 yield Button(self.confirm_label, variant="error" if self.danger else "primary", id="confirm-yes")
                 yield Button("Cancel", id="confirm-no")
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         self.dismiss(event.button.id == "confirm-yes")

@@ -4,10 +4,12 @@ from __future__ import annotations
 import argparse
 import logging
 import socket
+import sys
 from pathlib import Path
 
 from provision import schema
 from provision.common import Runner, require_root
+from provision.schema import ValidationError
 from provision.steps import build, drivers, hf, swap, wol
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -48,7 +50,12 @@ def main() -> None:
     if not args.dry_run:
         require_root()  # every step writes under /opt, /etc, /var/lib or installs apt packages
 
-    host_profile, manifest, models = _load(args.host)
+    try:
+        host_profile, manifest, models = _load(args.host)
+    except ValidationError as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
+
     runner = Runner(dry_run=args.dry_run)
 
     order = list(STEPS) if args.step == "all" else [args.step]

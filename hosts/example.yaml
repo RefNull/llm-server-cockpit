@@ -18,12 +18,12 @@ network:
     health_check_timeout: 120
 
 gpus:
-  - id: gpu0
+  - id: gpu-nvidia
     vendor: nvidia   # nvidia | amd | intel
     backends: [cuda]  # any of: cuda, rocm, vulkan, sycl — must match keys in manifest.yaml backends
-  # - id: gpu1
-  #   vendor: intel
-  #   backends: [vulkan]
+  - id: gpu-intel
+    vendor: intel
+    backends: [vulkan]
 
 paths:
   models_dir: /srv/models/gguf

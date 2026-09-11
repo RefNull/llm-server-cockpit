@@ -4,5 +4,4 @@
 # a separate venv for textual, that split doesn't compose (a venv can't see system
 # site-packages by default).
 PyYAML==6.0.3
-jsonschema==4.26.0
 textual==8.2.8

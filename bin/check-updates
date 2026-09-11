@@ -46,8 +46,11 @@ def main() -> None:
     parser.add_argument("--host", default=socket.gethostname())
     args = parser.parse_args()
 
-    host_profile = schema.load_host_profile(_REPO_ROOT / "hosts" / f"{args.host}.yaml")
-    manifest = schema.load_manifest(_REPO_ROOT / "manifest.yaml")
+    try:
+        host_profile = schema.load_host_profile(_REPO_ROOT / "hosts" / f"{args.host}.yaml")
+        manifest = schema.load_manifest(_REPO_ROOT / "manifest.yaml")
+    except schema.ValidationError as e:
+        sys.exit(f"error: {e}")
 
     result = {
         "checked_at": datetime.now(timezone.utc).isoformat(),

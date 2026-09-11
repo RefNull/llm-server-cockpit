@@ -59,7 +59,10 @@ class CockpitApp(App):
         self.host_profile = schema.try_load_host_profile(REPO_ROOT / "hosts" / f"{self.host_name}.yaml")
         self.manifest = schema.load_manifest(REPO_ROOT / "manifest.yaml")
         if self.host_profile is not None:
-            self.models = schema.load_models(REPO_ROOT / "models.yaml", self.host_profile, self.manifest)
+            try:
+                self.models = schema.load_models(REPO_ROOT / "models.yaml", self.host_profile, self.manifest)
+            except schema.ValidationError:
+                self.models = {"models": []}
         else:
             self.models = {"models": []}
         self.runner = Runner(dry_run=True)
@@ -102,7 +105,10 @@ class CockpitApp(App):
     def reload_models(self) -> None:
         if self.host_profile is None:
             return
-        self.models = schema.load_models(self.repo_root / "models.yaml", self.host_profile, self.manifest)
+        try:
+            self.models = schema.load_models(self.repo_root / "models.yaml", self.host_profile, self.manifest)
+        except schema.ValidationError as e:
+            self.notify(f"models.yaml error: {e}", severity="error")
 
 
 def main() -> None:
