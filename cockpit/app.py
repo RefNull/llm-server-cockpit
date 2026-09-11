@@ -12,18 +12,65 @@ import socket
 from pathlib import Path
 
 from textual.app import App, ComposeResult
-from textual.widgets import Footer, Header, TabbedContent, TabPane
+from textual.containers import Vertical
+from textual.widgets import Footer, Header, Static, TabbedContent, TabPane
 
 from provision import schema
 from provision.common import Runner
 
+from cockpit import __version__
 from cockpit.screens.builds import BuildsScreen
 from cockpit.screens.deploy import DeployScreen
 from cockpit.screens.downloads import DownloadsScreen
 from cockpit.screens.settings import SettingsScreen
-from cockpit.widgets import SHARED_CSS
+from cockpit.widgets import AMBER_THEME, SHARED_CSS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+ASCII_BANNER = (
+    r" _      _     ___  ___       _____ ___________ _   _ ___________       _____ _____ _____  _   ________ _____ _____ " "\n"
+    r"| |    | |    |  \/  |      /  ___|  ___| ___ \ | | |  ___| ___ \     /  __ \  _  /  __ \| | / /| ___ \_   _|_   _|" "\n"
+    r"| |    | |    | .  . |______\ `--.| |__ | |_/ / | | | |__ | |_/ /_____| /  \/ | | | /  \/| |/ / | |_/ / | |   | |  " "\n"
+    r"| |    | |    | |\/| |______|`--. \  __||    /| | | |  __||    /______| |   | | | | |    |    \ |  __/  | |   | |  " "\n"
+    r"| |____| |____| |  | |      /\__/ / |___| |\ \\ \_/ / |___| |\ \      | \__/\ \_/ / \__/\| |\  \| |    _| |_  | |  " "\n"
+    r"\_____/\_____/\_|  |_/      \____/\____/\_| \_|\___/\____/\_| \_|      \____/\___/ \____/\_| \_/\_|    \___/  \_/  "
+)
+
+
+class CockpitHeader(Vertical):
+    """Top header widget displaying ASCII art banner, version, and host info."""
+
+    DEFAULT_CSS = """
+    CockpitHeader {
+        height: auto;
+        align: center middle;
+        margin: 0 2 1 2;
+    }
+    CockpitHeader #banner-art {
+        color: #f5a623;
+        content-align: center middle;
+        text-align: center;
+        width: 100%;
+        overflow-x: hidden;
+    }
+    CockpitHeader #banner-meta {
+        content-align: center middle;
+        text-align: center;
+        width: 100%;
+        color: $text-muted;
+    }
+    """
+
+    def __init__(self, host_name: str) -> None:
+        super().__init__(id="cockpit-header")
+        self.host_name = host_name
+
+    def compose(self) -> ComposeResult:
+        yield Static(ASCII_BANNER, id="banner-art")
+        yield Static(
+            f"[bold #f5a623]Local LLM server cockpit · v{__version__}[/]  [dim]·[/]  [dim]Host:[/] [bold #e5a93c]{self.host_name}[/]",
+            id="banner-meta",
+        )
 
 
 class CockpitApp(App):
@@ -43,17 +90,25 @@ class CockpitApp(App):
     file's module docstring for the convention every screen composes against.
     """
 
-    CSS = SHARED_CSS
+    CSS = (
+        SHARED_CSS
+        + """
+    TabbedContent {
+        margin: 0 2;
+    }
+    """
+    )
 
     TITLE = "llm-server-cockpit"
     BINDINGS = [
-        ("d", "toggle_dry_run", "Toggle dry-run"),
         ("r", "refresh_all", "Refresh"),
         ("q", "quit", "Quit"),
     ]
 
     def __init__(self, host: str | None = None) -> None:
         super().__init__()
+        self.register_theme(AMBER_THEME)
+        self.theme = "cockpit-amber"
         self.host_name = host or socket.gethostname()
         self.repo_root = REPO_ROOT
         self.host_profile = schema.try_load_host_profile(REPO_ROOT / "hosts" / f"{self.host_name}.yaml")
@@ -69,6 +124,7 @@ class CockpitApp(App):
 
     def compose(self) -> ComposeResult:
         yield Header()
+        yield CockpitHeader(self.host_name)
         if self.host_profile is None:
             with TabbedContent(initial="settings"):
                 with TabPane("First setup", id="settings"):
@@ -84,17 +140,6 @@ class CockpitApp(App):
                 with TabPane("Settings", id="settings"):
                     yield SettingsScreen(self.host_profile, self.manifest, self.models, self.runner, self.repo_root, self)
         yield Footer()
-
-    def on_mount(self) -> None:
-        self._update_dry_run_subtitle()
-
-    def _update_dry_run_subtitle(self) -> None:
-        self.sub_title = "DRY RUN — no action will actually execute" if self.runner.dry_run else "LIVE — actions execute for real"
-
-    def action_toggle_dry_run(self) -> None:
-        self.runner.dry_run = not self.runner.dry_run
-        self._update_dry_run_subtitle()
-        self.notify(f"dry-run {'ON' if self.runner.dry_run else 'OFF'}", severity="warning" if not self.runner.dry_run else "information")
 
     def action_refresh_all(self) -> None:
         self.reload_models()

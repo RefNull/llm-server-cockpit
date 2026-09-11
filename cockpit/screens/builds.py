@@ -74,6 +74,9 @@ class BuildsScreen(Widget):
         text-style: italic;
         margin-bottom: 1;
     }
+    BuildsScreen #selected-build {
+        margin-bottom: 1;
+    }
     """
 
     def __init__(
@@ -94,8 +97,8 @@ class BuildsScreen(Widget):
         self.app_ref = app_ref
         self.backends = self._compute_backends()
 
-        # ref -> None once we know it's stale; populated by _refresh_builds_and_history.
-        self._selected_build: dict[str, str | None] = {backend: None for backend in self.backends}
+        self._selected_backend: str | None = None
+        self._selected_ref: str | None = None
         self._builds_cache: dict[str, list[dict]] = {backend: [] for backend in self.backends}
         self._build_in_progress = False
 
@@ -117,12 +120,14 @@ class BuildsScreen(Widget):
 
     def compose(self) -> ComposeResult:
         with VerticalScroll():
+            yield Static("llama.cpp build management, version checks, and rollback controls", classes="subtitle")
+
             with Vertical(id="update-panel", classes="panel"):
                 yield Label("Upstream version check", classes="panel-title")
                 yield Static("llama.cpp: not checked yet", id="update-llama-cpp")
                 yield Static("llama-swap: not checked yet", id="update-llama-swap")
                 with Horizontal(classes="button-row"):
-                    yield Button("Check for updates", id="check-updates-btn")
+                    yield Button("Check for updates", id="check-updates-btn", classes="thin-button")
 
             if not self.backends:
                 yield Static(
@@ -131,33 +136,39 @@ class BuildsScreen(Widget):
                     id="no-backends",
                     classes="panel",
                 )
+            else:
+                with Vertical(id="builds-panel", classes="panel"):
+                    ref = self.manifest.get("llama_cpp", {}).get("ref", "")
+                    yield Static(f"pinned llama.cpp ref: {self._short(ref)}", id="pinned-ref")
+                    buttons: list[Widget] = [
+                        Button(f"Build {b}", id=f"build-{b}", variant="primary", classes="thin-button")
+                        for b in self.backends
+                    ]
+                    buttons.append(
+                        Button("Roll back to selected", id="rollback-btn", variant="warning", classes="thin-button")
+                    )
+                    yield Horizontal(*buttons, classes="button-row")
 
-            for backend in self.backends:
-                with Vertical(id=f"backend-panel-{backend}", classes="panel"):
-                    yield Label(f"Backend: {backend}", classes="panel-title")
-                    yield Static("", id=f"pinned-{backend}")
-                    with Horizontal(classes="button-row"):
-                        yield Button(f"Build {backend}", id=f"build-{backend}", variant="primary")
-                        yield Button("Roll back to selected", id=f"rollback-{backend}", variant="warning")
                     yield Label("Retained builds (click a row to select it for rollback):")
-                    yield DataTable(id=f"builds-table-{backend}")
-                    yield Static("selected for rollback: (none)", id=f"selected-{backend}")
+                    yield DataTable(id="builds-table")
+                    yield Static("selected for rollback: (none — click a row above)", id="selected-build")
+
                     yield Label("Recent build history:")
-                    yield DataTable(id=f"history-table-{backend}")
+                    yield DataTable(id="history-table")
 
             yield Static("", id="build-status")
             yield RichLog(id="build-log", highlight=False, markup=False, max_lines=400)
 
     def on_mount(self) -> None:
-        for backend in self.backends:
-            builds_table = self.query_one(f"#builds-table-{backend}", DataTable)
+        if self.backends:
+            builds_table = self.query_one("#builds-table", DataTable)
             builds_table.cursor_type = "row"
             builds_table.zebra_stripes = True
-            builds_table.add_columns("ref", "current", "sane")
+            builds_table.add_columns("Backend", "Ref", "Status", "Integrity")
 
-            history_table = self.query_one(f"#history-table-{backend}", DataTable)
+            history_table = self.query_one("#history-table", DataTable)
             history_table.zebra_stripes = True
-            history_table.add_columns("timestamp (UTC)", "outcome", "detail")
+            history_table.add_columns("Backend", "Timestamp (UTC)", "Outcome", "Detail")
 
         self._refresh_builds_and_history()
         # Initial check on mount so the panel isn't blank; the button below is for
@@ -172,55 +183,91 @@ class BuildsScreen(Widget):
     # ------------------------------------------------------------------ rendering
 
     def _refresh_builds_and_history(self) -> None:
-        ref = self.manifest["llama_cpp"]["ref"]
-        for backend in self.backends:
-            pinned_widget = self.query_one(f"#pinned-{backend}", Static)
+        if not self.backends:
+            return
+        ref = self.manifest.get("llama_cpp", {}).get("ref", "")
+        if self.query("#pinned-ref"):
+            pinned_widget = self.query_one("#pinned-ref", Static)
             pinned_widget.update(f"pinned llama.cpp ref: {self._short(ref)}")
             pinned_widget.tooltip = ref
 
+        table = self.query_one("#builds-table", DataTable)
+        table.clear()
+        for backend in self.backends:
             builds = build_step.list_builds(self.host_profile, backend)
             self._builds_cache[backend] = builds
-            table = self.query_one(f"#builds-table-{backend}", DataTable)
-            table.clear()
             for b in builds:
-                current_cell = Text("current", style="bold green") if b["current"] else Text("")
-                sane_cell = Text("ok", style="green") if b["sane"] else Text("NOT SANE", style="bold red")
-                table.add_row(Text(self._short(b["ref"])), current_cell, sane_cell, key=b["ref"])
-
-            if self._selected_build.get(backend) not in {b["ref"] for b in builds}:
-                self._selected_build[backend] = None
-            self._update_selected_label(backend)
-
-            history = build_step.read_build_history(self.host_profile, backend, limit=5)
-            htable = self.query_one(f"#history-table-{backend}", DataTable)
-            htable.clear()
-            for h in history:
-                detail = h.get("detail") or ""
-                first_line = detail.splitlines()[0] if detail else ""
-                ts = (h.get("timestamp") or "")[:19].replace("T", " ")
-                outcome = h.get("outcome", "")
-                style = (
-                    "green" if outcome == "smoke_pass"
-                    else "bold red" if outcome in ("smoke_failed", "build_failed")
-                    else ""
+                current_cell = Text("current", style="bold green") if b.get("current") else Text("retained", style="dim")
+                sane_cell = Text("ok", style="green") if b.get("sane") else Text("NOT SANE", style="bold red")
+                table.add_row(
+                    Text(backend),
+                    Text(self._short(b.get("ref", ""))),
+                    current_cell,
+                    sane_cell,
+                    key=f"{backend}:{b.get('ref', '')}",
                 )
-                htable.add_row(Text(ts), Text(outcome, style=style), Text(first_line))
 
-    def _update_selected_label(self, backend: str) -> None:
-        label = self.query_one(f"#selected-{backend}", Static)
-        ref = self._selected_build.get(backend)
-        if ref:
-            label.update(f"selected for rollback: {self._short(ref)} (full: {ref})")
+        if self._selected_backend and self._selected_ref:
+            backend_builds = self._builds_cache.get(self._selected_backend, [])
+            if not any(b.get("ref") == self._selected_ref for b in backend_builds):
+                self._selected_backend = None
+                self._selected_ref = None
+        self._update_selected_label()
+
+        all_history: list[tuple[str, dict]] = []
+        for backend in self.backends:
+            history = build_step.read_build_history(self.host_profile, backend, limit=5)
+            for h in history:
+                all_history.append((backend, h))
+        all_history.sort(key=lambda item: item[1].get("timestamp") or "", reverse=True)
+
+        htable = self.query_one("#history-table", DataTable)
+        htable.clear()
+        for backend, h in all_history[:10]:
+            detail = h.get("detail") or ""
+            first_line = detail.splitlines()[0] if detail else ""
+            ts = (h.get("timestamp") or "")[:19].replace("T", " ")
+            outcome = h.get("outcome", "")
+            style = (
+                "green" if outcome == "smoke_pass"
+                else "bold red" if outcome in ("smoke_failed", "build_failed")
+                else ""
+            )
+            htable.add_row(Text(backend), Text(ts), Text(outcome, style=style), Text(first_line))
+
+    def _update_selected_label(self) -> None:
+        if not self.query("#selected-build"):
+            return
+        label = self.query_one("#selected-build", Static)
+        if self._selected_backend and self._selected_ref:
+            label.update(
+                f"selected for rollback: [{self._selected_backend}] {self._short(self._selected_ref)} (full: {self._selected_ref})"
+            )
         else:
             label.update("selected for rollback: (none — click a row above)")
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
-        table_id = event.data_table.id or ""
-        if not table_id.startswith("builds-table-"):
+        if event.data_table.id != "builds-table":
             return
-        backend = table_id.removeprefix("builds-table-")
-        self._selected_build[backend] = event.row_key.value if event.row_key is not None else None
-        self._update_selected_label(backend)
+        if event.row_key is None or event.row_key.value is None:
+            self._selected_backend = None
+            self._selected_ref = None
+        else:
+            key_str = str(event.row_key.value)
+            backend, _, ref = key_str.partition(":")
+            self._selected_backend = backend
+            self._selected_ref = ref
+        self._update_selected_label()
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        if event.data_table.id != "builds-table":
+            return
+        if event.row_key is not None and event.row_key.value is not None:
+            key_str = str(event.row_key.value)
+            backend, _, ref = key_str.partition(":")
+            self._selected_backend = backend
+            self._selected_ref = ref
+            self._update_selected_label()
 
     # ------------------------------------------------------------------ button dispatch
 
@@ -230,8 +277,8 @@ class BuildsScreen(Widget):
             self._run_update_check()
         elif button_id.startswith("build-"):
             await self._handle_build_press(button_id.removeprefix("build-"))
-        elif button_id.startswith("rollback-"):
-            await self._handle_rollback_press(button_id.removeprefix("rollback-"))
+        elif button_id == "rollback-btn":
+            await self._handle_rollback_press()
 
     async def _handle_build_press(self, backend: str) -> None:
         if self._build_in_progress:
@@ -252,17 +299,19 @@ class BuildsScreen(Widget):
         if confirmed:
             self._run_build()
 
-    async def _handle_rollback_press(self, backend: str) -> None:
-        target_ref = self._selected_build.get(backend)
-        if not target_ref:
-            self.notify(f"select a build in the {backend} table first", severity="warning")
+    async def _handle_rollback_press(self) -> None:
+        if not self._selected_backend or not self._selected_ref:
+            self.notify("select a build in the table first", severity="warning")
             return
 
-        matching = next((b for b in self._builds_cache.get(backend, []) if b["ref"] == target_ref), None)
+        backend = self._selected_backend
+        target_ref = self._selected_ref
+
+        matching = next((b for b in self._builds_cache.get(backend, []) if b.get("ref") == target_ref), None)
         if matching is None:
             self.notify("selected build is no longer available — refresh and try again", severity="warning")
             return
-        if matching["current"]:
+        if matching.get("current"):
             self.notify(f"{backend}: {self._short(target_ref)} is already current", severity="information")
             return
 
@@ -313,8 +362,12 @@ class BuildsScreen(Widget):
         self._build_in_progress = active
         self.query_one("#build-status", Static).update("building... (see log below)" if active else "")
         for backend in self.backends:
-            self.query_one(f"#build-{backend}", Button).disabled = active
-            self.query_one(f"#rollback-{backend}", Button).disabled = active
+            btn = self.query(f"#build-{backend}")
+            if btn:
+                btn.first(Button).disabled = active
+        rollback_btn = self.query("#rollback-btn")
+        if rollback_btn:
+            rollback_btn.first(Button).disabled = active
         if active:
             self.query_one("#build-log", RichLog).clear()
 
@@ -351,14 +404,28 @@ class BuildsScreen(Widget):
         self.app.call_from_thread(self._set_checking_status, False)
 
     def _set_checking_status(self, checking: bool) -> None:
-        self.query_one("#check-updates-btn", Button).disabled = checking
+        if not self.is_mounted:
+            return
+        btn = self.query("#check-updates-btn")
+        if btn:
+            btn.first(Button).disabled = checking
         if checking:
-            self.query_one("#update-llama-cpp", Static).update("llama.cpp: checking...")
-            self.query_one("#update-llama-swap", Static).update("llama-swap: checking...")
+            cpp = self.query("#update-llama-cpp")
+            if cpp:
+                cpp.first(Static).update("llama.cpp: checking...")
+            swap = self.query("#update-llama-swap")
+            if swap:
+                swap.first(Static).update("llama-swap: checking...")
 
     def _apply_update_check_results(self, result_cpp: dict, result_swap: dict) -> None:
-        self.query_one("#update-llama-cpp", Static).update(self._format_check("llama.cpp", result_cpp))
-        self.query_one("#update-llama-swap", Static).update(self._format_check("llama-swap", result_swap))
+        if not self.is_mounted:
+            return
+        cpp = self.query("#update-llama-cpp")
+        if cpp:
+            cpp.first(Static).update(self._format_check("llama.cpp", result_cpp))
+        swap = self.query("#update-llama-swap")
+        if swap:
+            swap.first(Static).update(self._format_check("llama-swap", result_swap))
 
     def _format_check(self, name: str, result: dict) -> str:
         if not result.get("ok"):

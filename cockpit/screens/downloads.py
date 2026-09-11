@@ -59,6 +59,10 @@ class DownloadsScreen(Widget):
     #disk-usage {
         margin: 1 0;
     }
+    #empty-models-notice {
+        margin: 1 0;
+        text-style: italic;
+    }
     #model-table {
         height: auto;
         max-height: 15;
@@ -87,14 +91,20 @@ class DownloadsScreen(Widget):
 
     def compose(self) -> ComposeResult:
         with VerticalScroll():
+            yield Static("Hugging Face model weights download and cache inventory", classes="subtitle")
             yield Static("", id="auth-banner")
             yield Static("", id="disk-usage")
+            yield Static(
+                "No llama-cpp models configured in models.yaml. Add models under the Deploy tab first.",
+                id="empty-models-notice",
+                classes="status-text",
+            )
             table = DataTable(id="model-table", zebra_stripes=True)
             table.cursor_type = "row"
             yield table
             with Horizontal(classes="button-row"):
-                yield Button("Download selected", id="download-selected", variant="primary")
-                yield Button("Download all", id="download-all", variant="warning")
+                yield Button("Download selected", id="download-selected", variant="primary", classes="thin-button")
+                yield Button("Download all", id="download-all", variant="warning", classes="thin-button")
             yield Label("", id="download-status", classes="status-text")
 
     def on_mount(self) -> None:
@@ -142,7 +152,17 @@ class DownloadsScreen(Widget):
                 STATUS_ICONS.get(status, status),
                 key=model["id"],
             )
-        self._sync_button_state()
+
+        if not self._downloadable:
+            self.query_one("#model-table").display = False
+            self.query_one("#empty-models-notice").display = True
+            self.query_one("#download-selected", Button).disabled = True
+            self.query_one("#download-all", Button).disabled = True
+        else:
+            self.query_one("#model-table").display = True
+            self.query_one("#empty-models-notice").display = False
+            self.query_one("#download-all", Button).disabled = False
+            self._sync_button_state()
 
     def _refresh_disk_usage(self) -> None:
         widget = self.query_one("#disk-usage", Static)
@@ -162,6 +182,9 @@ class DownloadsScreen(Widget):
     def _sync_button_state(self) -> None:
         """Enable 'Download selected' only when the highlighted row's status is 'missing'."""
         button = self.query_one("#download-selected", Button)
+        if not self._downloadable:
+            button.disabled = True
+            return
         table = self.query_one("#model-table", DataTable)
         model_id = self._selected_model_id(table)
         if model_id is None:
@@ -191,6 +214,7 @@ class DownloadsScreen(Widget):
     # ------------------------------------------------------------------
 
     def on_refresh_requested(self) -> None:
+        self.models = getattr(self.cockpit_app, "models", self.models)
         self._refresh_auth_banner()
         self._refresh_table()
         self._refresh_disk_usage()

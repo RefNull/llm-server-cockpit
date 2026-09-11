@@ -19,22 +19,64 @@ import subprocess
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
+from textual.theme import Theme
 from textual.widgets import Button, Static
 
+AMBER_THEME = Theme(
+    name="cockpit-amber",
+    primary="#e5a93c",
+    secondary="#d97706",
+    accent="#f5a623",
+    warning="#f59e0b",
+    error="#ef4444",
+    success="#10b981",
+    background="#121214",
+    surface="#1a1a1e",
+    panel="#1e1e24",
+    dark=True,
+)
+
 SHARED_CSS = """
+Header {
+    background: #e5a93c;
+    color: #000000;
+    text-style: bold;
+}
+Tabs {
+    background: transparent;
+}
+Tab {
+    padding: 0 2;
+}
+Tab.-active {
+    color: #f5a623;
+    text-style: bold;
+    border-bottom: tall #f5a623;
+}
 .panel {
-    border: round $primary;
     padding: 0 1;
     margin-bottom: 1;
 }
 .panel-title {
     text-style: bold;
 }
+.subtitle {
+    color: $text-muted;
+    margin-bottom: 1;
+    text-style: italic;
+}
 .section-title {
     text-style: bold;
     color: $accent;
     margin-top: 1;
     margin-bottom: 1;
+}
+.thin-button {
+    height: 1;
+    min-width: 10;
+    border: none;
+    padding: 0 1;
+    margin-right: 1;
 }
 .close-button {
     min-width: 4;

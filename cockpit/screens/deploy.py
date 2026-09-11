@@ -78,13 +78,14 @@ class DeployScreen(Widget):
 
     def compose(self) -> ComposeResult:
         with VerticalScroll():
+            yield Static("Configure models.yaml and deploy the llama-swap inference routing service", classes="subtitle")
             yield Static("Models (models.yaml)", classes="section-title")
             yield DataTable(id="models-table")
             with Horizontal(classes="button-row"):
-                yield Button("Add", id="btn-add", variant="primary")
-                yield Button("Edit", id="btn-edit")
-                yield Button("Delete", id="btn-delete", variant="error")
-                yield Button("Preview config.yaml", id="btn-preview")
+                yield Button("Add", id="btn-add", variant="primary", classes="thin-button")
+                yield Button("Edit", id="btn-edit", classes="thin-button")
+                yield Button("Delete", id="btn-delete", variant="error", classes="thin-button")
+                yield Button("Preview config.yaml", id="btn-preview", classes="thin-button")
             yield Static("", id="status-message", classes="status-text")
 
             with Vertical(id="edit-form", classes="panel"):
@@ -121,15 +122,20 @@ class DeployScreen(Widget):
 
                 yield Static("", id="form-error", classes="error-text")
                 with Horizontal(classes="button-row"):
-                    yield Button("Save", id="btn-save", variant="primary")
-                    yield Button("Cancel", id="btn-cancel")
+                    yield Button("Save", id="btn-save", variant="primary", classes="thin-button")
+                    yield Button("Cancel", id="btn-cancel", classes="thin-button")
 
             with Vertical(id="preview-area", classes="panel"):
                 yield Static("Generated config.yaml preview", classes="panel-title")
                 yield TextArea(id="preview-text")
                 with Horizontal(classes="button-row"):
-                    yield Button("Apply this config", id="btn-confirm-apply", variant="primary")
-                    yield Button("Close preview", id="btn-close-preview")
+                    yield Button(
+                        "Deploy Host Configuration (llama-swap & systemd)",
+                        id="btn-confirm-apply",
+                        variant="primary",
+                        classes="thin-button",
+                    )
+                    yield Button("Close preview", id="btn-close-preview", classes="thin-button")
 
     def on_mount(self) -> None:
         table = self.query_one("#models-table", DataTable)
@@ -436,16 +442,17 @@ class DeployScreen(Widget):
 
     @work
     async def _confirm_and_apply(self) -> None:
+        message = "Deploy llama-swap service and apply configuration to systemd?"
         if self.runner.dry_run:
-            message = "Apply this config? [DRY RUN — no real install/restart will happen]"
+            message += " [DRY RUN — no real install/restart will happen]"
         else:
-            message = "Apply this config and restart llama-swap? [LIVE — this restarts the real service]"
+            message += " [LIVE — this restarts the real service]"
         confirmed = await self.app.push_screen_wait(
-            ConfirmModal(message, confirm_label="Apply", danger=not self.runner.dry_run)
+            ConfirmModal(message, confirm_label="Deploy", danger=not self.runner.dry_run)
         )
         if not confirmed:
             return
-        self._set_status("applying config...")
+        self._set_status("deploying configuration...")
         self._apply_in_background()
 
     @work(thread=True)
@@ -453,12 +460,16 @@ class DeployScreen(Widget):
         try:
             swap.run(self.host_profile, self.manifest, self.models, self.runner, self.repo_root)
         except SystemExit as e:
-            self.app.call_from_thread(self._set_status, f"apply failed: {e.code}")
+            self.app.call_from_thread(self._set_status, f"deploy failed: {e.code}")
             return
         except Exception as e:
-            self.app.call_from_thread(self._set_status, f"apply failed: {e}")
+            self.app.call_from_thread(self._set_status, f"deploy failed: {e}")
             return
-        done_message = "dry-run apply complete (nothing was actually installed/restarted)" if self.runner.dry_run else "applied config and restarted llama-swap"
+        done_message = (
+            "dry-run deploy complete (nothing was actually installed/restarted)"
+            if self.runner.dry_run
+            else "deployed configuration and restarted llama-swap"
+        )
         self.app.call_from_thread(self._set_status, done_message)
 
     # -- button dispatch ------------------------------------------------------------

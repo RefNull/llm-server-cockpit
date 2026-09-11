@@ -1,6 +1,8 @@
 __pycache__/
 *.pyc
 .claude/
+.DS_Store
+screenshots/
 
 # Real per-deployment data — hostnames, MACs, home-dir paths, driver fingerprints. Never
 # committed to a public repo. See hosts/example.yaml and models.example.yaml for the
