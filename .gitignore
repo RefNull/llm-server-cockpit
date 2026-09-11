@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.claude/
+
+# Real per-deployment data — hostnames, MACs, home-dir paths, driver fingerprints. Never
+# committed to a public repo. See hosts/example.yaml and models.example.yaml for the
+# templates that ARE tracked; copy them and fill in your own machine's facts locally.
+/hosts/*.yaml
+!/hosts/example.yaml
+/hosts/*.lock.yaml
+/models.yaml

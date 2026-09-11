@@ -1,0 +1,97 @@
+# Template model list. This file IS tracked by git. Copy it to models.yaml (gitignored,
+# see .gitignore) — a real per-deployment catalog shouldn't live in a public repo, even
+# though model/repo choices aren't secrets in themselves. This example reflects a real
+# migration (from a hand-maintained llama-swap config that had lost its binary/config/unit)
+# with only host-identifying paths genericized — everything else, including the specific
+# models and args, is real and left in as a working reference.
+#
+# repo_id fields marked TODO are real gaps — the exact Hugging Face repo IDs weren't known
+# (only local filenames survived from the old config) and weren't guessed at.
+#
+# Intentionally NOT carried over from the old config, per its own notes:
+#   - qwen3.6-35b-a3b: superseded by qwen3.8, kept there only for rollback.
+#   - gemma-4-12b-it: on disk but never assigned a role — add it once you've
+#     decided what it's for (lighter fallback chat model? vision duty?).
+#   - qwen3.8's --mmproj line: the mmproj file hadn't been downloaded yet.
+#     Add `mmproj_file: mmproj-Qwen3.8-27B-BF16.gguf` once it has been.
+
+models:
+  - id: qwen3.8
+    engine: llama-cpp
+    repo_id: "TODO: HF repo id for ISTA-DASLab GSQ-RCO Qwen3.8-27B IQ3_S-mtp quant"
+    quant_file: Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf
+    bind:
+      gpu: gpu-intel
+      backend: vulkan
+    llama_server_args:
+      - "--ctx-size"
+      - "262144"
+      - "--cache-type-k"
+      - "q4_0"
+      - "--cache-type-v"
+      - "q4_0"
+      - "--jinja"
+      - "--chat-template-kwargs"
+      - '{"reasoning_effort":"medium","preserve_thinking":true}'
+      - "--reasoning-budget"
+      - "5000"
+      - "--spec-type"
+      - "draft-mtp"
+      - "--spec-draft-n-max"
+      - "2"
+      - "--fit"
+      - "off"
+      - "--ctx-checkpoints"
+      - "0"
+      - "--flash-attn"
+    env:
+      - "VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/intel_icd.x86_64.json"
+    ttl: 0
+
+  - id: bge-m3
+    engine: llama-cpp
+    repo_id: "TODO: HF repo id for bge-m3 Q8_0 quant"
+    quant_file: bge-m3-Q8_0.gguf
+    bind:
+      gpu: gpu-nvidia
+      backend: cuda
+    llama_server_args:
+      - "--embedding"
+      - "--pooling"
+      - "cls"
+      - "--ctx-size"
+      - "8192"
+    env:
+      - "CUDA_VISIBLE_DEVICES=0"
+    ttl: 0
+    group: always-on
+
+  - id: qwen3-reranker-4b
+    engine: llama-cpp
+    repo_id: "TODO: HF repo id for Qwen3-Reranker-4B Q4_K_M quant"
+    quant_file: Qwen3-Reranker-4B-Q4_K_M.gguf
+    bind:
+      gpu: gpu-nvidia
+      backend: cuda
+    llama_server_args:
+      - "--reranking"
+      - "--pooling"
+      - "rank"
+      - "--embedding"
+    env:
+      - "CUDA_VISIBLE_DEVICES=0"
+    ttl: 0
+    group: always-on
+
+  # Not built/pinned/version-checked by this repo — it's a pre-existing
+  # docker-based service, kept only so config.yaml generation doesn't drop
+  # it and break STT/TTS. See the "unmanaged" engine in provision/schema.py.
+  - id: speaches-stt-tts
+    engine: unmanaged
+    cmd: |
+      docker run --rm -p ${PORT}:8000
+      --gpus device=0
+      -v /srv/models/speaches-cache:/home/ubuntu/.cache/huggingface/hub
+      speaches-ai/speaches:latest-cuda
+    ttl: 0
+    group: always-on

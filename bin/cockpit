@@ -1,0 +1,19 @@
+#!/usr/bin/env python3
+import argparse
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from cockpit.app import CockpitApp  # noqa: E402
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(prog="cockpit")
+    parser.add_argument("--host", default=None, help="host profile to use (defaults to this machine's hostname)")
+    args = parser.parse_args()
+    CockpitApp(host=args.host).run()
+
+
+if __name__ == "__main__":
+    main()

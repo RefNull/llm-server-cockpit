@@ -1,0 +1,57 @@
+# Version pins and per-backend build recipes. Bumping a version here is the
+# only sanctioned way to update llama.cpp or llama-swap — there is no
+# "install latest" path anywhere in this repo.
+#
+# Pinned as of 2026-09-11 research (see PR/commit history for how these were
+# chosen). Bumping llama_cpp.ref is a deliberate act: re-run `provision build`
+# and let the per-backend smoke test pass before trusting a new SHA.
+
+llama_cpp:
+  ref: 481c65f091f74c5e7089dd0a3a1cc6b50cced31e  # b10903
+  repo: https://github.com/ggml-org/llama.cpp
+
+llama_swap:
+  version: v255
+  repo: https://github.com/mostlygeek/llama-swap
+
+huggingface_hub:
+  version: "TODO: pin an exact huggingface_hub version (not researched — check PyPI before first run)"
+
+textual:
+  version: "8.2.8"  # confirmed latest as of 2026-09-11, via GitHub releases API
+
+# Backend recipes are repo-level, not host-level: a host profile only says
+# *which* of these its GPUs use (hosts/<hostname>.yaml gpus[].backends).
+# Recipes for backends no host currently uses (rocm, sycl) stay here so
+# adding a new host with different hardware is a host-profile edit, not a
+# code change.
+backends:
+  cuda:
+    cmake_flags:
+      - "-DGGML_CUDA=ON"
+      - "-DGGML_NATIVE=OFF"
+    apt_packages: []  # CUDA toolkit presence is checked, not installed, by `provision drivers`
+
+  rocm:
+    cmake_flags:
+      - "-DGGML_HIP=ON"
+    build_env:
+      HIPCXX: "$(hipconfig -l)/clang"
+      HIP_PATH: "$(hipconfig -R)"
+    apt_packages: []  # ROCm stack presence is checked, not installed, by `provision drivers`
+
+  vulkan:
+    cmake_flags:
+      - "-DGGML_VULKAN=ON"
+    apt_packages:
+      - libvulkan-dev
+      - glslc
+      - spirv-headers
+
+  sycl:
+    cmake_flags:
+      - "-DGGML_SYCL=ON"
+      - "-DCMAKE_C_COMPILER=icx"
+      - "-DCMAKE_CXX_COMPILER=icpx"
+    source_script: /opt/intel/oneapi/setvars.sh  # sourced before cmake configure+build
+    apt_packages: []

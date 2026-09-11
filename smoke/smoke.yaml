@@ -1,0 +1,13 @@
+# Pinned smoke-test fixture used by `provision build` to real-inference-test every backend
+# build, independent of the real model catalog in models.yaml. Small on purpose — this gets
+# downloaded once per host and run once per backend, not per model.
+#
+# repo_id is Qwen's own official GGUF release for Qwen2.5-0.5B-Instruct — a mainstream,
+# widely-mirrored quant (unlike the obscure repo_ids models.yaml leaves as TODO). Flagged
+# here anyway per the same policy: if this ever needs re-pinning, verify on HF before
+# trusting it blindly.
+repo_id: Qwen/Qwen2.5-0.5B-Instruct-GGUF
+quant_file: qwen2.5-0.5b-instruct-q4_k_m.gguf
+prompt: "Q: What is the capital of France?\nA:"
+expected_substring: "Paris"
+max_tokens: 32

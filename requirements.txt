@@ -1,0 +1,8 @@
+# Dependencies for provision/ and cockpit/ THEMSELVES — not the inference stack they manage.
+# All three confirmed as current-latest on PyPI/GitHub as of 2026-09-11. Install into one
+# dedicated venv (see README) — don't rely on apt's python3-yaml/python3-jsonschema alongside
+# a separate venv for textual, that split doesn't compose (a venv can't see system
+# site-packages by default).
+PyYAML==6.0.3
+jsonschema==4.26.0
+textual==8.2.8

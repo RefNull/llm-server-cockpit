@@ -1,0 +1,23 @@
+[Unit]
+Description=llama-swap model router
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Runs as root rather than a dedicated user: the unmanaged speaches-stt-tts model's cmd is a
+# `docker run`, and docker-group membership is root-equivalent anyway (trivial container
+# escape via bind mounts) — a dedicated account would need that group plus GPU device-node
+# access across nvidia/intel stacks, buying no real isolation for the extra provisioning
+# surface. Revisit if the docker-based unmanaged model goes away.
+# ExecStartPre validates config and exits (llama-swap -validate, added Aug 2026) so a bad
+# config.yaml is caught before ExecStart ever tries to bind the listen address.
+ExecStartPre=$binary_path -validate -config $config_path
+# -config is required explicitly since PR #790 (2026-05-29) removed the implicit
+# ./config.yaml default — never omit it.
+ExecStart=$binary_path -config $config_path -listen $listen_addr
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
