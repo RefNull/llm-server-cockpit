@@ -1,10 +1,8 @@
 """Cockpit: a Textual TUI over the same provision.steps.* functions the CLI uses — no
 parallel implementation of build/config-gen/download logic, just a view + confirm layer.
 
-Starts in dry-run by default (real builds/downloads/systemd restarts are one keystroke away
-in an interactive UI — default to the safe mode, make the operator opt in to real actions).
-Screens share a single Runner instance by reference, so toggling dry-run here is
-instantly visible to every tab without any extra plumbing.
+Interactive actions require operator confirmation via modals, and YAML configuration
+previews are available before deployment.
 """
 from __future__ import annotations
 
@@ -120,7 +118,7 @@ class CockpitApp(App):
                 self.models = {"models": []}
         else:
             self.models = {"models": []}
-        self.runner = Runner(dry_run=True)
+        self.runner = Runner(dry_run=False)
 
     def compose(self) -> ComposeResult:
         yield Header()

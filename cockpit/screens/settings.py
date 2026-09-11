@@ -228,7 +228,7 @@ class SettingsScreen(Widget):
                 yield Static("", id="step-review-status", classes="status-text")
                 with Horizontal(classes="button-row"):
                     yield Button("← Back: Hardware & Network", id="btn-back-hardware")
-                    yield Button("Dummy Deploy (Preview YAML)", id="btn-dummy-deploy")
+                    yield Button("Preview YAML", id="btn-dummy-deploy")
                     yield Button("Deploy Host Profile", id="btn-real-deploy", variant="primary")
 
     def _compose_normal(self) -> ComposeResult:
@@ -567,7 +567,7 @@ class SettingsScreen(Widget):
             return
         self.query_one("#step-review-error", Static).update("")
         yaml_content = yaml.safe_dump(candidate, sort_keys=False)
-        self.app.push_screen(InfoModal("Generated host profile (Dry Run)", yaml_content))
+        self.app.push_screen(InfoModal("Generated host profile preview", yaml_content))
 
     @work
     async def _real_deploy(self) -> None:
@@ -584,27 +584,19 @@ class SettingsScreen(Widget):
 
         hostname = candidate["hostname"]
         message = f"Deploy host profile at hosts/{hostname}.yaml?"
-        if self.runner.dry_run:
-            message += " [DRY RUN — preview only, nothing will be written]"
-        confirmed = await self.app.push_screen_wait(ConfirmModal(message, confirm_label="Deploy"))
+        confirmed = await self.app.push_screen_wait(ConfirmModal(message, confirm_label="Deploy", danger=True))
         if not confirmed:
             return
 
         content = yaml.safe_dump(candidate, sort_keys=False)
         target_path = self.repo_root / "hosts" / f"{hostname}.yaml"
-        self.runner.write_file(target_path, content)
-        wrote = not self.runner.dry_run
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        target_path.write_text(content, encoding="utf-8")
 
-        if wrote:
-            self.app.exit(
-                message=f"Host profile created at hosts/{hostname}.yaml — "
-                "restart the cockpit (bin/cockpit) to continue."
-            )
-        else:
-            self.query_one("#step-review-status", Static).update(
-                "\\[DRY RUN] Would have created host profile — nothing written. "
-                "Toggle dry-run off and deploy again to create."
-            )
+        self.app.exit(
+            message=f"Host profile created at hosts/{hostname}.yaml — "
+            "restart the cockpit (bin/cockpit) to continue."
+        )
 
     # -- normal mode form & saving -------------------------------------------------
 
@@ -769,22 +761,18 @@ class SettingsScreen(Widget):
 
         hostname = candidate["hostname"]
         message = f"Save host profile at hosts/{hostname}.yaml?"
-        if self.runner.dry_run:
-            message += " [DRY RUN — preview only, nothing will be written]"
-        confirmed = await self.app.push_screen_wait(ConfirmModal(message, confirm_label="Save"))
+        confirmed = await self.app.push_screen_wait(ConfirmModal(message, confirm_label="Save", danger=True))
         if not confirmed:
             return
 
         content = yaml.safe_dump(candidate, sort_keys=False)
-        self.runner.write_file(self._host_profile_path(), content)
-        wrote = not self.runner.dry_run
+        target_path = self._host_profile_path()
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        target_path.write_text(content, encoding="utf-8")
 
         self.host_profile = candidate
         self._render_gpu_list()
-        if wrote:
-            self._set_profile_status("host profile saved — restart the cockpit for other tabs to see the change")
-        else:
-            self._set_profile_status("\\[DRY RUN] would have saved host profile — nothing written")
+        self._set_profile_status("host profile saved — restart the cockpit for other tabs to see the change")
 
     # -- WOL status + check/enable ---------------------------------------------------
 
@@ -805,16 +793,10 @@ class SettingsScreen(Widget):
 
     @work
     async def _confirm_and_check_wol(self) -> None:
-        if self.runner.dry_run:
-            message = (
-                "Check / enable Wake-on-LAN? [DRY RUN — verification reads are real, "
-                "but no mutation (ethtool/systemctl/nmcli/TLP config) will actually happen]"
-            )
-        else:
-            message = (
-                "Check / enable Wake-on-LAN? [LIVE — may change NIC wake flags, "
-                "TLP/NetworkManager config, and enable a systemd persistence unit]"
-            )
+        message = (
+            "Check / enable Wake-on-LAN? (may change NIC wake flags, "
+            "TLP/NetworkManager config, and enable a systemd persistence unit)"
+        )
         confirmed = await self.app.push_screen_wait(ConfirmModal(message, confirm_label="Check / Enable"))
         if not confirmed:
             return
@@ -830,8 +812,7 @@ class SettingsScreen(Widget):
         except Exception as e:
             self.app.call_from_thread(self.app.notify, f"WOL check failed: {e}", severity="error")
         else:
-            msg = "WOL check complete (dry-run preview only)" if self.runner.dry_run else "WOL enabled/verified"
-            self.app.call_from_thread(self.app.notify, msg)
+            self.app.call_from_thread(self.app.notify, "WOL enabled/verified")
         finally:
             self.app.call_from_thread(self._refresh_wol_status)
 
@@ -860,13 +841,10 @@ class SettingsScreen(Widget):
 
     @work
     async def _confirm_and_check_drivers(self) -> None:
-        if self.runner.dry_run:
-            message = "Check GPU drivers for drift? [DRY RUN — reads driver/runtime versions only]"
-        else:
-            message = (
-                "Check GPU drivers for drift? [LIVE — captures driver/runtime versions; "
-                "exits loudly on detected drift, never auto-corrects]"
-            )
+        message = (
+            "Check GPU drivers for drift? (captures driver/runtime versions; "
+            "exits loudly on detected drift, never auto-corrects)"
+        )
         confirmed = await self.app.push_screen_wait(ConfirmModal(message, confirm_label="Check"))
         if not confirmed:
             return
@@ -905,22 +883,18 @@ class SettingsScreen(Widget):
             return
         self._set_service_error("")
 
-        if self.runner.dry_run:
-            message = (
-                "Apply service/update-check settings? [DRY RUN — writes hosts/<hostname>.yaml as a "
-                "preview only; no real install/restart/timer change will happen]"
-            )
-        else:
-            message = (
-                "Apply service/update-check settings? [LIVE — writes hosts/<hostname>.yaml and may "
-                "restart llama-swap and (re)install/remove systemd timers]"
-            )
+        message = (
+            "Apply service/update-check settings? (writes hosts/<hostname>.yaml and may "
+            "restart llama-swap and (re)install/remove systemd timers)"
+        )
         confirmed = await self.app.push_screen_wait(ConfirmModal(message, confirm_label="Apply"))
         if not confirmed:
             return
 
         content = yaml.safe_dump(candidate, sort_keys=False)
-        self.runner.write_file(self._host_profile_path(), content)
+        target_path = self._host_profile_path()
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        target_path.write_text(content, encoding="utf-8")
         self.host_profile = candidate
         self._set_service_status("applying...")
         self._apply_service_in_background(candidate)
@@ -937,8 +911,7 @@ class SettingsScreen(Widget):
         except Exception as e:
             self.app.call_from_thread(self._set_service_status, f"apply failed: {e}")
             return
-        msg = "dry-run apply complete (nothing actually installed/restarted)" if self.runner.dry_run else "service settings applied"
-        self.app.call_from_thread(self._set_service_status, msg)
+        self.app.call_from_thread(self._set_service_status, "service settings applied")
 
     # -- button dispatch ------------------------------------------------------------
 

@@ -353,23 +353,16 @@ class DeployScreen(Widget):
         except schema.ValidationError as e:
             return False, str(e), None
 
-    def _write_models_yaml(self, data: dict) -> bool:
-        """Routed through Runner so --dry-run actually previews instead of writing for real —
-        this edits the live, git-tracked models.yaml, the same "real action" class as a build
-        or a config apply, and deserves the same gate. Returns whether a real write happened."""
+    def _write_models_yaml(self, data: dict) -> None:
         target = self.repo_root / "models.yaml"
         content = yaml.safe_dump(data, sort_keys=False)
-        self.runner.write_file(target, content)
-        return not self.runner.dry_run
+        target.write_text(content, encoding="utf-8")
 
-    def _after_write(self, action_past_tense: str, wrote: bool) -> None:
+    def _after_write(self, action_past_tense: str) -> None:
         self.app_ref.reload_models()
         self.models = self.app_ref.models
         self._populate_table()
-        if wrote:
-            self._set_status(f"{action_past_tense} — models.yaml written")
-        else:
-            self._set_status(f"[DRY RUN] would have {action_past_tense} — nothing written")
+        self._set_status(f"{action_past_tense} — models.yaml written")
 
     # -- save / delete ------------------------------------------------------------
 
@@ -396,14 +389,12 @@ class DeployScreen(Widget):
 
         verb = "Save changes to" if self._editing_id else "Add"
         message = f"{verb} model {model['id']!r} in models.yaml?"
-        if self.runner.dry_run:
-            message += " [DRY RUN — preview only, nothing will be written]"
-        confirmed = await self.app.push_screen_wait(ConfirmModal(message, confirm_label="Save"))
+        confirmed = await self.app.push_screen_wait(ConfirmModal(message, confirm_label="Save", danger=True))
         if not confirmed:
             return
 
-        wrote = self._write_models_yaml(validated)
-        self._after_write(f"saved model {model['id']!r}", wrote)
+        self._write_models_yaml(validated)
+        self._after_write(f"saved model {model['id']!r}")
         self._hide_form()
 
     @work
@@ -413,8 +404,6 @@ class DeployScreen(Widget):
             self._set_status("select a model row first")
             return
         message = f"Delete model {model_id!r} from models.yaml?"
-        if self.runner.dry_run:
-            message += " [DRY RUN — preview only, nothing will be written]"
         confirmed = await self.app.push_screen_wait(ConfirmModal(message, confirm_label="Delete", danger=True))
         if not confirmed:
             return
@@ -426,8 +415,8 @@ class DeployScreen(Widget):
             self._set_status(f"delete blocked by validation: {err}")
             return
 
-        wrote = self._write_models_yaml(validated)
-        self._after_write(f"deleted model {model_id!r}", wrote)
+        self._write_models_yaml(validated)
+        self._after_write(f"deleted model {model_id!r}")
 
     # -- preview + apply ------------------------------------------------------------
 
@@ -443,12 +432,8 @@ class DeployScreen(Widget):
     @work
     async def _confirm_and_apply(self) -> None:
         message = "Deploy llama-swap service and apply configuration to systemd?"
-        if self.runner.dry_run:
-            message += " [DRY RUN — no real install/restart will happen]"
-        else:
-            message += " [LIVE — this restarts the real service]"
         confirmed = await self.app.push_screen_wait(
-            ConfirmModal(message, confirm_label="Deploy", danger=not self.runner.dry_run)
+            ConfirmModal(message, confirm_label="Deploy", danger=True)
         )
         if not confirmed:
             return
@@ -465,12 +450,7 @@ class DeployScreen(Widget):
         except Exception as e:
             self.app.call_from_thread(self._set_status, f"deploy failed: {e}")
             return
-        done_message = (
-            "dry-run deploy complete (nothing was actually installed/restarted)"
-            if self.runner.dry_run
-            else "deployed configuration and restarted llama-swap"
-        )
-        self.app.call_from_thread(self._set_status, done_message)
+        self.app.call_from_thread(self._set_status, "deployed configuration and restarted llama-swap")
 
     # -- button dispatch ------------------------------------------------------------
 

@@ -292,10 +292,8 @@ class BuildsScreen(Widget):
         # operator think this only touches `backend`.
         if len(self.backends) > 1:
             message += f" This builds every backend this host needs: {', '.join(self.backends)}."
-        if self.runner.dry_run:
-            message += " (dry-run preview only — no real build will run)"
 
-        confirmed = await self.app.push_screen_wait(ConfirmModal(message, confirm_label="Build"))
+        confirmed = await self.app.push_screen_wait(ConfirmModal(message, confirm_label="Build", danger=True))
         if confirmed:
             self._run_build()
 
@@ -319,8 +317,6 @@ class BuildsScreen(Widget):
             f"Roll back {backend} to {target_ref}? This points 'current' at an "
             f"already-built, retained prefix — no rebuild, no re-smoke-test."
         )
-        if self.runner.dry_run:
-            message += " (dry-run preview only — no real change will happen)"
 
         confirmed = await self.app.push_screen_wait(
             ConfirmModal(message, confirm_label="Roll back", danger=True)
@@ -348,10 +344,7 @@ class BuildsScreen(Widget):
         except Exception as e:  # never let a build-time exception crash the whole TUI
             self.app.call_from_thread(self.app.notify, f"build failed: {e}", severity="error")
         else:
-            done_msg = "build finished"
-            if self.runner.dry_run:
-                done_msg += " (dry-run preview only — nothing was actually built)"
-            self.app.call_from_thread(self.app.notify, done_msg)
+            self.app.call_from_thread(self.app.notify, "build finished")
         finally:
             provision_logger.removeHandler(handler)
             provision_logger.setLevel(prior_level)
@@ -388,8 +381,6 @@ class BuildsScreen(Widget):
             return
 
         msg = f"{backend}: current now points at {self._short(target_ref)}"
-        if self.runner.dry_run:
-            msg += " (dry-run preview only — no real change was made)"
         self.app.call_from_thread(self.app.notify, msg)
         self.app.call_from_thread(self._refresh_builds_and_history)
 
