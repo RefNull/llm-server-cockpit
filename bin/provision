@@ -8,11 +8,17 @@ _VENV_DIR = _REPO_ROOT / ".venv"
 
 
 def _venv_python() -> Path | None:
-    for name in ("python3", "python"):  # not every venv creates a `python3` symlink
-        candidate = _VENV_DIR / "bin" / name
+    bin_dir = _VENV_DIR / "bin"
+    if not bin_dir.is_dir():
+        return None
+    for name in ("python3", "python"):  # not every venv creates these symlinks
+        candidate = bin_dir / name
         if candidate.exists():
             return candidate
-    return None
+    # Fall back to whatever version-specific interpreter is actually in there
+    # (e.g. python3.14) — some venv builds skip the generic python3/python symlinks.
+    matches = sorted(bin_dir.glob("python3.*"))
+    return matches[0] if matches else None
 
 
 _venv = _venv_python()
@@ -20,6 +26,12 @@ if _venv is not None and Path(sys.executable).resolve() != _venv.resolve():
     # Re-exec under the repo's own venv (see requirements.txt / README Setup) so
     # `bin/provision` works regardless of which `python3` was first on PATH when invoked.
     os.execv(str(_venv), [str(_venv), str(Path(__file__).resolve()), *sys.argv[1:]])
+elif _venv is None and _VENV_DIR.is_dir():
+    sys.exit(
+        f"{_VENV_DIR} exists but no python executable was found under {_VENV_DIR / 'bin'} "
+        "(checked python3, python, python3.*). List that directory and check the venv wasn't "
+        "left partially created."
+    )
 
 sys.path.insert(0, str(_REPO_ROOT))
 
