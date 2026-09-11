@@ -14,15 +14,17 @@ defined once below instead of redeclared per screen.
 """
 from __future__ import annotations
 
+import subprocess
+
 from textual.app import ComposeResult
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, Static
 
 SHARED_CSS = """
 .panel {
     border: round $primary;
-    padding: 1 2;
+    padding: 0 1;
     margin-bottom: 1;
 }
 .panel-title {
@@ -44,7 +46,69 @@ SHARED_CSS = """
     color: $error;
     margin-top: 1;
 }
+.accent-button {
+    background: $accent;
+}
 """
+
+
+def run_shell_capture(cmd: str, timeout: float = 5.0) -> str:
+    """Run a fixed (never user-supplied) shell one-liner and return its stdout, for a quick
+    read-only info popup (lspci, ip a) — not a provisioning action, nothing here mutates
+    anything, so this stays a plain synchronous call rather than going through Runner/@work."""
+    try:
+        result = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, timeout=timeout)
+        return (result.stdout or result.stderr or "(no output)").strip()
+    except Exception as e:
+        return f"error running command: {e}"
+
+
+class InfoModal(ModalScreen[None]):
+    """Read-only scrollable popup for showing command output. Usage: self.app.push_screen(
+    InfoModal("PCIe devices", run_shell_capture(cmd))) — scrolling is defined once here so
+    every such popup (lspci, ip a, future ones) gets it for free instead of reimplementing it.
+    """
+
+    DEFAULT_CSS = """
+    InfoModal {
+        align: center middle;
+    }
+    #info-dialog {
+        width: 80%;
+        height: 80%;
+        border: thick $background 80%;
+        background: $surface;
+        padding: 1 2;
+    }
+    #info-header {
+        height: auto;
+        margin-bottom: 1;
+    }
+    #info-title {
+        width: 1fr;
+        text-style: bold;
+    }
+    #info-body {
+        height: 1fr;
+    }
+    """
+
+    def __init__(self, title: str, content: str) -> None:
+        super().__init__()
+        self.info_title = title
+        self.content_text = content
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="info-dialog"):
+            with Horizontal(id="info-header"):
+                yield Static(self.info_title, id="info-title")
+                yield Button("X", id="info-close", variant="error")
+            with VerticalScroll(id="info-body"):
+                yield Static(self.content_text)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "info-close":
+            self.dismiss(None)
 
 
 class ConfirmModal(ModalScreen[bool]):

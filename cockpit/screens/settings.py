@@ -19,10 +19,10 @@ Three operational sections apply live, no restart needed: WOL status/enable, GPU
 driver-drift status/check, and service + update-check settings (which also nudges
 provision.steps.swap to (re)install the systemd unit/timers).
 
-Layout: two independently-scrolling columns (left = general settings/host identity/
-network/paths/operational sections, right = GPUs) rather than one long flat stack — the
-old single-scroll layout cut fields off at the bottom of the terminal with no way to reach
-them.
+Layout: two independently-scrolling columns, each ONE bordered panel (left = general
+settings, right = GPUs) rather than one box per field group — nested boxes don't scroll
+their own content, so many small boxes just wasted space without helping the cut-off/
+no-scroll problem. Sections within a column are separated by a plain heading, no border.
 """
 from __future__ import annotations
 
@@ -37,9 +37,9 @@ from textual import work
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widget import Widget
-from textual.widgets import Button, Collapsible, Input, Label, Select, Static, Switch
+from textual.widgets import Button, Input, Label, Select, Static, Switch
 
-from cockpit.widgets import ConfirmModal
+from cockpit.widgets import ConfirmModal, InfoModal, run_shell_capture
 from provision import schema
 from provision.common import Runner
 from provision.steps import drivers, swap, wol
@@ -49,20 +49,25 @@ log = logging.getLogger("provision")
 _RESTART_POLICY_OPTIONS = [("on-failure", "on-failure"), ("always", "always"), ("no", "no")]
 _GPU_VENDOR_OPTIONS = [("nvidia", "nvidia"), ("amd", "amd"), ("intel", "intel")]
 
-# hosts/example.yaml's defaults — shown as placeholders (first-run only), never as values,
-# so an operator can't accidentally ship the template's machine-specific-looking paths
-# without having actually looked at them.
-_EXAMPLE_PATHS = {
-    "models_dir": "/srv/models/gguf",
-    "state_dir": "/var/lib/llm-server-cockpit",
-    "prefix_root": "/opt/llm-server-cockpit/builds",
-}
-
 # hosts/example.yaml's placeholder convention for WOL fields that are no longer part of the
 # structural form (moved to their own section, normal mode only) — a string field gets
 # "TODO", the regex-constrained MAC field gets a valid-but-obviously-fake value since "TODO"
 # would fail its pattern.
 _WOL_PLACEHOLDER = {"interface": "TODO", "mac": "00:00:00:00:00:00"}
+
+# The exact one-liner requested for the "List PCIe devices" popup.
+_LSPCI_CMD = (
+    'i=0; lspci | grep -E "VGA compatible controller|3D controller" | '
+    "while read -r line; do name=$(echo \"$line\" | cut -d':' -f3- | "
+    "sed 's/^ //; s/ (rev .*//'); echo \"gpu$i: $name\"; i=$((i+1)); done"
+)
+
+
+def _default_paths() -> dict[str, str]:
+    """A single root under the invoking user's home, with subfolders — proposed as real
+    prefilled values (not just placeholder ghost text), editable before saving."""
+    root = str(Path.home() / "llm-server-cockpit")
+    return {"models_dir": f"{root}/models", "state_dir": f"{root}/state", "prefix_root": f"{root}/builds"}
 
 
 def _ancestor(widget: Widget, cls: type) -> Widget | None:
@@ -72,16 +77,46 @@ def _ancestor(widget: Widget, cls: type) -> Widget | None:
     return node
 
 
+class _GpuRow(Vertical):
+    """Header row (toggle button + optional Remove, same line) plus a detail section shown
+    or hidden by the toggle — a hand-built replacement for Collapsible so Remove can share
+    the header's row (Collapsible's own title is a plain string, it can't host a second
+    widget next to it)."""
+
+    def __init__(self, gpu_id: str, detail: Widget, *, collapsed: bool, show_remove: bool) -> None:
+        self.gpu_id = gpu_id
+        header_children: list[Widget] = [Button(self._label(collapsed), classes="gpu-row-toggle")]
+        if show_remove:
+            header_children.append(Button("Remove", classes="gpu-row-remove", variant="error"))
+        detail.display = not collapsed
+        super().__init__(Horizontal(*header_children, classes="gpu-row-header"), detail, classes="gpu-row")
+
+    def _label(self, collapsed: bool) -> str:
+        return f"{'▶' if collapsed else '▼'} {self.gpu_id}"
+
+    def toggle(self) -> None:
+        detail = self.children[1]
+        detail.display = not detail.display
+        self.query_one(".gpu-row-toggle", Button).label = self._label(collapsed=not detail.display)
+
+
 class SettingsScreen(Widget):
     """Mounted inside a TabPane by cockpit/app.py — not a Textual Screen."""
 
-    # .panel / .panel-title / .button-row / .status-text / .error-text come from
-    # cockpit/widgets.py's SHARED_CSS (CockpitApp.CSS) — only this screen's own rules live
-    # here. Two independently-scrolling columns (#settings-left/#settings-right) are the
-    # structural fix for the old single-scroll layout cutting fields off at the bottom.
+    # .panel / .panel-title / .button-row / .status-text / .error-text / .accent-button come
+    # from cockpit/widgets.py's SHARED_CSS (CockpitApp.CSS) — only this screen's own rules
+    # live here. Two independently-scrolling columns (#settings-left/#settings-right), each
+    # ONE panel, are the structural fix for the old cut-off/no-scroll layout.
     DEFAULT_CSS = """
     SettingsScreen {
         height: 1fr;
+    }
+    SettingsScreen #settings-header {
+        height: auto;
+        margin: 1 0;
+    }
+    SettingsScreen #settings-header Static {
+        width: 1fr;
     }
     SettingsScreen #settings-columns {
         height: 1fr;
@@ -91,14 +126,13 @@ class SettingsScreen(Widget):
         width: 1fr;
     }
     SettingsScreen #settings-left {
-        padding-right: 1;
+        margin-right: 1;
+    }
+    SettingsScreen .field-group {
+        margin-bottom: 1;
     }
     SettingsScreen Label {
         margin-top: 1;
-    }
-    SettingsScreen .field-help {
-        color: $text-muted;
-        margin-top: 0;
     }
     SettingsScreen .hint {
         color: $text-muted;
@@ -106,7 +140,12 @@ class SettingsScreen(Widget):
     }
     SettingsScreen #vpn-resolve-preview {
         color: $text-muted;
-        margin-bottom: 1;
+    }
+    SettingsScreen .inline-row {
+        height: auto;
+    }
+    SettingsScreen .inline-row Input {
+        width: 1fr;
     }
     SettingsScreen .switch-row {
         height: auto;
@@ -116,14 +155,14 @@ class SettingsScreen(Widget):
         margin-top: 1;
         margin-left: 1;
     }
-    SettingsScreen #gpu-editor-list Collapsible, SettingsScreen #gpu-display-list Collapsible {
+    SettingsScreen .gpu-row {
         margin-bottom: 1;
     }
-    SettingsScreen .gpu-row-remove {
-        margin-top: 1;
+    SettingsScreen .gpu-row-header {
+        height: auto;
     }
-    SettingsScreen #btn-add-gpu {
-        margin-top: 1;
+    SettingsScreen .gpu-row-toggle {
+        width: 1fr;
     }
     """
 
@@ -152,51 +191,51 @@ class SettingsScreen(Widget):
 
     def compose(self) -> ComposeResult:
         first_run = self.host_profile is None
+
+        with Horizontal(id="settings-header"):
+            yield Static("First setup" if first_run else "Settings", classes="panel-title")
+            if first_run:
+                yield Button("Create host profile", id="btn-save-profile", variant="primary")
+
         with Horizontal(id="settings-columns"):
-            with VerticalScroll(id="settings-left"):
-                with Vertical(classes="panel"):
+            with VerticalScroll(id="settings-left", classes="panel"):
+                with Vertical(classes="field-group"):
                     yield Static("Host identity", classes="panel-title")
-                    yield Label("hostname")
+                    yield Label("Hostname")
                     yield Input(id="f-hostname")
-                    yield Label("retain_builds")
+                    yield Label("Builds to keep")
                     yield Input(id="f-retain-builds")
-                    yield Label("hf.token_env")
+                    yield Label("HF token env var")
                     yield Input(id="f-token-env")
 
-                with Vertical(classes="panel"):
+                with Vertical(classes="field-group"):
                     yield Static("Network bind", classes="panel-title")
-                    yield Label("VPN interface (NIC name, not an IP)")
-                    yield Input(id="f-vpn-interface", placeholder="e.g. tailscale0, wg0")
-                    yield Static(
-                        "The gateway binds to whatever IPv4 address this interface has — "
-                        "resolved automatically each time you apply. Examples: tailscale0 "
-                        "(Tailscale), wg0 (WireGuard). Run `ip a` on this host to find yours.",
-                        classes="field-help",
-                    )
+                    yield Label("VPN interface (not an IP)")
+                    with Horizontal(classes="inline-row"):
+                        yield Input(id="f-vpn-interface", placeholder="e.g. tailscale0, wg0")
+                        yield Button("ip a", id="btn-show-ip-a")
                     yield Static("", id="vpn-resolve-preview")
-                    yield Label("network.gateway.port")
+                    yield Label("Gateway port")
                     yield Input(id="f-gw-port")
-                    yield Label("network.gateway.health_check_timeout (optional)")
+                    yield Label("Health check timeout (opt.)")
                     yield Input(id="f-gw-timeout")
 
-                with Vertical(classes="panel"):
+                with Vertical(classes="field-group"):
                     yield Static("Paths", classes="panel-title")
-                    yield Label("paths.models_dir")
-                    yield Input(id="f-models-dir", placeholder=_EXAMPLE_PATHS["models_dir"])
-                    yield Label("paths.state_dir")
-                    yield Input(id="f-state-dir", placeholder=_EXAMPLE_PATHS["state_dir"])
-                    yield Label("paths.prefix_root")
-                    yield Input(id="f-prefix-root", placeholder=_EXAMPLE_PATHS["prefix_root"])
+                    yield Label("Model files folder")
+                    yield Input(id="f-models-dir")
+                    yield Label("App state folder")
+                    yield Input(id="f-state-dir")
+                    yield Label("Build output folder")
+                    yield Input(id="f-prefix-root")
 
                 if first_run:
                     yield Static(
                         "Wake-on-LAN, GPU driver checks, and service/update-check scheduling "
-                        "can be configured after initial setup, from the Settings tabs below.",
+                        "can be configured after initial setup.",
                         classes="hint",
                     )
                     yield Static("", id="profile-error", classes="error-text")
-                    with Horizontal(classes="button-row"):
-                        yield Button("Create host profile", id="btn-save-profile", variant="primary")
                     yield Static("", id="profile-status", classes="status-text")
                 else:
                     yield Static("", id="profile-error", classes="error-text")
@@ -204,45 +243,46 @@ class SettingsScreen(Widget):
                         yield Button("Save host profile", id="btn-save-profile", variant="primary")
                     yield Static("", id="profile-status", classes="status-text")
 
-                    with Vertical(classes="panel"):
+                    with Vertical(classes="field-group"):
                         yield Static("Wake-on-LAN", classes="panel-title")
                         yield Static("not checked yet", id="wol-status", classes="status-text")
                         yield Button("Check / Enable WOL", id="btn-wol-check")
 
-                    with Vertical(classes="panel"):
+                    with Vertical(classes="field-group"):
                         yield Static("GPU driver lockfile", classes="panel-title")
                         yield Static("not checked yet", id="drivers-status", classes="status-text")
                         yield Button("Check drivers", id="btn-drivers-check")
 
-                    with Vertical(classes="panel"):
+                    with Vertical(classes="field-group"):
                         yield Static("Service & update-check settings", classes="panel-title")
-                        yield Label("service.restart_policy")
+                        yield Label("Restart policy")
                         yield Select(_RESTART_POLICY_OPTIONS, id="f-restart-policy", allow_blank=False, value="on-failure")
-                        yield Label("service.restart_sec")
+                        yield Label("Restart delay (sec)")
                         yield Input(id="f-restart-sec")
                         with Horizontal(classes="switch-row"):
                             yield Switch(id="f-scheduled-restart-enabled")
-                            yield Label("service.scheduled_restart.enabled")
-                        yield Label("service.scheduled_restart.on_calendar")
+                            yield Label("Scheduled restart")
+                        yield Label("Restart schedule")
                         yield Input(id="f-scheduled-restart-calendar")
                         with Horizontal(classes="switch-row"):
                             yield Switch(id="f-update-check-enabled")
-                            yield Label("update_check.enabled")
-                        yield Label("update_check.on_calendar")
+                            yield Label("Scheduled update check")
+                        yield Label("Check schedule")
                         yield Input(id="f-update-check-calendar")
                         yield Static("", id="service-error", classes="error-text")
                         with Horizontal(classes="button-row"):
                             yield Button("Apply service settings", id="btn-apply-service", variant="primary")
                         yield Static("", id="service-status", classes="status-text")
 
-            with VerticalScroll(id="settings-right"):
-                with Vertical(classes="panel"):
-                    yield Static("GPUs", classes="panel-title")
-                    if first_run:
-                        yield Vertical(id="gpu-editor-list")
-                        yield Button("Add GPU", id="btn-add-gpu")
-                    else:
-                        yield Vertical(id="gpu-display-list")
+            with VerticalScroll(id="settings-right", classes="panel"):
+                yield Static("GPUs", classes="panel-title")
+                if first_run:
+                    yield Vertical(id="gpu-editor-list")
+                    with Horizontal(classes="button-row"):
+                        yield Button("Add GPU", id="btn-add-gpu", classes="accent-button")
+                        yield Button("List PCIe devices", id="btn-show-pcie")
+                else:
+                    yield Vertical(id="gpu-display-list")
 
     def on_mount(self) -> None:
         self._populate_profile_form()
@@ -274,6 +314,10 @@ class SettingsScreen(Widget):
             self.query_one("#f-gw-timeout", Input).value = "120"
             self.query_one("#f-retain-builds", Input).value = "3"
             self.query_one("#f-token-env", Input).value = "HF_TOKEN"
+            defaults = _default_paths()
+            self.query_one("#f-models-dir", Input).value = defaults["models_dir"]
+            self.query_one("#f-state-dir", Input).value = defaults["state_dir"]
+            self.query_one("#f-prefix-root", Input).value = defaults["prefix_root"]
             return
 
         self.query_one("#f-hostname", Input).value = hp["hostname"]
@@ -305,8 +349,8 @@ class SettingsScreen(Widget):
         return data.get("gpus", {}) or {}
 
     def _render_gpu_list(self) -> None:
-        """Normal mode: read-only, one Collapsible per gpus[] entry, merged with lockfile
-        facts when available. Topology changes stay a direct hosts/<hostname>.yaml edit."""
+        """Normal mode: read-only, one row per gpus[] entry, merged with lockfile facts when
+        available. Topology changes stay a direct hosts/<hostname>.yaml edit."""
         container = self.query_one("#gpu-display-list", Vertical)
         container.remove_children()
         lock_facts = self._lock_gpu_facts()
@@ -317,30 +361,29 @@ class SettingsScreen(Widget):
             if facts:
                 lines.append("driver/runtime facts (from lockfile):")
                 lines.extend(f"  {k}: {v}" for k, v in facts.items())
-            container.mount(Collapsible(Static("\n".join(lines)), title=gpu["id"], collapsed=True))
+            detail = Vertical(Static("\n".join(lines)))
+            container.mount(_GpuRow(gpu["id"], detail, collapsed=True, show_remove=False))
 
-    def _build_gpu_editor_row(self, index: int, gpu: dict) -> Collapsible:
+    def _build_gpu_editor_row(self, index: int, gpu: dict) -> _GpuRow:
         can_remove = len(self._pending_gpus) > 1
-        return Collapsible(
+        detail = Vertical(
             Label("id"),
             Input(value=gpu["id"], classes="gpu-row-id"),
             Label("vendor"),
             Select(_GPU_VENDOR_OPTIONS, classes="gpu-row-vendor", allow_blank=False, value=gpu["vendor"]),
             Label("backends (comma-separated: cuda, rocm, vulkan, sycl)"),
             Input(value=", ".join(gpu["backends"]), classes="gpu-row-backends"),
-            Button("Remove", classes="gpu-row-remove", variant="error", disabled=not can_remove),
-            title=gpu["id"] or f"gpu{index}",
-            collapsed=False,
         )
+        return _GpuRow(gpu["id"] or f"gpu{index}", detail, collapsed=False, show_remove=can_remove)
 
     def _render_gpu_editor(self) -> None:
-        """First-run mode: editable Collapsible per pending GPU, plus "Add GPU" below."""
+        """First-run mode: editable row per pending GPU, plus "Add GPU" below."""
         container = self.query_one("#gpu-editor-list", Vertical)
         container.remove_children()
         for i, gpu in enumerate(self._pending_gpus):
             container.mount(self._build_gpu_editor_row(i, gpu))
 
-    def _read_gpu_row(self, row: Collapsible) -> dict:
+    def _read_gpu_row(self, row: _GpuRow) -> dict:
         gpu_id = row.query_one(".gpu-row-id", Input).value.strip()
         vendor = row.query_one(".gpu-row-vendor", Select).value
         backends_raw = row.query_one(".gpu-row-backends", Input).value.strip()
@@ -349,7 +392,7 @@ class SettingsScreen(Widget):
 
     def _sync_pending_gpus_from_widgets(self) -> None:
         container = self.query_one("#gpu-editor-list", Vertical)
-        self._pending_gpus = [self._read_gpu_row(row) for row in container.query(Collapsible)]
+        self._pending_gpus = [self._read_gpu_row(row) for row in container.query(_GpuRow)]
 
     def _on_add_gpu_row(self) -> None:
         self._sync_pending_gpus_from_widgets()
@@ -361,9 +404,9 @@ class SettingsScreen(Widget):
         if len(self._pending_gpus) <= 1:
             return
         self._sync_pending_gpus_from_widgets()
-        row = _ancestor(button, Collapsible)
+        row = _ancestor(button, _GpuRow)
         container = self.query_one("#gpu-editor-list", Vertical)
-        rows = list(container.query(Collapsible))
+        rows = list(container.query(_GpuRow))
         if row in rows:
             del self._pending_gpus[rows.index(row)]
         self._render_gpu_editor()
@@ -415,6 +458,14 @@ class SettingsScreen(Widget):
         if event.input.id == "f-vpn-interface":
             self._update_vpn_preview(event.value)
 
+    # -- info popups (lspci, ip a) ----------------------------------------------------
+
+    def _show_pcie_devices(self) -> None:
+        self.app.push_screen(InfoModal("PCIe devices (lspci)", run_shell_capture(_LSPCI_CMD)))
+
+    def _show_ip_a(self) -> None:
+        self.app.push_screen(InfoModal("Network interfaces (ip a)", run_shell_capture("ip a")))
+
     # -- status helpers -----------------------------------------------------------
 
     def _set_profile_error(self, text: str) -> None:
@@ -459,7 +510,7 @@ class SettingsScreen(Widget):
         state_dir = self.query_one("#f-state-dir", Input).value.strip()
         prefix_root = self.query_one("#f-prefix-root", Input).value.strip()
         if not all([models_dir, state_dir, prefix_root]):
-            return None, "paths.models_dir/state_dir/prefix_root are all required"
+            return None, "model/state/build paths are all required"
         return {"models_dir": models_dir, "state_dir": state_dir, "prefix_root": prefix_root}, None
 
     def _build_profile_candidate(self) -> tuple[dict | None, str | None]:
@@ -750,5 +801,11 @@ class SettingsScreen(Widget):
             self._confirm_and_apply_service()
         elif bid == "btn-add-gpu":
             self._on_add_gpu_row()
+        elif bid == "btn-show-pcie":
+            self._show_pcie_devices()
+        elif bid == "btn-show-ip-a":
+            self._show_ip_a()
         elif event.button.has_class("gpu-row-remove"):
             self._on_remove_gpu_row(event.button)
+        elif event.button.has_class("gpu-row-toggle"):
+            _ancestor(event.button, _GpuRow).toggle()
