@@ -51,10 +51,12 @@ HOST_PROFILE_SCHEMA = {
             "properties": {
                 "vpn": {
                     "type": "object",
-                    "required": ["provider", "interface"],
+                    "required": ["interface"],
                     "additionalProperties": False,
                     "properties": {
-                        "provider": {"type": "string"},
+                        # The overlay NIC name (e.g. tailscale0, wg0) — never an IP. The
+                        # gateway binds to whatever address this interface currently has,
+                        # resolved fresh on every apply (see swap.py's resolve_vpn_ip).
                         "interface": {"type": "string"},
                     },
                 },

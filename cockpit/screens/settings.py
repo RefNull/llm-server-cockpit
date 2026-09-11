@@ -1,9 +1,12 @@
 """Cockpit "Settings" tab.
 
-First-run (host_profile is None): the ONLY tab shown (see app.py) — offers a form to
-create hosts/<hostname>.yaml from scratch. A successful real write exits the app and asks
-for a restart (bin/cockpit) rather than trying to dynamically grow the other three tabs
-into a running TabbedContent — simpler and more robust for a one-time step.
+First-run (host_profile is None): the ONLY tab shown (see app.py, which titles it
+"First setup") — offers a form to create hosts/<hostname>.yaml from scratch. A successful
+real write exits the app and asks for a restart (bin/cockpit) rather than trying to
+dynamically grow the other three tabs into a running TabbedContent — simpler and more
+robust for a one-time step. WOL is not part of this form at all — first-run writes fixed
+placeholder values for network.wol (matching hosts/example.yaml's own convention) and WOL
+gets its own section, editable only in normal mode, after the host actually exists.
 
 Normal (host_profile is a real dict): the same structural fields (network/paths/
 retain_builds/hf) stay editable via "Save host profile", again with a restart notice —
@@ -15,6 +18,11 @@ way deploy.py already handles — out of scope for this tab).
 Three operational sections apply live, no restart needed: WOL status/enable, GPU
 driver-drift status/check, and service + update-check settings (which also nudges
 provision.steps.swap to (re)install the systemd unit/timers).
+
+Layout: two independently-scrolling columns (left = general settings/host identity/
+network/paths/operational sections, right = GPUs) rather than one long flat stack — the
+old single-scroll layout cut fields off at the bottom of the terminal with no way to reach
+them.
 """
 from __future__ import annotations
 
@@ -29,7 +37,7 @@ from textual import work
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widget import Widget
-from textual.widgets import Button, Input, Label, Select, Static, Switch
+from textual.widgets import Button, Collapsible, Input, Label, Select, Static, Switch
 
 from cockpit.widgets import ConfirmModal
 from provision import schema
@@ -50,24 +58,55 @@ _EXAMPLE_PATHS = {
     "prefix_root": "/opt/llm-server-cockpit/builds",
 }
 
+# hosts/example.yaml's placeholder convention for WOL fields that are no longer part of the
+# structural form (moved to their own section, normal mode only) — a string field gets
+# "TODO", the regex-constrained MAC field gets a valid-but-obviously-fake value since "TODO"
+# would fail its pattern.
+_WOL_PLACEHOLDER = {"interface": "TODO", "mac": "00:00:00:00:00:00"}
+
+
+def _ancestor(widget: Widget, cls: type) -> Widget | None:
+    node: Widget | None = widget
+    while node is not None and not isinstance(node, cls):
+        node = node.parent  # type: ignore[assignment]
+    return node
+
 
 class SettingsScreen(Widget):
     """Mounted inside a TabPane by cockpit/app.py — not a Textual Screen."""
 
+    # .panel / .panel-title / .button-row / .status-text / .error-text come from
+    # cockpit/widgets.py's SHARED_CSS (CockpitApp.CSS) — only this screen's own rules live
+    # here. Two independently-scrolling columns (#settings-left/#settings-right) are the
+    # structural fix for the old single-scroll layout cutting fields off at the bottom.
     DEFAULT_CSS = """
     SettingsScreen {
         height: 1fr;
     }
-    SettingsScreen .panel {
-        border: round $primary;
-        padding: 1 2;
-        margin-bottom: 1;
+    SettingsScreen #settings-columns {
+        height: 1fr;
     }
-    SettingsScreen .panel-title {
-        text-style: bold;
+    SettingsScreen #settings-left, SettingsScreen #settings-right {
+        height: 1fr;
+        width: 1fr;
+    }
+    SettingsScreen #settings-left {
+        padding-right: 1;
     }
     SettingsScreen Label {
         margin-top: 1;
+    }
+    SettingsScreen .field-help {
+        color: $text-muted;
+        margin-top: 0;
+    }
+    SettingsScreen .hint {
+        color: $text-muted;
+        margin-bottom: 1;
+    }
+    SettingsScreen #vpn-resolve-preview {
+        color: $text-muted;
+        margin-bottom: 1;
     }
     SettingsScreen .switch-row {
         height: auto;
@@ -77,17 +116,13 @@ class SettingsScreen(Widget):
         margin-top: 1;
         margin-left: 1;
     }
-    SettingsScreen #profile-error, SettingsScreen #service-error {
-        color: $error;
+    SettingsScreen #gpu-editor-list Collapsible, SettingsScreen #gpu-display-list Collapsible {
+        margin-bottom: 1;
+    }
+    SettingsScreen .gpu-row-remove {
         margin-top: 1;
     }
-    SettingsScreen #profile-status, SettingsScreen #service-status,
-    SettingsScreen #wol-status, SettingsScreen #drivers-status, SettingsScreen #gpu-list-display {
-        color: $text-muted;
-        margin-top: 1;
-    }
-    SettingsScreen .button-row {
-        height: auto;
+    SettingsScreen #btn-add-gpu {
         margin-top: 1;
     }
     """
@@ -108,103 +143,117 @@ class SettingsScreen(Widget):
         self.runner = runner
         self.repo_root = repo_root
         self.app_ref = app_ref
+        # First-run only: in-memory GPU rows being built up before the profile exists —
+        # the schema requires gpus: minItems 1, so this always starts with one blank entry
+        # matching the previous single-GPU default (id=gpu0/vendor=nvidia/backends=cuda).
+        self._pending_gpus: list[dict] = [{"id": "gpu0", "vendor": "nvidia", "backends": ["cuda"]}]
 
     # -- layout ---------------------------------------------------------------
 
     def compose(self) -> ComposeResult:
         first_run = self.host_profile is None
-        with VerticalScroll():
-            with Vertical(classes="panel"):
-                yield Static(
-                    "Create host profile" if first_run else "Host profile (hosts/<hostname>.yaml)",
-                    classes="panel-title",
-                )
-                yield Label("hostname")
-                yield Input(id="f-hostname")
+        with Horizontal(id="settings-columns"):
+            with VerticalScroll(id="settings-left"):
+                with Vertical(classes="panel"):
+                    yield Static("Host identity", classes="panel-title")
+                    yield Label("hostname")
+                    yield Input(id="f-hostname")
+                    yield Label("retain_builds")
+                    yield Input(id="f-retain-builds")
+                    yield Label("hf.token_env")
+                    yield Input(id="f-token-env")
 
-                yield Label("network.vpn.provider")
-                yield Input(id="f-vpn-provider", placeholder="TODO — e.g. tailscale, wireguard")
-                yield Label("network.vpn.interface")
-                yield Input(id="f-vpn-interface", placeholder="TODO — e.g. tailscale0, wg0")
-                yield Label("network.wol.interface")
-                yield Input(id="f-wol-interface", placeholder="TODO — e.g. enp5s0")
-                yield Label("network.wol.mac")
-                yield Input(id="f-wol-mac", placeholder="00:00:00:00:00:00")
-                yield Label("network.gateway.port")
-                yield Input(id="f-gw-port")
-                yield Label("network.gateway.health_check_timeout (optional)")
-                yield Input(id="f-gw-timeout")
+                with Vertical(classes="panel"):
+                    yield Static("Network bind", classes="panel-title")
+                    yield Label("VPN interface (NIC name, not an IP)")
+                    yield Input(id="f-vpn-interface", placeholder="e.g. tailscale0, wg0")
+                    yield Static(
+                        "The gateway binds to whatever IPv4 address this interface has — "
+                        "resolved automatically each time you apply. Examples: tailscale0 "
+                        "(Tailscale), wg0 (WireGuard). Run `ip a` on this host to find yours.",
+                        classes="field-help",
+                    )
+                    yield Static("", id="vpn-resolve-preview")
+                    yield Label("network.gateway.port")
+                    yield Input(id="f-gw-port")
+                    yield Label("network.gateway.health_check_timeout (optional)")
+                    yield Input(id="f-gw-timeout")
+
+                with Vertical(classes="panel"):
+                    yield Static("Paths", classes="panel-title")
+                    yield Label("paths.models_dir")
+                    yield Input(id="f-models-dir", placeholder=_EXAMPLE_PATHS["models_dir"])
+                    yield Label("paths.state_dir")
+                    yield Input(id="f-state-dir", placeholder=_EXAMPLE_PATHS["state_dir"])
+                    yield Label("paths.prefix_root")
+                    yield Input(id="f-prefix-root", placeholder=_EXAMPLE_PATHS["prefix_root"])
 
                 if first_run:
-                    yield Label("gpus[0].id")
-                    yield Input(id="f-gpu-id")
-                    yield Label("gpus[0].vendor")
-                    yield Select(_GPU_VENDOR_OPTIONS, id="f-gpu-vendor", allow_blank=False, value="nvidia")
-                    yield Label("gpus[0].backends (comma-separated: cuda, rocm, vulkan, sycl)")
-                    yield Input(id="f-gpu-backends")
-                else:
-                    yield Label("gpus (read-only here — edit hosts/<hostname>.yaml directly to change topology)")
-                    yield Static("", id="gpu-list-display")
-
-                yield Label("paths.models_dir")
-                yield Input(id="f-models-dir", placeholder=_EXAMPLE_PATHS["models_dir"])
-                yield Label("paths.state_dir")
-                yield Input(id="f-state-dir", placeholder=_EXAMPLE_PATHS["state_dir"])
-                yield Label("paths.prefix_root")
-                yield Input(id="f-prefix-root", placeholder=_EXAMPLE_PATHS["prefix_root"])
-                yield Label("retain_builds")
-                yield Input(id="f-retain-builds")
-                yield Label("hf.token_env")
-                yield Input(id="f-token-env")
-
-                yield Static("", id="profile-error")
-                with Horizontal(classes="button-row"):
-                    yield Button(
-                        "Create host profile" if first_run else "Save host profile",
-                        id="btn-save-profile",
-                        variant="primary",
+                    yield Static(
+                        "Wake-on-LAN, GPU driver checks, and service/update-check scheduling "
+                        "can be configured after initial setup, from the Settings tabs below.",
+                        classes="hint",
                     )
-                yield Static("", id="profile-status")
-
-            if not first_run:
-                with Vertical(classes="panel"):
-                    yield Static("Wake-on-LAN", classes="panel-title")
-                    yield Static("not checked yet", id="wol-status")
-                    yield Button("Check / Enable WOL", id="btn-wol-check")
-
-                with Vertical(classes="panel"):
-                    yield Static("GPU driver lockfile", classes="panel-title")
-                    yield Static("not checked yet", id="drivers-status")
-                    yield Button("Check drivers", id="btn-drivers-check")
-
-                with Vertical(classes="panel"):
-                    yield Static("Service & update-check settings", classes="panel-title")
-                    yield Label("service.restart_policy")
-                    yield Select(_RESTART_POLICY_OPTIONS, id="f-restart-policy", allow_blank=False, value="on-failure")
-                    yield Label("service.restart_sec")
-                    yield Input(id="f-restart-sec")
-                    with Horizontal(classes="switch-row"):
-                        yield Switch(id="f-scheduled-restart-enabled")
-                        yield Label("service.scheduled_restart.enabled")
-                    yield Label("service.scheduled_restart.on_calendar")
-                    yield Input(id="f-scheduled-restart-calendar")
-                    with Horizontal(classes="switch-row"):
-                        yield Switch(id="f-update-check-enabled")
-                        yield Label("update_check.enabled")
-                    yield Label("update_check.on_calendar")
-                    yield Input(id="f-update-check-calendar")
-                    yield Static("", id="service-error")
+                    yield Static("", id="profile-error", classes="error-text")
                     with Horizontal(classes="button-row"):
-                        yield Button("Apply service settings", id="btn-apply-service", variant="primary")
-                    yield Static("", id="service-status")
+                        yield Button("Create host profile", id="btn-save-profile", variant="primary")
+                    yield Static("", id="profile-status", classes="status-text")
+                else:
+                    yield Static("", id="profile-error", classes="error-text")
+                    with Horizontal(classes="button-row"):
+                        yield Button("Save host profile", id="btn-save-profile", variant="primary")
+                    yield Static("", id="profile-status", classes="status-text")
+
+                    with Vertical(classes="panel"):
+                        yield Static("Wake-on-LAN", classes="panel-title")
+                        yield Static("not checked yet", id="wol-status", classes="status-text")
+                        yield Button("Check / Enable WOL", id="btn-wol-check")
+
+                    with Vertical(classes="panel"):
+                        yield Static("GPU driver lockfile", classes="panel-title")
+                        yield Static("not checked yet", id="drivers-status", classes="status-text")
+                        yield Button("Check drivers", id="btn-drivers-check")
+
+                    with Vertical(classes="panel"):
+                        yield Static("Service & update-check settings", classes="panel-title")
+                        yield Label("service.restart_policy")
+                        yield Select(_RESTART_POLICY_OPTIONS, id="f-restart-policy", allow_blank=False, value="on-failure")
+                        yield Label("service.restart_sec")
+                        yield Input(id="f-restart-sec")
+                        with Horizontal(classes="switch-row"):
+                            yield Switch(id="f-scheduled-restart-enabled")
+                            yield Label("service.scheduled_restart.enabled")
+                        yield Label("service.scheduled_restart.on_calendar")
+                        yield Input(id="f-scheduled-restart-calendar")
+                        with Horizontal(classes="switch-row"):
+                            yield Switch(id="f-update-check-enabled")
+                            yield Label("update_check.enabled")
+                        yield Label("update_check.on_calendar")
+                        yield Input(id="f-update-check-calendar")
+                        yield Static("", id="service-error", classes="error-text")
+                        with Horizontal(classes="button-row"):
+                            yield Button("Apply service settings", id="btn-apply-service", variant="primary")
+                        yield Static("", id="service-status", classes="status-text")
+
+            with VerticalScroll(id="settings-right"):
+                with Vertical(classes="panel"):
+                    yield Static("GPUs", classes="panel-title")
+                    if first_run:
+                        yield Vertical(id="gpu-editor-list")
+                        yield Button("Add GPU", id="btn-add-gpu")
+                    else:
+                        yield Vertical(id="gpu-display-list")
 
     def on_mount(self) -> None:
         self._populate_profile_form()
-        if self.host_profile is not None:
+        if self.host_profile is None:
+            self._render_gpu_editor()
+        else:
             self._render_gpu_list()
             self._populate_service_form()
             self._refresh_wol_status()
             self._refresh_drivers_status()
+        self._update_vpn_preview(self.query_one("#f-vpn-interface", Input).value)
 
     def on_refresh_requested(self) -> None:
         """Called by CockpitApp.action_refresh_all — re-reads WOL/driver status only (both are
@@ -223,18 +272,12 @@ class SettingsScreen(Widget):
             self.query_one("#f-hostname", Input).value = self.app_ref.host_name
             self.query_one("#f-gw-port", Input).value = "8090"
             self.query_one("#f-gw-timeout", Input).value = "120"
-            self.query_one("#f-gpu-id", Input).value = "gpu0"
-            self.query_one("#f-gpu-vendor", Select).value = "nvidia"
-            self.query_one("#f-gpu-backends", Input).value = "cuda"
             self.query_one("#f-retain-builds", Input).value = "3"
             self.query_one("#f-token-env", Input).value = "HF_TOKEN"
             return
 
         self.query_one("#f-hostname", Input).value = hp["hostname"]
-        self.query_one("#f-vpn-provider", Input).value = hp["network"]["vpn"]["provider"]
         self.query_one("#f-vpn-interface", Input).value = hp["network"]["vpn"]["interface"]
-        self.query_one("#f-wol-interface", Input).value = hp["network"]["wol"]["interface"]
-        self.query_one("#f-wol-mac", Input).value = hp["network"]["wol"]["mac"]
         self.query_one("#f-gw-port", Input).value = str(hp["network"]["gateway"]["port"])
         self.query_one("#f-gw-timeout", Input).value = str(hp["network"]["gateway"].get("health_check_timeout", ""))
         self.query_one("#f-models-dir", Input).value = hp["paths"]["models_dir"]
@@ -243,10 +286,102 @@ class SettingsScreen(Widget):
         self.query_one("#f-retain-builds", Input).value = str(hp["retain_builds"])
         self.query_one("#f-token-env", Input).value = hp["hf"]["token_env"]
 
+    # -- GPUs panel (right column) ---------------------------------------------------
+
+    def _lock_gpu_facts(self) -> dict[str, dict]:
+        """Best-effort per-GPU facts from hosts/<hostname>.lock.yaml, for the GPUs panel's
+        expanded detail (normal mode only). Returns {} if there's no lockfile yet or it
+        fails to parse — this is a display nicety, never a hard requirement. Reads the same
+        file _refresh_drivers_status does."""
+        if self.host_profile is None:
+            return {}
+        lock_path = self.repo_root / "hosts" / f"{self.host_profile['hostname']}.lock.yaml"
+        if not lock_path.exists():
+            return {}
+        try:
+            data = yaml.safe_load(lock_path.read_text()) or {}
+        except Exception:
+            return {}
+        return data.get("gpus", {}) or {}
+
     def _render_gpu_list(self) -> None:
-        gpus = self.host_profile["gpus"]
-        lines = [f"{g['id']} ({g['vendor']}): {', '.join(g['backends'])}" for g in gpus]
-        self.query_one("#gpu-list-display", Static).update("\n".join(lines) or "(no gpus)")
+        """Normal mode: read-only, one Collapsible per gpus[] entry, merged with lockfile
+        facts when available. Topology changes stay a direct hosts/<hostname>.yaml edit."""
+        container = self.query_one("#gpu-display-list", Vertical)
+        container.remove_children()
+        lock_facts = self._lock_gpu_facts()
+        for gpu in self.host_profile["gpus"]:
+            facts = dict(lock_facts.get(gpu["id"], {}))
+            facts.pop("vendor", None)
+            lines = [f"vendor: {gpu['vendor']}", f"backends: {', '.join(gpu['backends'])}"]
+            if facts:
+                lines.append("driver/runtime facts (from lockfile):")
+                lines.extend(f"  {k}: {v}" for k, v in facts.items())
+            container.mount(Collapsible(Static("\n".join(lines)), title=gpu["id"], collapsed=True))
+
+    def _build_gpu_editor_row(self, index: int, gpu: dict) -> Collapsible:
+        can_remove = len(self._pending_gpus) > 1
+        return Collapsible(
+            Label("id"),
+            Input(value=gpu["id"], classes="gpu-row-id"),
+            Label("vendor"),
+            Select(_GPU_VENDOR_OPTIONS, classes="gpu-row-vendor", allow_blank=False, value=gpu["vendor"]),
+            Label("backends (comma-separated: cuda, rocm, vulkan, sycl)"),
+            Input(value=", ".join(gpu["backends"]), classes="gpu-row-backends"),
+            Button("Remove", classes="gpu-row-remove", variant="error", disabled=not can_remove),
+            title=gpu["id"] or f"gpu{index}",
+            collapsed=False,
+        )
+
+    def _render_gpu_editor(self) -> None:
+        """First-run mode: editable Collapsible per pending GPU, plus "Add GPU" below."""
+        container = self.query_one("#gpu-editor-list", Vertical)
+        container.remove_children()
+        for i, gpu in enumerate(self._pending_gpus):
+            container.mount(self._build_gpu_editor_row(i, gpu))
+
+    def _read_gpu_row(self, row: Collapsible) -> dict:
+        gpu_id = row.query_one(".gpu-row-id", Input).value.strip()
+        vendor = row.query_one(".gpu-row-vendor", Select).value
+        backends_raw = row.query_one(".gpu-row-backends", Input).value.strip()
+        backends = [b.strip() for b in backends_raw.split(",") if b.strip()]
+        return {"id": gpu_id, "vendor": vendor, "backends": backends}
+
+    def _sync_pending_gpus_from_widgets(self) -> None:
+        container = self.query_one("#gpu-editor-list", Vertical)
+        self._pending_gpus = [self._read_gpu_row(row) for row in container.query(Collapsible)]
+
+    def _on_add_gpu_row(self) -> None:
+        self._sync_pending_gpus_from_widgets()
+        next_index = len(self._pending_gpus)
+        self._pending_gpus.append({"id": f"gpu{next_index}", "vendor": "nvidia", "backends": ["cuda"]})
+        self._render_gpu_editor()
+
+    def _on_remove_gpu_row(self, button: Button) -> None:
+        if len(self._pending_gpus) <= 1:
+            return
+        self._sync_pending_gpus_from_widgets()
+        row = _ancestor(button, Collapsible)
+        container = self.query_one("#gpu-editor-list", Vertical)
+        rows = list(container.query(Collapsible))
+        if row in rows:
+            del self._pending_gpus[rows.index(row)]
+        self._render_gpu_editor()
+
+    def _read_pending_gpus(self) -> tuple[list[dict] | None, str | None]:
+        self._sync_pending_gpus_from_widgets()
+        if not self._pending_gpus:
+            return None, "at least one gpu is required"
+        gpus = []
+        for i, gpu in enumerate(self._pending_gpus):
+            if not gpu["id"]:
+                return None, f"gpus[{i}].id is required"
+            if gpu["vendor"] is Select.BLANK:
+                return None, f"gpus[{i}].vendor is required"
+            if not gpu["backends"]:
+                return None, f"gpus[{i}].backends is required (comma-separated, e.g. cuda)"
+            gpus.append(gpu)
+        return gpus, None
 
     def _populate_service_form(self) -> None:
         service = self.host_profile.get("service", {})
@@ -258,6 +393,27 @@ class SettingsScreen(Widget):
         self.query_one("#f-scheduled-restart-calendar", Input).value = scheduled.get("on_calendar", "daily")
         self.query_one("#f-update-check-enabled", Switch).value = update_check_cfg.get("enabled", False)
         self.query_one("#f-update-check-calendar", Input).value = update_check_cfg.get("on_calendar", "daily")
+
+    # -- VPN interface -> IP live preview ---------------------------------------------
+
+    def _update_vpn_preview(self, interface: str) -> None:
+        interface = interface.strip()
+        preview = self.query_one("#vpn-resolve-preview", Static)
+        if not interface:
+            preview.update("")
+            return
+        try:
+            ip = swap.resolve_vpn_ip(interface)
+        except Exception:
+            # Keystroke-driven, outside any @work/try-except-guarded action — never let a
+            # missing `ip` binary or similar crash the whole TUI over a live preview.
+            preview.update("→ could not resolve (is `ip` available on this host?)")
+            return
+        preview.update(f"→ resolves to: {ip}" if ip else "→ not found / no address yet")
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "f-vpn-interface":
+            self._update_vpn_preview(event.value)
 
     # -- status helpers -----------------------------------------------------------
 
@@ -276,22 +432,20 @@ class SettingsScreen(Widget):
     # -- read form fields into a candidate host-profile dict ------------------------
 
     def _read_network_fields(self) -> tuple[dict | None, str | None]:
-        vpn_provider = self.query_one("#f-vpn-provider", Input).value.strip()
         vpn_interface = self.query_one("#f-vpn-interface", Input).value.strip()
-        wol_interface = self.query_one("#f-wol-interface", Input).value.strip()
-        wol_mac = self.query_one("#f-wol-mac", Input).value.strip()
         gw_port_raw = self.query_one("#f-gw-port", Input).value.strip()
         gw_timeout_raw = self.query_one("#f-gw-timeout", Input).value.strip()
-        if not all([vpn_provider, vpn_interface, wol_interface, wol_mac, gw_port_raw]):
-            return None, "network.vpn/wol fields and gateway.port are all required"
+        if not vpn_interface or not gw_port_raw:
+            return None, "network.vpn.interface and gateway.port are required"
         try:
             gw_port = int(gw_port_raw)
         except ValueError:
             return None, "gateway.port must be an integer"
         network: dict[str, Any] = {
-            "vpn": {"provider": vpn_provider, "interface": vpn_interface},
-            "wol": {"interface": wol_interface, "mac": wol_mac},
+            "vpn": {"interface": vpn_interface},
             "gateway": {"port": gw_port},
+            # WOL is edited elsewhere (or not yet, on first-run) — never part of this form.
+            "wol": dict(_WOL_PLACEHOLDER) if self.host_profile is None else self.host_profile["network"]["wol"],
         }
         if gw_timeout_raw:
             try:
@@ -299,19 +453,6 @@ class SettingsScreen(Widget):
             except ValueError:
                 return None, "gateway.health_check_timeout must be an integer"
         return network, None
-
-    def _read_gpu_fields(self) -> tuple[dict | None, str | None]:
-        gpu_id = self.query_one("#f-gpu-id", Input).value.strip()
-        vendor = self.query_one("#f-gpu-vendor", Select).value
-        backends_raw = self.query_one("#f-gpu-backends", Input).value.strip()
-        if not gpu_id:
-            return None, "gpu id is required"
-        if vendor is Select.BLANK:
-            return None, "gpu vendor is required"
-        backends = [b.strip() for b in backends_raw.split(",") if b.strip()]
-        if not backends:
-            return None, "gpu backends is required (comma-separated, e.g. cuda)"
-        return {"id": gpu_id, "vendor": vendor, "backends": backends}, None
 
     def _read_paths_fields(self) -> tuple[dict | None, str | None]:
         models_dir = self.query_one("#f-models-dir", Input).value.strip()
@@ -351,10 +492,10 @@ class SettingsScreen(Widget):
         }
 
         if self.host_profile is None:
-            gpu, err = self._read_gpu_fields()
+            gpus, err = self._read_pending_gpus()
             if err:
                 return None, err
-            candidate["gpus"] = [gpu]
+            candidate["gpus"] = gpus
         else:
             # GPU topology, service, and update_check are edited elsewhere (GPUs are
             # read-only here by design; service/update_check via "Apply service settings")
@@ -607,3 +748,7 @@ class SettingsScreen(Widget):
             self._confirm_and_check_drivers()
         elif bid == "btn-apply-service":
             self._confirm_and_apply_service()
+        elif bid == "btn-add-gpu":
+            self._on_add_gpu_row()
+        elif event.button.has_class("gpu-row-remove"):
+            self._on_remove_gpu_row(event.button)

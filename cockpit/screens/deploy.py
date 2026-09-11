@@ -15,7 +15,7 @@ from pathlib import Path
 import yaml
 from textual import work
 from textual.app import ComposeResult
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widget import Widget
 from textual.widgets import Button, DataTable, Input, Label, Select, Static, TextArea
 
@@ -30,30 +30,19 @@ _ENGINE_OPTIONS = [("llama-cpp", "llama-cpp"), ("unmanaged", "unmanaged")]
 class DeployScreen(Widget):
     """Mounted inside a TabPane by cockpit/app.py — not a Textual Screen."""
 
+    # .panel / .button-row / .status-text / .error-text come from cockpit/widgets.py's
+    # SHARED_CSS (CockpitApp.CSS) — only this screen's own rules live here. Root content is
+    # wrapped in a VerticalScroll (see compose()) so a tall form/preview doesn't get clipped
+    # in a short terminal.
     DEFAULT_CSS = """
     DeployScreen {
-        layout: vertical;
         height: 1fr;
-        padding: 1 2;
     }
     #models-table {
         height: 12;
         margin-bottom: 1;
     }
-    #list-actions {
-        height: auto;
-        margin-bottom: 1;
-    }
-    #list-actions Button {
-        margin-right: 1;
-    }
-    #status-message {
-        color: $text-muted;
-        margin-bottom: 1;
-    }
     #edit-form, #preview-area {
-        border: round $primary;
-        padding: 1 2;
         height: auto;
         max-height: 32;
     }
@@ -65,17 +54,6 @@ class DeployScreen(Widget):
     }
     #preview-text {
         height: 22;
-    }
-    #form-error {
-        color: $error;
-        margin-top: 1;
-    }
-    #form-buttons, #preview-buttons {
-        margin-top: 1;
-        height: auto;
-    }
-    #form-buttons Button, #preview-buttons Button {
-        margin-right: 1;
     }
     """
 
@@ -100,58 +78,59 @@ class DeployScreen(Widget):
     # -- layout ---------------------------------------------------------------
 
     def compose(self) -> ComposeResult:
-        yield Static("Models (models.yaml)", classes="section-title")
-        yield DataTable(id="models-table")
-        with Horizontal(id="list-actions"):
-            yield Button("Add", id="btn-add")
-            yield Button("Edit", id="btn-edit")
-            yield Button("Delete", id="btn-delete", variant="error")
-            yield Button("Preview config.yaml", id="btn-preview")
-        yield Static("", id="status-message")
+        with VerticalScroll():
+            yield Static("Models (models.yaml)", classes="section-title")
+            yield DataTable(id="models-table")
+            with Horizontal(classes="button-row"):
+                yield Button("Add", id="btn-add")
+                yield Button("Edit", id="btn-edit")
+                yield Button("Delete", id="btn-delete", variant="error")
+                yield Button("Preview config.yaml", id="btn-preview")
+            yield Static("", id="status-message", classes="status-text")
 
-        with Vertical(id="edit-form"):
-            yield Static("", id="form-title", classes="section-title")
-            yield Label("id")
-            yield Input(id="f-id", placeholder="model id")
-            yield Label("engine")
-            yield Select(_ENGINE_OPTIONS, id="f-engine", allow_blank=False, value="llama-cpp")
+            with Vertical(id="edit-form", classes="panel"):
+                yield Static("", id="form-title", classes="panel-title")
+                yield Label("id")
+                yield Input(id="f-id", placeholder="model id")
+                yield Label("engine")
+                yield Select(_ENGINE_OPTIONS, id="f-engine", allow_blank=False, value="llama-cpp")
 
-            with Vertical(id="f-llamacpp-fields"):
-                yield Label("repo_id")
-                yield Input(id="f-repo-id", placeholder="huggingface repo id")
-                yield Label("quant_file")
-                yield Input(id="f-quant-file", placeholder="quant filename")
-                yield Label("mmproj_file (optional)")
-                yield Input(id="f-mmproj-file", placeholder="")
-                yield Label("bind.gpu")
-                yield Select(self._gpu_options(), id="f-gpu", allow_blank=False)
-                yield Label("bind.backend")
-                yield Select([], id="f-backend", allow_blank=True)
-                yield Label("llama_server_args (one flag/value per line)")
-                yield TextArea(id="f-args")
+                with Vertical(id="f-llamacpp-fields"):
+                    yield Label("repo_id")
+                    yield Input(id="f-repo-id", placeholder="huggingface repo id")
+                    yield Label("quant_file")
+                    yield Input(id="f-quant-file", placeholder="quant filename")
+                    yield Label("mmproj_file (optional)")
+                    yield Input(id="f-mmproj-file", placeholder="")
+                    yield Label("bind.gpu")
+                    yield Select(self._gpu_options(), id="f-gpu", allow_blank=False)
+                    yield Label("bind.backend")
+                    yield Select([], id="f-backend", allow_blank=True)
+                    yield Label("llama_server_args (one flag/value per line)")
+                    yield TextArea(id="f-args")
 
-            with Vertical(id="f-unmanaged-fields"):
-                yield Label("cmd (raw shell command, ${PORT} available)")
-                yield TextArea(id="f-cmd")
+                with Vertical(id="f-unmanaged-fields"):
+                    yield Label("cmd (raw shell command, ${PORT} available)")
+                    yield TextArea(id="f-cmd")
 
-            yield Label("env (one KEY=VALUE per line)")
-            yield TextArea(id="f-env")
-            yield Label("ttl (seconds, 0 = never evict)")
-            yield Input(id="f-ttl", value="0")
-            yield Label("group (optional)")
-            yield Input(id="f-group", placeholder="")
+                yield Label("env (one KEY=VALUE per line)")
+                yield TextArea(id="f-env")
+                yield Label("ttl (seconds, 0 = never evict)")
+                yield Input(id="f-ttl", value="0")
+                yield Label("group (optional)")
+                yield Input(id="f-group", placeholder="")
 
-            yield Static("", id="form-error")
-            with Horizontal(id="form-buttons"):
-                yield Button("Save", id="btn-save", variant="primary")
-                yield Button("Cancel", id="btn-cancel")
+                yield Static("", id="form-error", classes="error-text")
+                with Horizontal(classes="button-row"):
+                    yield Button("Save", id="btn-save", variant="primary")
+                    yield Button("Cancel", id="btn-cancel")
 
-        with Vertical(id="preview-area"):
-            yield Static("Generated config.yaml preview", classes="section-title")
-            yield TextArea(id="preview-text")
-            with Horizontal(id="preview-buttons"):
-                yield Button("Apply this config", id="btn-confirm-apply", variant="primary")
-                yield Button("Close preview", id="btn-close-preview")
+            with Vertical(id="preview-area", classes="panel"):
+                yield Static("Generated config.yaml preview", classes="panel-title")
+                yield TextArea(id="preview-text")
+                with Horizontal(classes="button-row"):
+                    yield Button("Apply this config", id="btn-confirm-apply", variant="primary")
+                    yield Button("Close preview", id="btn-close-preview")
 
     def on_mount(self) -> None:
         table = self.query_one("#models-table", DataTable)

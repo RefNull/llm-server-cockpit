@@ -54,25 +54,11 @@ class BuildsScreen(Widget):
     etc. per hosts/<hostname>.yaml), plus one upstream-version-check panel.
     """
 
+    # .panel / .panel-title / .button-row come from cockpit/widgets.py's SHARED_CSS
+    # (CockpitApp.CSS) — only this screen's own rules live here.
     DEFAULT_CSS = """
     BuildsScreen {
         height: 1fr;
-    }
-    BuildsScreen .panel {
-        border: round $primary;
-        padding: 1 2;
-        margin-bottom: 1;
-    }
-    BuildsScreen .panel-title {
-        text-style: bold;
-    }
-    BuildsScreen .button-row {
-        height: auto;
-        margin-top: 1;
-        margin-bottom: 1;
-    }
-    BuildsScreen .button-row Button {
-        margin-right: 2;
     }
     BuildsScreen DataTable {
         height: auto;

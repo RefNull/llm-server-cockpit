@@ -6,8 +6,10 @@ hostname: example-host
 
 network:
   vpn:
-    provider: "TODO"     # e.g. tailscale, wireguard — the overlay this host is reachable through
-    interface: "TODO"    # e.g. tailscale0, wg0 — gateway binds ONLY to this interface's address
+    # NIC name, not an IP or hostname — e.g. tailscale0 for Tailscale, wg0 for WireGuard.
+    # The gateway binds to whatever address this interface has at the time, resolved fresh
+    # on every apply (`ip a` on the host will show you the interface name to use here).
+    interface: "TODO"
   wol:
     interface: "TODO"    # NIC that receives the magic packet, e.g. enp5s0
     mac: "00:00:00:00:00:00"

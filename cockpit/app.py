@@ -21,6 +21,7 @@ from cockpit.screens.builds import BuildsScreen
 from cockpit.screens.deploy import DeployScreen
 from cockpit.screens.downloads import DownloadsScreen
 from cockpit.screens.settings import SettingsScreen
+from cockpit.widgets import SHARED_CSS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -36,7 +37,13 @@ class CockpitApp(App):
     paths, etc.), so rather than pushing None-handling into every screen, first-run just asks
     for a restart once the profile is created (see SettingsScreen) — a one-time step, not
     something that needs to be seamless.
+
+    CSS = SHARED_CSS (cockpit/widgets.py): panel/button-row/status-text/error-text and the
+    scroll-container convention are defined once there and cascade to every screen — see that
+    file's module docstring for the convention every screen composes against.
     """
+
+    CSS = SHARED_CSS
 
     TITLE = "llm-server-cockpit"
     BINDINGS = [
@@ -61,7 +68,7 @@ class CockpitApp(App):
         yield Header()
         if self.host_profile is None:
             with TabbedContent(initial="settings"):
-                with TabPane("Settings", id="settings"):
+                with TabPane("First setup", id="settings"):
                     yield SettingsScreen(self.host_profile, self.manifest, self.models, self.runner, self.repo_root, self)
         else:
             with TabbedContent(initial="installs"):

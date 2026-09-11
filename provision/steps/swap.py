@@ -71,19 +71,31 @@ def _install_llama_swap(host_profile: dict[str, Any], manifest: dict[str, Any], 
     return _BINARY_PATH
 
 
+def resolve_vpn_ip(interface: str) -> str | None:
+    """Read-only: the interface's current IPv4 address, or None if it doesn't exist / has
+    none yet. Public so the cockpit's Settings tab can show a live preview of what an
+    interface name actually resolves to — the field takes a NIC name, not an IP, precisely
+    because that address can change (DHCP/overlay-assigned) while the interface name doesn't."""
+    result = subprocess.run(["ip", "-4", "addr", "show", "dev", interface], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    if result.returncode != 0:
+        return None
+    m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)/\d+", result.stdout)
+    return m.group(1) if m else None
+
+
 def _resolve_listen_addr(host_profile: dict[str, Any]) -> str:
     iface = host_profile["network"]["vpn"]["interface"]
     port = host_profile["network"]["gateway"]["port"]
     # Resolved at generation time rather than stored in the host profile: the interface name
     # is stable, a DHCP/overlay-assigned IP is not. Binds to this address specifically (never
     # 0.0.0.0) per the project owner's explicit private-network-only decision.
-    result = subprocess.run(["ip", "-4", "addr", "show", "dev", iface], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    if result.returncode != 0:
-        sys.exit(f"swap: interface {iface!r} (network.vpn.interface) not found on this host: {result.stdout.strip()}")
-    m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)/\d+", result.stdout)
-    if not m:
-        sys.exit(f"swap: interface {iface!r} has no IPv4 address yet — VPN not up, refusing to fall back to another bind address")
-    return f"{m.group(1)}:{port}"
+    ip = resolve_vpn_ip(iface)
+    if ip is None:
+        sys.exit(
+            f"swap: interface {iface!r} (network.vpn.interface) not found, or has no IPv4 "
+            "address yet (VPN not up) — refusing to fall back to another bind address"
+        )
+    return f"{ip}:{port}"
 
 
 def _build_model_entry(model: dict[str, Any], host_profile: dict[str, Any]) -> dict[str, Any]:

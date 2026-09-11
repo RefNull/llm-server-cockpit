@@ -10,7 +10,7 @@ from typing import Any
 
 from textual import work
 from textual.app import ComposeResult
-from textual.containers import Horizontal
+from textual.containers import Horizontal, VerticalScroll
 from textual.widgets import Button, DataTable, Label, Static
 
 from provision.common import Runner
@@ -35,6 +35,10 @@ class DownloadsScreen(Static):
     skip-placeholder-and-report logic, so there's nothing to pre-empt there.
     """
 
+    # .button-row / .status-text come from cockpit/widgets.py's SHARED_CSS (CockpitApp.CSS).
+    # Root content is wrapped in a VerticalScroll (see compose()); the table gets a bounded
+    # max-height rather than 1fr, which doesn't have a well-defined meaning inside a
+    # content-sized scroll container (matches builds.py's DataTable convention).
     DEFAULT_CSS = """
     DownloadsScreen {
         padding: 1 2;
@@ -54,19 +58,10 @@ class DownloadsScreen(Static):
     #disk-usage {
         margin: 1 0;
     }
-    #actions-row {
+    #model-table {
         height: auto;
-        margin-top: 1;
-    }
-    #actions-row Button {
-        margin-right: 2;
-    }
-    #download-status {
-        margin-top: 1;
-        height: auto;
-    }
-    DataTable {
-        height: 1fr;
+        max-height: 15;
+        margin-bottom: 1;
     }
     """
 
@@ -90,15 +85,16 @@ class DownloadsScreen(Static):
         self._downloadable: dict[str, dict[str, Any]] = {}
 
     def compose(self) -> ComposeResult:
-        yield Static("", id="auth-banner")
-        yield Static("", id="disk-usage")
-        table = DataTable(id="model-table", zebra_stripes=True)
-        table.cursor_type = "row"
-        yield table
-        with Horizontal(id="actions-row"):
-            yield Button("Download selected", id="download-selected", variant="primary")
-            yield Button("Download all", id="download-all", variant="warning")
-        yield Label("", id="download-status")
+        with VerticalScroll():
+            yield Static("", id="auth-banner")
+            yield Static("", id="disk-usage")
+            table = DataTable(id="model-table", zebra_stripes=True)
+            table.cursor_type = "row"
+            yield table
+            with Horizontal(classes="button-row"):
+                yield Button("Download selected", id="download-selected", variant="primary")
+                yield Button("Download all", id="download-all", variant="warning")
+            yield Label("", id="download-status", classes="status-text")
 
     def on_mount(self) -> None:
         table = self.query_one("#model-table", DataTable)
