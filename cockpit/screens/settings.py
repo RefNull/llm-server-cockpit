@@ -36,6 +36,8 @@ from textual.widgets import (
     Select,
     Static,
     Switch,
+    TabbedContent,
+    TabPane,
     TextArea,
 )
 
@@ -80,16 +82,8 @@ class SettingsScreen(Widget):
         height: 1fr;
         padding: 0 1;
     }
-    SettingsScreen #settings-columns {
+    SettingsScreen #settings-tabs {
         height: 1fr;
-    }
-    SettingsScreen #settings-left, SettingsScreen #settings-right {
-        height: 1fr;
-        width: 1fr;
-        min-width: 45;
-    }
-    SettingsScreen #settings-left {
-        margin-right: 1;
     }
     SettingsScreen Label {
         margin-top: 1;
@@ -224,82 +218,88 @@ class SettingsScreen(Widget):
 
     def _compose_normal(self) -> ComposeResult:
         yield Static("Host hardware profile, GPU topology, and system services", classes="subtitle")
-        with Horizontal(id="settings-columns"):
-            with VerticalScroll(id="settings-left", classes="panel"):
-                with Vertical(classes="panel"):
-                    yield Static("Host identity", classes="panel-title")
-                    yield Label("Hostname")
-                    yield Input(id="f-hostname")
-                    yield Label("Builds to keep")
-                    yield Input(id="f-retain")
-                    yield Label("HF token env var")
-                    yield Input(id="f-token-env")
+        with TabbedContent(initial="settings-host", id="settings-tabs"):
+            with TabPane("Host", id="settings-host"):
+                with VerticalScroll():
+                    with Vertical(classes="panel"):
+                        yield Static("Host identity", classes="panel-title")
+                        yield Label("Hostname")
+                        yield Input(id="f-hostname")
+                        yield Label("Builds to keep")
+                        yield Input(id="f-retain")
+                        yield Label("HF token env var")
+                        yield Input(id="f-token-env")
 
-                with Vertical(classes="panel"):
-                    yield Static("Network bind", classes="panel-title")
-                    yield Label("VPN interface (not an IP)")
-                    with Horizontal(classes="inline-row"):
-                        yield Input(id="f-vpn-interface", placeholder="e.g. tailscale0, wg0")
-                        yield Button("ip a", id="btn-ip-a", classes="thin-button")
-                    yield Static("", id="vpn-resolve-preview")
-                    yield Label("Gateway port")
-                    yield Input(id="f-port")
-                    yield Label("Health check timeout (opt.)")
-                    yield Input(id="f-gw-timeout")
+                    with Vertical(classes="panel"):
+                        yield Static("Paths", classes="panel-title")
+                        yield Label("Model files folder")
+                        yield Input(id="f-models-dir")
+                        yield Label("App state folder")
+                        yield Input(id="f-state-dir")
+                        yield Label("Build output folder")
+                        yield Input(id="f-prefix-root")
 
-                with Vertical(classes="panel"):
-                    yield Static("Paths", classes="panel-title")
-                    yield Label("Model files folder")
-                    yield Input(id="f-models-dir")
-                    yield Label("App state folder")
-                    yield Input(id="f-state-dir")
-                    yield Label("Build output folder")
-                    yield Input(id="f-prefix-root")
-
-                yield Static("", id="profile-error", classes="error-text")
-                with Horizontal(classes="button-row"):
-                    yield Button("Save host profile", id="btn-save-profile", variant="primary", classes="thin-button")
-                yield Static("", id="profile-status", classes="status-text")
-
-            with VerticalScroll(id="settings-right", classes="panel"):
-                with Vertical(classes="panel"):
-                    yield Static("GPUs", classes="panel-title")
-                    yield DataTable(id="gpu-table", zebra_stripes=True, classes="data-table")
+                    yield Static("", id="profile-error", classes="error-text")
                     with Horizontal(classes="button-row"):
-                        yield Button("List PCIe devices", id="btn-lspci", classes="thin-button")
+                        yield Button("Save host profile", id="btn-save-profile", variant="primary", classes="thin-button")
+                    yield Static("", id="profile-status", classes="status-text")
 
-                with Vertical(classes="panel"):
-                    yield Static("Wake-on-LAN", classes="panel-title")
-                    yield Static("not checked yet", id="wol-status", classes="status-text")
-                    with Horizontal(classes="button-row"):
-                        yield Button("Check / Enable WOL", id="btn-wol-check", classes="thin-button")
+            with TabPane("Networking", id="settings-networking"):
+                with VerticalScroll():
+                    with Vertical(classes="panel"):
+                        yield Static("Network bind", classes="panel-title")
+                        yield Label("VPN interface (not an IP)")
+                        with Horizontal(classes="inline-row"):
+                            yield Input(id="f-vpn-interface", placeholder="e.g. tailscale0, wg0")
+                            yield Button("ip a", id="btn-ip-a", classes="thin-button")
+                        yield Static("", id="vpn-resolve-preview")
+                        yield Label("Gateway port")
+                        yield Input(id="f-port")
+                        yield Label("Health check timeout (opt.)")
+                        yield Input(id="f-gw-timeout")
 
-                with Vertical(classes="panel"):
-                    yield Static("GPU driver lockfile", classes="panel-title")
-                    yield Static("not checked yet", id="drivers-status", classes="status-text")
-                    with Horizontal(classes="button-row"):
-                        yield Button("Check drivers", id="btn-drivers-check", classes="thin-button")
+            with TabPane("Hardware", id="settings-hardware"):
+                with VerticalScroll():
+                    with Vertical(classes="panel"):
+                        yield Static("GPUs", classes="panel-title")
+                        yield DataTable(id="gpu-table", zebra_stripes=True, classes="data-table")
+                        with Horizontal(classes="button-row"):
+                            yield Button("List PCIe devices", id="btn-lspci", classes="thin-button")
 
-                with Vertical(classes="panel"):
-                    yield Static("Service & update-check settings", classes="panel-title")
-                    yield Label("Restart policy")
-                    yield Select(_RESTART_POLICY_OPTIONS, id="f-restart-policy", allow_blank=False, value="on-failure")
-                    yield Label("Restart delay (sec)")
-                    yield Input(id="f-restart-sec")
-                    with Horizontal(classes="switch-row"):
-                        yield Switch(id="f-scheduled-restart-enabled")
-                        yield Label("Scheduled restart")
-                    yield Label("Restart schedule")
-                    yield Input(id="f-scheduled-restart-calendar")
-                    with Horizontal(classes="switch-row"):
-                        yield Switch(id="f-update-check-enabled")
-                        yield Label("Scheduled update check")
-                    yield Label("Check schedule")
-                    yield Input(id="f-update-check-calendar")
-                    yield Static("", id="service-error", classes="error-text")
-                    with Horizontal(classes="button-row"):
-                        yield Button("Apply service settings", id="btn-apply-service", variant="primary", classes="thin-button")
-                    yield Static("", id="service-status", classes="status-text")
+                    with Vertical(classes="panel"):
+                        yield Static("GPU driver lockfile", classes="panel-title")
+                        yield Static("not checked yet", id="drivers-status", classes="status-text")
+                        with Horizontal(classes="button-row"):
+                            yield Button("Check drivers", id="btn-drivers-check", classes="thin-button")
+
+            with TabPane("Services", id="settings-services"):
+                with VerticalScroll():
+                    with Vertical(classes="panel"):
+                        yield Static("Wake-on-LAN", classes="panel-title")
+                        yield Static("not checked yet", id="wol-status", classes="status-text")
+                        with Horizontal(classes="button-row"):
+                            yield Button("Check / Enable WOL", id="btn-wol-check", classes="thin-button")
+
+                    with Vertical(classes="panel"):
+                        yield Static("Service & update-check settings", classes="panel-title")
+                        yield Label("Restart policy")
+                        yield Select(_RESTART_POLICY_OPTIONS, id="f-restart-policy", allow_blank=False, value="on-failure")
+                        yield Label("Restart delay (sec)")
+                        yield Input(id="f-restart-sec")
+                        with Horizontal(classes="switch-row"):
+                            yield Switch(id="f-scheduled-restart-enabled")
+                            yield Label("Scheduled restart")
+                        yield Label("Restart schedule")
+                        yield Input(id="f-scheduled-restart-calendar")
+                        with Horizontal(classes="switch-row"):
+                            yield Switch(id="f-update-check-enabled")
+                            yield Label("Scheduled update check")
+                        yield Label("Check schedule")
+                        yield Input(id="f-update-check-calendar")
+                        yield Static("", id="service-error", classes="error-text")
+                        with Horizontal(classes="button-row"):
+                            yield Button("Apply service settings", id="btn-apply-service", variant="primary", classes="thin-button")
+                        yield Static("", id="service-status", classes="status-text")
 
     def on_mount(self) -> None:
         self._populate_profile_form()
@@ -823,15 +823,14 @@ class SettingsScreen(Widget):
     def _refresh_drivers_status(self) -> None:
         if self.host_profile is None:
             return
-        lock_path = self.repo_root / "hosts" / f"{self.host_profile['hostname']}.lock.yaml"
         widget = self.query_one("#drivers-status", Static)
-        if not lock_path.exists():
-            widget.update("not checked yet (no lockfile at hosts/<hostname>.lock.yaml)")
-            return
         try:
-            data = yaml.safe_load(lock_path.read_text()) or {}
+            data = drivers.read_lockfile_status(self.host_profile, self.repo_root)
         except Exception as e:
             widget.update(f"failed to read lockfile: {e}")
+            return
+        if data is None:
+            widget.update("not checked yet (no lockfile at hosts/<hostname>.lock.yaml)")
             return
         lines = [f"generated_at: {data.get('generated_at', 'unknown')}"]
         for gpu_id, facts in (data.get("gpus") or {}).items():

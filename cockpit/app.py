@@ -18,6 +18,7 @@ from provision.common import Runner
 
 from cockpit import __version__
 from cockpit.screens.builds import BuildsScreen
+from cockpit.screens.dashboard import DashboardScreen
 from cockpit.screens.deploy import DeployScreen
 from cockpit.screens.downloads import DownloadsScreen
 from cockpit.screens.settings import SettingsScreen
@@ -83,6 +84,13 @@ class CockpitApp(App):
     for a restart once the profile is created (see SettingsScreen) — a one-time step, not
     something that needs to be seamless.
 
+    Normal mode's tabs are grouped two levels deep via nested TabbedContent — Dashboard is the
+    default/landing tab, "LLM" groups Backends/Models/HF Downloads (BuildsScreen/DeployScreen/
+    DownloadsScreen — renamed labels only, same screen classes), Settings groups its own
+    sub-tabs internally (see SettingsScreen._compose_normal). Nesting doesn't change how
+    action_refresh_all's DOM query below finds screens: Textual mounts every TabPane's content
+    up front (no lazy-mount), so a query for a screen class matches regardless of nesting depth.
+
     CSS = SHARED_CSS (cockpit/widgets.py): panel/button-row/status-text/error-text and the
     scroll-container convention are defined once there and cascade to every screen — see that
     file's module docstring for the convention every screen composes against.
@@ -128,20 +136,24 @@ class CockpitApp(App):
                 with TabPane("First setup", id="settings"):
                     yield SettingsScreen(self.host_profile, self.manifest, self.models, self.runner, self.repo_root, self)
         else:
-            with TabbedContent(initial="installs"):
-                with TabPane("Installs", id="installs"):
-                    yield BuildsScreen(self.host_profile, self.manifest, self.models, self.runner, self.repo_root, self)
-                with TabPane("Deploy", id="deploy"):
-                    yield DeployScreen(self.host_profile, self.manifest, self.models, self.runner, self.repo_root, self)
-                with TabPane("Downloads", id="downloads"):
-                    yield DownloadsScreen(self.host_profile, self.manifest, self.models, self.runner, self.repo_root, self)
+            with TabbedContent(initial="dashboard"):
+                with TabPane("Dashboard", id="dashboard"):
+                    yield DashboardScreen(self.host_profile, self.manifest, self.models, self.runner, self.repo_root, self)
+                with TabPane("LLM", id="llm"):
+                    with TabbedContent(initial="backends"):
+                        with TabPane("Backends", id="backends"):
+                            yield BuildsScreen(self.host_profile, self.manifest, self.models, self.runner, self.repo_root, self)
+                        with TabPane("Models", id="models"):
+                            yield DeployScreen(self.host_profile, self.manifest, self.models, self.runner, self.repo_root, self)
+                        with TabPane("HF Downloads", id="hf-downloads"):
+                            yield DownloadsScreen(self.host_profile, self.manifest, self.models, self.runner, self.repo_root, self)
                 with TabPane("Settings", id="settings"):
                     yield SettingsScreen(self.host_profile, self.manifest, self.models, self.runner, self.repo_root, self)
         yield Footer()
 
     def action_refresh_all(self) -> None:
         self.reload_models()
-        for widget in self.query("BuildsScreen, DeployScreen, DownloadsScreen, SettingsScreen"):
+        for widget in self.query("DashboardScreen, BuildsScreen, DeployScreen, DownloadsScreen, SettingsScreen"):
             if hasattr(widget, "on_refresh_requested"):
                 widget.on_refresh_requested()
 

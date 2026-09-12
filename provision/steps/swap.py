@@ -170,14 +170,31 @@ def _install_unit(repo_root: Path, binary_path: Path, config_path: Path, listen_
     return unit_changed
 
 
+_TIMEOUT_S = 10
+
+
 def _is_active(unit: str) -> bool:
-    result = subprocess.run(["systemctl", "is-active", unit], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    result = subprocess.run(
+        ["systemctl", "is-active", unit], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=_TIMEOUT_S,
+    )
     return result.returncode == 0 and result.stdout.strip() == "active"
 
 
 def _is_enabled(unit: str) -> bool:
-    result = subprocess.run(["systemctl", "is-enabled", unit], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    result = subprocess.run(
+        ["systemctl", "is-enabled", unit], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=_TIMEOUT_S,
+    )
     return result.returncode == 0 and result.stdout.strip() == "enabled"
+
+
+def status(host_profile: dict[str, Any]) -> dict[str, Any]:
+    """Read-only llama-swap facts for display (the cockpit's Dashboard/Models tabs) — reuses
+    run()'s own _is_active/_is_enabled/_current_installed_version rather than a parallel check."""
+    return {
+        "installed_version": _current_installed_version(_BINARY_PATH),
+        "unit_active": _is_active(_UNIT_NAME),
+        "unit_enabled": _is_enabled(_UNIT_NAME),
+    }
 
 
 def _sync_timer_pair(

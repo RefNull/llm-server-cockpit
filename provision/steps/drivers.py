@@ -89,8 +89,22 @@ def _capture_intel(gpu_id: str) -> dict[str, str]:
 _CAPTURE = {"nvidia": _capture_nvidia, "amd": _capture_amd, "intel": _capture_intel}
 
 
+def _lockfile_path(host_profile: dict[str, Any], repo_root: Path) -> Path:
+    return repo_root / "hosts" / f"{host_profile['hostname']}.lock.yaml"
+
+
+def read_lockfile_status(host_profile: dict[str, Any], repo_root: Path) -> dict[str, Any] | None:
+    """Read-only parse of the drift-check lockfile run() writes, for display on the cockpit's
+    Settings/Dashboard tabs — None if no lockfile exists yet (never checked). Raises on a
+    corrupt lockfile; callers decide how to surface that."""
+    lock_path = _lockfile_path(host_profile, repo_root)
+    if not lock_path.exists():
+        return None
+    return yaml.safe_load(lock_path.read_text()) or {}
+
+
 def run(host_profile: dict[str, Any], manifest: dict[str, Any], models: dict[str, Any], runner: Runner, repo_root: Path) -> None:
-    lock_path = repo_root / "hosts" / f"{host_profile['hostname']}.lock.yaml"
+    lock_path = _lockfile_path(host_profile, repo_root)
 
     captured: dict[str, dict[str, str]] = {}
     for gpu in host_profile["gpus"]:
