@@ -13,6 +13,10 @@ from provision.common import Runner
 
 log = logging.getLogger("provision")
 
+# Local, fast commands (ip/ethtool/systemctl/nmcli) — a timeout here is only a backstop against
+# one hanging and freezing the cockpit's status-check worker, not a real operational limit.
+_TIMEOUT_S = 10
+
 
 def _read_iface_mac(iface: str) -> str | None:
     if shutil.which("ip") is None:  # iproute2 isn't guaranteed present on a minimal image
@@ -22,6 +26,7 @@ def _read_iface_mac(iface: str) -> str | None:
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        timeout=_TIMEOUT_S,
     )
     if result.returncode != 0:
         return None
@@ -37,6 +42,7 @@ def _read_wake_flags(iface: str) -> str | None:
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        timeout=_TIMEOUT_S,
     )
     if result.returncode != 0:
         return None
@@ -50,6 +56,7 @@ def _is_enabled(unit: str) -> bool:
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        timeout=_TIMEOUT_S,
     )
     return result.returncode == 0 and result.stdout.strip() == "enabled"
 
@@ -96,7 +103,7 @@ def _fix_tlp(iface: str, runner: Runner) -> None:
 def _active_nm_connection(iface: str) -> str | None:
     result = subprocess.run(
         ["nmcli", "-t", "-f", "DEVICE,NAME", "con", "show", "--active"],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=_TIMEOUT_S,
     )
     if result.returncode != 0:
         return None
@@ -112,7 +119,9 @@ def _arm_networkmanager(iface: str, runner: Runner) -> None:
     independently of whatever ethtool -s was last told — same class of problem as TLP."""
     if shutil.which("nmcli") is None:
         return
-    active = subprocess.run(["systemctl", "is-active", "NetworkManager"], stdout=subprocess.PIPE, text=True)
+    active = subprocess.run(
+        ["systemctl", "is-active", "NetworkManager"], stdout=subprocess.PIPE, text=True, timeout=_TIMEOUT_S,
+    )
     if active.returncode != 0:
         return
     conn = _active_nm_connection(iface)
@@ -121,7 +130,7 @@ def _arm_networkmanager(iface: str, runner: Runner) -> None:
         return
     current = subprocess.run(
         ["nmcli", "-t", "-f", "802-3-ethernet.wake-on-lan", "con", "show", conn],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=_TIMEOUT_S,
     )
     if "magic" in current.stdout:
         log.info("wol: NetworkManager connection %r already arms wake-on-lan=magic", conn)

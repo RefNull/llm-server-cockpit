@@ -37,10 +37,6 @@ class DeployScreen(Widget):
     DeployScreen {
         height: 1fr;
     }
-    #models-table {
-        height: 12;
-        margin-bottom: 1;
-    }
     #edit-form, #preview-area {
         height: auto;
         max-height: 32;
@@ -80,7 +76,7 @@ class DeployScreen(Widget):
         with VerticalScroll():
             yield Static("Configure models.yaml and deploy the llama-swap inference routing service", classes="subtitle")
             yield Static("Models (models.yaml)", classes="section-title")
-            yield DataTable(id="models-table")
+            yield DataTable(id="models-table", classes="data-table")
             with Horizontal(classes="button-row"):
                 yield Button("Add", id="btn-add", variant="primary", classes="thin-button")
                 yield Button("Edit", id="btn-edit", classes="thin-button")

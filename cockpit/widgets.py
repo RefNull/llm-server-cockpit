@@ -16,11 +16,13 @@ from __future__ import annotations
 
 import subprocess
 
+from rich.text import Text
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.coordinate import Coordinate
 from textual.screen import ModalScreen
 from textual.theme import Theme
-from textual.widgets import Button, Static
+from textual.widgets import Button, DataTable, Static
 
 AMBER_THEME = Theme(
     name="cockpit-amber",
@@ -48,12 +50,23 @@ Tabs {
 Tab {
     padding: 0 2;
 }
-Tab.-active {
-    color: #f5a623;
-    text-style: bold;
-    border-bottom: tall #f5a623;
-}
+/* No custom Tab.-active rule here on purpose. Textual's built-in Tabs:focus rule already
+   paints the active tab with a solid $block-cursor-background (AMBER_THEME.primary) and a
+   contrasting dark $block-cursor-foreground — legible out of the box, and it's what every
+   screenshot below was verified against. The app previously added its own `Tab.-active {
+   color: #f5a623; ... }` on top of that: same property, different CSS source (app-level flat
+   rule vs. the widget's own nested `&:focus { &.-active {...} } ` rule), and that combination
+   made Textual drop the tab's label glyphs entirely — not just poor contrast, no text at all —
+   confirmed by directly inspecting the rendered Tab (correct resolved color/background, empty
+   painted cells) and reproduced with intentionally high-contrast colors instead of amber, which
+   also came out blank. Leave Tab's active styling to Textual's default rather than fight it. */
 .panel {
+    /* Textual's Vertical container defaults to height: 1fr — fine for a flex layout, wrong
+       for a grouped box of fields meant to size to its own content. Without this override,
+       every Vertical(classes="panel") inside a VerticalScroll stretches to fill an even share
+       of the scroll viewport instead of hugging its content, opening large dead gaps between
+       panels (most visible once a panel holds little content, e.g. a short DataTable). */
+    height: auto;
     padding: 0 1;
     margin-bottom: 1;
 }
@@ -114,6 +127,11 @@ Tab.-active {
     color: $error;
     margin-top: 1;
 }
+.data-table {
+    height: auto;
+    max-height: 15;
+    margin-bottom: 1;
+}
 """
 
 
@@ -126,6 +144,39 @@ def run_shell_capture(cmd: str, timeout: float = 5.0) -> str:
         return (result.stdout or result.stderr or "(no output)").strip()
     except Exception as e:
         return f"error running command: {e}"
+
+
+def selection_marker(selected: bool) -> Text:
+    """Column-0 tick mark for a tick-able DataTable row — see SingleClickDataTable. Plain text,
+    not a Checkbox widget: selection state lives in the screen's own `set[str]` of row keys,
+    toggled on DataTable.RowSelected, and the table is rebuilt (clear() + re-add_row()) so this
+    marker always reflects current state rather than being independently mutated."""
+    return Text("[x]" if selected else "[ ]", style="bold" if selected else "")
+
+
+class SingleClickDataTable(DataTable):
+    """A DataTable that selects a row on the first click instead of Textual's default, which
+    requires the cursor to already be on a row before a click there counts as a selection (i.e.
+    two clicks to select an unvisited row). A tick-able table (Installs backends, Downloads
+    models) needs one click per row to toggle it, so this mirrors DataTable._on_click but always
+    posts the selection message instead of only when the click matches the existing cursor."""
+
+    async def _on_click(self, event) -> None:
+        self._set_hover_cursor(True)
+        meta = event.style.meta
+        if "row" not in meta or "column" not in meta:
+            return
+        row_index = meta["row"]
+        column_index = meta["column"]
+        is_header_click = self.show_header and row_index == -1
+        is_row_label_click = self.show_row_labels and column_index == -1
+        if is_header_click or is_row_label_click or not self.show_cursor or self.cursor_type == "none":
+            await super()._on_click(event)
+            return
+        self.cursor_coordinate = Coordinate(row_index, column_index)
+        self._post_selected_message()
+        self._scroll_cursor_into_view(animate=True)
+        event.stop()
 
 
 class InfoModal(ModalScreen[None]):

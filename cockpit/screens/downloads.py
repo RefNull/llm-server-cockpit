@@ -17,7 +17,7 @@ from textual.widgets import Button, DataTable, Label, Static
 from provision.common import Runner
 from provision.steps import hf
 
-from cockpit.widgets import ConfirmModal
+from cockpit.widgets import ConfirmModal, SingleClickDataTable, selection_marker
 
 STATUS_ICONS = {
     "downloaded": "✅ downloaded",   # ✅
@@ -42,6 +42,7 @@ class DownloadsScreen(Widget):
     # content-sized scroll container (matches builds.py's DataTable convention).
     DEFAULT_CSS = """
     DownloadsScreen {
+        height: 1fr;
         padding: 0;
     }
     #auth-banner {
@@ -63,11 +64,6 @@ class DownloadsScreen(Widget):
         margin: 1 0;
         text-style: italic;
     }
-    #model-table {
-        height: auto;
-        max-height: 15;
-        margin-bottom: 1;
-    }
     """
 
     def __init__(
@@ -88,6 +84,11 @@ class DownloadsScreen(Widget):
         self.cockpit_app = app_ref
         # id -> model dict, for the llama-cpp models currently shown in the table.
         self._downloadable: dict[str, dict[str, Any]] = {}
+        # Ticked model ids — tick-able table convention ported from kyuz0/ai-toolbox-cockpit:
+        # plain DataTable + a "[ ]"/"[x]" text marker in column 0, not a Checkbox widget. See
+        # cockpit/widgets.py's selection_marker()/SingleClickDataTable.
+        self._selected: set[str] = set()
+        self._downloading = False
 
     def compose(self) -> ComposeResult:
         with VerticalScroll():
@@ -99,17 +100,17 @@ class DownloadsScreen(Widget):
                 id="empty-models-notice",
                 classes="status-text",
             )
-            table = DataTable(id="model-table", zebra_stripes=True)
+            table = SingleClickDataTable(id="model-table", zebra_stripes=True, classes="data-table")
             table.cursor_type = "row"
             yield table
             with Horizontal(classes="button-row"):
                 yield Button("Download selected", id="download-selected", variant="primary", classes="thin-button")
-                yield Button("Download all", id="download-all", variant="warning", classes="thin-button")
+                yield Button("Download all", id="download-all", variant="primary", classes="thin-button")
             yield Label("", id="download-status", classes="status-text")
 
     def on_mount(self) -> None:
         table = self.query_one("#model-table", DataTable)
-        table.add_columns("id", "repo_id", "quant_file", "status")
+        table.add_columns("", "ID", "Repo ID", "Quant File", "Status")
         self._refresh_auth_banner()
         self._refresh_table()
         self._refresh_disk_usage()
@@ -146,12 +147,15 @@ class DownloadsScreen(Widget):
             repo_id = model["repo_id"]
             repo_display = "PLACEHOLDER — edit models.yaml" if status == "placeholder" else repo_id
             table.add_row(
+                selection_marker(model["id"] in self._selected),
                 model["id"],
                 repo_display,
                 model["quant_file"],
                 STATUS_ICONS.get(status, status),
                 key=model["id"],
             )
+        # A model that disappeared from models.yaml (or changed engine) can't stay ticked.
+        self._selected &= self._downloadable.keys()
 
         if not self._downloadable:
             self.query_one("#model-table").display = False
@@ -161,7 +165,7 @@ class DownloadsScreen(Widget):
         else:
             self.query_one("#model-table").display = True
             self.query_one("#empty-models-notice").display = False
-            self.query_one("#download-all", Button).disabled = False
+            self.query_one("#download-all", Button).disabled = self._downloading
             self._sync_button_state()
 
     def _refresh_disk_usage(self) -> None:
@@ -180,34 +184,29 @@ class DownloadsScreen(Widget):
             widget.update(f"Disk usage: {total_gb:.1f} GiB in {models_dir}")
 
     def _sync_button_state(self) -> None:
-        """Enable 'Download selected' only when the highlighted row's status is 'missing'."""
+        """Enable 'Download selected' only when at least one ticked model is still
+        downloadable ('missing') and no download is already running."""
         button = self.query_one("#download-selected", Button)
-        if not self._downloadable:
+        if self._downloading:
             button.disabled = True
             return
-        table = self.query_one("#model-table", DataTable)
-        model_id = self._selected_model_id(table)
-        if model_id is None:
-            button.disabled = True
-            return
-        model = self._downloadable.get(model_id)
-        if model is None:
-            button.disabled = True
-            return
-        status = hf.model_status(model, self.host_profile)
-        button.disabled = status != "missing"
+        button.disabled = not any(
+            hf.model_status(self._downloadable[model_id], self.host_profile) == "missing"
+            for model_id in self._selected
+            if model_id in self._downloadable
+        )
 
-    def _selected_model_id(self, table: DataTable) -> str | None:
-        if table.row_count == 0:
-            return None
-        try:
-            row_key, _ = table.coordinate_to_cell_key(table.cursor_coordinate)
-        except Exception:
-            return None
-        return row_key.value if row_key is not None else None
-
-    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
-        self._sync_button_state()
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        if event.data_table.id != "model-table" or event.row_key is None or event.row_key.value is None:
+            return
+        model_id = event.row_key.value
+        if model_id not in self._downloadable:
+            return
+        if model_id in self._selected:
+            self._selected.discard(model_id)
+        else:
+            self._selected.add(model_id)
+        self._refresh_table()
 
     # ------------------------------------------------------------------
     # Refresh entry point (called by app.py's action_refresh_all)
@@ -230,51 +229,65 @@ class DownloadsScreen(Widget):
             self._on_download_all()
 
     def _on_download_selected(self) -> None:
-        table = self.query_one("#model-table", DataTable)
-        model_id = self._selected_model_id(table)
-        if model_id is None:
-            return
-        model = self._downloadable.get(model_id)
-        if model is None:
-            return
-        status = hf.model_status(model, self.host_profile)
-        if status != "missing":
+        pending = [
+            self._downloadable[model_id]
+            for model_id in sorted(self._selected)
+            if model_id in self._downloadable
+            and hf.model_status(self._downloadable[model_id], self.host_profile) == "missing"
+        ]
+        if not pending:
             # Button should already be disabled in this case; belt-and-braces guard.
             return
-        self._confirm_and_download_one(model_id, model)
+        self._confirm_and_download_selected(pending)
 
     @work
-    async def _confirm_and_download_one(self, model_id: str, model: dict[str, Any]) -> None:
+    async def _confirm_and_download_selected(self, models: list[dict[str, Any]]) -> None:
+        names = ", ".join(m["id"] for m in models)
         confirmed = await self.app.push_screen_wait(
             ConfirmModal(
-                f"Download {model_id!r} ({model['quant_file']})?\n"
-                "This can take a while and uses bandwidth."
+                f"Download {len(models)} selected model(s)?\n{names}\n"
+                "This can take a while and uses bandwidth.",
+                confirm_label="Download",
+                danger=True,
             )
         )
         if not confirmed:
             return
-        self._run_download_one(model_id, model)
+        self._run_download_batch(models)
 
     @work(thread=True)
-    def _run_download_one(self, model_id: str, model: dict[str, Any]) -> None:
+    def _run_download_batch(self, models: list[dict[str, Any]]) -> None:
+        self.app.call_from_thread(self._set_downloading, True)
         status_label = self.query_one("#download-status", Label)
-        self.app.call_from_thread(status_label.update, f"Downloading {model_id}...")
+        failures: list[str] = []
         try:
-            hf.download_model(model, self.host_profile, self.runner)
-        except BaseException as exc:  # noqa: BLE001 — surface any failure instead of a dead thread
-            # download_model() itself doesn't call sys.exit() (only run() does — see hf.py),
-            # but it shells out via Runner.run(check=True), so a bad repo_id/network failure
-            # raises CalledProcessError/OSError. Catch broadly anyway: better an ugly message
-            # in the UI than a silently dead worker thread.
-            self.app.call_from_thread(
-                status_label.update, f"Download failed for {model_id}: {exc}"
-            )
-            self.app.call_from_thread(self.app.notify, f"{model_id}: download failed — {exc}", severity="error")
-            return
-        self.app.call_from_thread(status_label.update, f"Downloaded {model_id}.")
-        self.app.call_from_thread(self.app.notify, f"{model_id}: download complete")
-        self.app.call_from_thread(self._refresh_table)
-        self.app.call_from_thread(self._refresh_disk_usage)
+            for model in models:
+                model_id = model["id"]
+                self.app.call_from_thread(status_label.update, f"Downloading {model_id}...")
+                try:
+                    hf.download_model(model, self.host_profile, self.runner)
+                except BaseException as exc:  # noqa: BLE001 — surface any failure instead of a dead thread
+                    # download_model() itself doesn't call sys.exit() (only run() does — see
+                    # hf.py), but it shells out via Runner.run(check=True), so a bad
+                    # repo_id/network failure raises CalledProcessError/OSError. Catch broadly
+                    # anyway: better an ugly message in the UI than a silently dead worker
+                    # thread, and keep going with the rest of the batch.
+                    failures.append(model_id)
+                    self.app.call_from_thread(
+                        self.app.notify, f"{model_id}: download failed — {exc}", severity="error"
+                    )
+                    continue
+                self.app.call_from_thread(self._selected.discard, model_id)
+                self.app.call_from_thread(self.app.notify, f"{model_id}: download complete")
+        finally:
+            if failures:
+                status_label_text = f"Download batch finished with {len(failures)} failure(s): {', '.join(failures)}"
+            else:
+                status_label_text = "Download batch complete."
+            self.app.call_from_thread(status_label.update, status_label_text)
+            self.app.call_from_thread(self._refresh_table)
+            self.app.call_from_thread(self._refresh_disk_usage)
+            self.app.call_from_thread(self._set_downloading, False)
 
     def _on_download_all(self) -> None:
         self._confirm_and_download_all()
@@ -296,6 +309,7 @@ class DownloadsScreen(Widget):
 
     @work(thread=True)
     def _run_download_all(self) -> None:
+        self.app.call_from_thread(self._set_downloading, True)
         status_label = self.query_one("#download-status", Label)
         self.app.call_from_thread(status_label.update, "Running full download (venv provision + login + all models)...")
         try:
@@ -314,9 +328,16 @@ class DownloadsScreen(Widget):
             self.app.call_from_thread(self.app.notify, f"Download-all stopped: {message}", severity="error")
             self.app.call_from_thread(self._refresh_table)
             self.app.call_from_thread(self._refresh_disk_usage)
+            self.app.call_from_thread(self._set_downloading, False)
             return
         self.app.call_from_thread(status_label.update, "Download-all complete.")
         self.app.call_from_thread(self.app.notify, "Download-all complete")
         self.app.call_from_thread(self._refresh_auth_banner)
         self.app.call_from_thread(self._refresh_table)
         self.app.call_from_thread(self._refresh_disk_usage)
+        self.app.call_from_thread(self._set_downloading, False)
+
+    def _set_downloading(self, active: bool) -> None:
+        self._downloading = active
+        self.query_one("#download-all", Button).disabled = active or not self._downloadable
+        self._sync_button_state()

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -110,7 +111,7 @@ def resolve_env_value(value: str) -> str:
     """manifest.yaml build_env values may be shell command substitutions (e.g. "$(hipconfig -l)/clang")."""
     if "$(" not in value:
         return value
-    result = subprocess.run(["sh", "-c", f"echo -n {value!r}"], stdout=subprocess.PIPE, check=True, text=True)
+    result = subprocess.run(["sh", "-c", f"echo -n {shlex.quote(value)}"], stdout=subprocess.PIPE, check=True, text=True)
     return result.stdout
 
 

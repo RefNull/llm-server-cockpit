@@ -18,7 +18,6 @@ the systemd unit/timers).
 from __future__ import annotations
 
 import copy
-import logging
 import socket
 from pathlib import Path
 from typing import Any
@@ -44,8 +43,6 @@ from cockpit.widgets import ConfirmModal, InfoModal, run_shell_capture
 from provision import schema
 from provision.common import Runner
 from provision.steps import drivers, swap, wol
-
-log = logging.getLogger("provision")
 
 _RESTART_POLICY_OPTIONS = [("on-failure", "on-failure"), ("always", "always"), ("no", "no")]
 _GPU_VENDOR_OPTIONS = [("nvidia", "nvidia"), ("amd", "amd"), ("intel", "intel")]
@@ -94,9 +91,6 @@ class SettingsScreen(Widget):
     SettingsScreen #settings-left {
         margin-right: 1;
     }
-    SettingsScreen .field-group {
-        margin-bottom: 1;
-    }
     SettingsScreen Label {
         margin-top: 1;
     }
@@ -115,11 +109,8 @@ class SettingsScreen(Widget):
         margin-top: 1;
         margin-left: 1;
     }
-    SettingsScreen DataTable {
-        height: auto;
-        max-height: 10;
+    SettingsScreen .data-table {
         margin-top: 1;
-        margin-bottom: 1;
     }
     SettingsScreen #gpu-add-form {
         border: solid $accent;
@@ -181,7 +172,7 @@ class SettingsScreen(Widget):
                 yield Input(id="f-prefix-root")
                 yield Static("", id="step-identity-error", classes="error-text")
                 with Horizontal(classes="button-row"):
-                    yield Button("Next: Hardware & Network →", id="btn-next-hardware", variant="primary")
+                    yield Button("Next: Hardware & Network →", id="btn-next-hardware", variant="primary", classes="thin-button")
 
             with VerticalScroll(id="step-hardware"):
                 yield Static("Step 2 of 3: Network Bind & GPU Acceleration", classes="subtitle")
@@ -197,7 +188,7 @@ class SettingsScreen(Widget):
                 yield Input(id="f-token-env")
 
                 yield Static("GPUs", classes="section-title")
-                yield DataTable(id="gpu-table", zebra_stripes=True)
+                yield DataTable(id="gpu-table", zebra_stripes=True, classes="data-table")
                 with Horizontal(classes="button-row"):
                     yield Button("Add GPU", id="btn-add-gpu", variant="primary", classes="thin-button")
                     yield Button("Remove Selected", id="btn-remove-gpu", variant="error", classes="thin-button")
@@ -219,7 +210,7 @@ class SettingsScreen(Widget):
                 yield Static("", id="step-hardware-error", classes="error-text")
                 with Horizontal(classes="button-row"):
                     yield Button("← Back: Host Identity", id="btn-back-identity")
-                    yield Button("Next: Review & Deploy →", id="btn-next-review", variant="primary")
+                    yield Button("Next: Review & Deploy →", id="btn-next-review", variant="primary", classes="thin-button")
 
             with VerticalScroll(id="step-review"):
                 yield Static("Step 3 of 3: Review Host Configuration & Deploy", classes="subtitle")
@@ -229,13 +220,13 @@ class SettingsScreen(Widget):
                 with Horizontal(classes="button-row"):
                     yield Button("← Back: Hardware & Network", id="btn-back-hardware")
                     yield Button("Preview YAML", id="btn-dummy-deploy")
-                    yield Button("Deploy Host Profile", id="btn-real-deploy", variant="primary")
+                    yield Button("Deploy Host Profile", id="btn-real-deploy", variant="primary", classes="thin-button")
 
     def _compose_normal(self) -> ComposeResult:
         yield Static("Host hardware profile, GPU topology, and system services", classes="subtitle")
         with Horizontal(id="settings-columns"):
             with VerticalScroll(id="settings-left", classes="panel"):
-                with Vertical(classes="field-group"):
+                with Vertical(classes="panel"):
                     yield Static("Host identity", classes="panel-title")
                     yield Label("Hostname")
                     yield Input(id="f-hostname")
@@ -244,7 +235,7 @@ class SettingsScreen(Widget):
                     yield Label("HF token env var")
                     yield Input(id="f-token-env")
 
-                with Vertical(classes="field-group"):
+                with Vertical(classes="panel"):
                     yield Static("Network bind", classes="panel-title")
                     yield Label("VPN interface (not an IP)")
                     with Horizontal(classes="inline-row"):
@@ -256,7 +247,7 @@ class SettingsScreen(Widget):
                     yield Label("Health check timeout (opt.)")
                     yield Input(id="f-gw-timeout")
 
-                with Vertical(classes="field-group"):
+                with Vertical(classes="panel"):
                     yield Static("Paths", classes="panel-title")
                     yield Label("Model files folder")
                     yield Input(id="f-models-dir")
@@ -267,22 +258,29 @@ class SettingsScreen(Widget):
 
                 yield Static("", id="profile-error", classes="error-text")
                 with Horizontal(classes="button-row"):
-                    yield Button("Save host profile", id="btn-save-profile", variant="primary")
+                    yield Button("Save host profile", id="btn-save-profile", variant="primary", classes="thin-button")
                 yield Static("", id="profile-status", classes="status-text")
 
-                with Vertical(classes="field-group"):
+            with VerticalScroll(id="settings-right", classes="panel"):
+                with Vertical(classes="panel"):
+                    yield Static("GPUs", classes="panel-title")
+                    yield DataTable(id="gpu-table", zebra_stripes=True, classes="data-table")
+                    with Horizontal(classes="button-row"):
+                        yield Button("List PCIe devices", id="btn-lspci", classes="thin-button")
+
+                with Vertical(classes="panel"):
                     yield Static("Wake-on-LAN", classes="panel-title")
                     yield Static("not checked yet", id="wol-status", classes="status-text")
                     with Horizontal(classes="button-row"):
                         yield Button("Check / Enable WOL", id="btn-wol-check", classes="thin-button")
 
-                with Vertical(classes="field-group"):
+                with Vertical(classes="panel"):
                     yield Static("GPU driver lockfile", classes="panel-title")
                     yield Static("not checked yet", id="drivers-status", classes="status-text")
                     with Horizontal(classes="button-row"):
                         yield Button("Check drivers", id="btn-drivers-check", classes="thin-button")
 
-                with Vertical(classes="field-group"):
+                with Vertical(classes="panel"):
                     yield Static("Service & update-check settings", classes="panel-title")
                     yield Label("Restart policy")
                     yield Select(_RESTART_POLICY_OPTIONS, id="f-restart-policy", allow_blank=False, value="on-failure")
@@ -300,14 +298,8 @@ class SettingsScreen(Widget):
                     yield Input(id="f-update-check-calendar")
                     yield Static("", id="service-error", classes="error-text")
                     with Horizontal(classes="button-row"):
-                        yield Button("Apply service settings", id="btn-apply-service", variant="primary")
+                        yield Button("Apply service settings", id="btn-apply-service", variant="primary", classes="thin-button")
                     yield Static("", id="service-status", classes="status-text")
-
-            with VerticalScroll(id="settings-right", classes="panel"):
-                yield Static("GPUs", classes="panel-title")
-                yield DataTable(id="gpu-table", zebra_stripes=True)
-                with Horizontal(classes="button-row"):
-                    yield Button("List PCIe devices", id="btn-lspci", classes="thin-button")
 
     def on_mount(self) -> None:
         self._populate_profile_form()
@@ -776,7 +768,11 @@ class SettingsScreen(Widget):
 
     # -- WOL status + check/enable ---------------------------------------------------
 
+    @work(thread=True)
     def _refresh_wol_status(self) -> None:
+        # wol.status() shells out to ip/ethtool/systemctl (see provision/steps/wol.py) — off
+        # the main thread like every other status/apply call in this file, so a slow or hung
+        # command can't freeze the whole TUI.
         if self.host_profile is None:
             return
         try:
@@ -787,9 +783,15 @@ class SettingsScreen(Widget):
                 f"Wake-on-LAN flags: {status['wake_flags'] or 'unknown'}",
                 f"persistence unit enabled: {'yes' if status['unit_enabled'] else 'no'}",
             ]
-            self.query_one("#wol-status", Static).update("\n".join(lines))
+            text = "\n".join(lines)
         except Exception as e:
-            self.query_one("#wol-status", Static).update(f"not available: {e}")
+            text = f"not available: {e}"
+        self.app.call_from_thread(self._apply_wol_status_text, text)
+
+    def _apply_wol_status_text(self, text: str) -> None:
+        if not self.is_mounted:
+            return
+        self.query_one("#wol-status", Static).update(text)
 
     @work
     async def _confirm_and_check_wol(self) -> None:

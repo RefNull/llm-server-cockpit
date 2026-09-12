@@ -206,8 +206,28 @@ def rollback(host_profile: dict[str, Any], backend: str, target_ref: str, runner
     runner.atomic_symlink(Path(host_profile["paths"]["prefix_root"]) / backend / "current", target)
 
 
-def run(host_profile: dict[str, Any], manifest: dict[str, Any], models: dict[str, Any], runner: Runner, repo_root: Path) -> None:
-    backends = _needed_backends(host_profile)
+def run(
+    host_profile: dict[str, Any],
+    manifest: dict[str, Any],
+    models: dict[str, Any],
+    runner: Runner,
+    repo_root: Path,
+    backends: list[str] | None = None,
+) -> None:
+    """`backends`, when given, restricts the build to that subset (e.g. the cockpit's Installs
+    tab building only the ticked rows) instead of every backend the host needs — everything
+    else (checkout, smoke test, retained-build pruning, history) is unchanged. Defaults to
+    every needed backend, matching every existing caller (CLI, bin/provision)."""
+    needed = _needed_backends(host_profile)
+    if backends is None:
+        backends = needed
+    else:
+        unknown = [b for b in backends if b not in needed]
+        if unknown:
+            sys.exit(
+                f"build: backend(s) {unknown} were requested but this host profile doesn't need "
+                f"them (needed: {needed})"
+            )
     if not backends:
         log.info("build: no GPU in host profile declares any backend — nothing to build")
         return

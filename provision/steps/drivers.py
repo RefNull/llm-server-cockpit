@@ -16,10 +16,15 @@ from provision.common import Runner
 
 log = logging.getLogger("provision")
 
+# These are read-only diagnostic queries (nvidia-smi/modinfo/vulkaninfo/dpkg-query), not builds
+# or downloads — 30s is generous headroom for a hung driver/kernel module query without letting
+# one wedge the cockpit's synchronous drift-check worker indefinitely.
+_TIMEOUT_S = 30
+
 
 def _run_ro(cmd: list[str]) -> str:
     """Read-only query helper — safe under --dry-run, output is used for comparison only."""
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=_TIMEOUT_S)
     if result.returncode != 0:
         raise RuntimeError(f"command failed ({' '.join(cmd)}): {result.stdout}")
     return result.stdout
@@ -49,7 +54,7 @@ def _capture_amd(gpu_id: str) -> dict[str, str]:
         sys.exit(f"drivers: gpu {gpu_id!r} is vendor=amd but dpkg-query is not on PATH — cannot verify, refusing to skip")
     rocm_result = subprocess.run(
         ["dpkg-query", "-W", "-f=${Version}", "rocm-libs"],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=_TIMEOUT_S,
     )
     if rocm_result.returncode != 0:
         sys.exit(f"drivers: gpu {gpu_id!r} — rocm-libs package not found via dpkg-query, cannot verify ROCm stack version")
@@ -74,7 +79,7 @@ def _capture_intel(gpu_id: str) -> dict[str, str]:
     # intel-opencl-icd is optional — not every Intel GPU setup uses the compute runtime.
     icd_result = subprocess.run(
         ["dpkg-query", "-W", "-f=${Version}", "intel-opencl-icd"],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=_TIMEOUT_S,
     )
     if icd_result.returncode == 0:
         facts["intel_opencl_icd_version"] = icd_result.stdout.strip()
