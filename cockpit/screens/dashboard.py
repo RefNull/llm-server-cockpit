@@ -6,22 +6,19 @@ stack right now".
 """
 from __future__ import annotations
 
-from collections import deque
+import time
 from pathlib import Path
 
 from textual import work
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widget import Widget
-from textual.widgets import ProgressBar, Sparkline, Static
+from textual.widgets import ProgressBar, Static
 
 from provision.common import Runner
 from provision.steps import build as build_step
 from provision.steps import docker, drivers, hf, metrics, swap, wol
 from provision.steps import scripts as scripts_step
-
-# ~2 minutes of history at the 1Hz sampling rate below.
-_HISTORY_LEN = 120
 
 
 def _fmt_gb(num_bytes: float) -> str:
@@ -52,33 +49,34 @@ class DashboardScreen(Widget):
     DashboardScreen .panel Static {
         margin-top: 1;
     }
-    DashboardScreen .resource-row {
+    DashboardScreen #dashboard-resources {
+        /* Deliberately not classes="panel" — .panel Static's blanket margin-top:1 (meant for
+           the other status panels' single text blob) has higher CSS specificity than a plain
+           class selector and was silently overriding this panel's own gauge spacing, stacking
+           an extra margin-top onto every gauge row on top of .gauge's own. */
         height: auto;
-        align-vertical: middle;
-        margin-top: 1;
+        padding: 0 1;
+        margin-bottom: 1;
     }
-    DashboardScreen .resource-label {
-        width: 8;
-    }
-    DashboardScreen .resource-row ProgressBar {
-        width: 26;
-        margin-right: 1;
-    }
-    DashboardScreen .resource-row Sparkline {
-        width: 1fr;
-        height: 1;
-        margin-right: 1;
-    }
-    DashboardScreen .resource-text {
-        width: auto;
-    }
-    DashboardScreen .resource-gpu-block {
+    DashboardScreen .gauge {
         height: auto;
         margin-top: 1;
     }
-    DashboardScreen .resource-subtitle {
+    DashboardScreen .gauge-header {
+        height: auto;
+    }
+    DashboardScreen .gauge-label {
         text-style: bold;
         color: $accent;
+        width: auto;
+        margin-right: 2;
+    }
+    DashboardScreen .gauge-value {
+        color: $text-muted;
+        width: auto;
+    }
+    DashboardScreen .gauge ProgressBar {
+        width: 100%;
     }
     """
 
@@ -104,10 +102,6 @@ class DashboardScreen(Widget):
         self._gpu_slots = [
             g for g in self.host_profile.get("gpus", []) if g.get("vendor") in ("nvidia", "intel")
         ]
-        self._cpu_history: deque[float] = deque(maxlen=_HISTORY_LEN)
-        self._mem_history: deque[float] = deque(maxlen=_HISTORY_LEN)
-        self._gpu_util_history: dict[int, deque[float]] = {}
-        self._cpu_prev_times: tuple[int, int] | None = None
 
     def _compute_backends(self) -> list[str]:
         seen: list[str] = []
@@ -117,40 +111,38 @@ class DashboardScreen(Widget):
                     seen.append(backend)
         return seen
 
+    def _gauge(self, label: str, bar_id: str, text_id: str) -> ComposeResult:
+        """One static snapshot row: LABEL + value text above a full-width bar — no history, no
+        sparkline. Values are refreshed only by _refresh_all (on mount and on manual/global
+        refresh), never on a timer: continuously polling nvidia-smi/xpu-smi every second was
+        observed to keep an Intel Arc GPU pinned in an active power state, ramping its fans to
+        100% within moments of opening the app."""
+        with Vertical(classes="gauge"):
+            with Horizontal(classes="gauge-header"):
+                yield Static(label, classes="gauge-label")
+                yield Static("", id=text_id, classes="gauge-value")
+            # show_percentage=False: the gauge-value Static above already spells out the number
+            # (with units, where relevant) — the bar's own built-in readout would just repeat it.
+            yield ProgressBar(total=100, show_eta=False, show_percentage=False, id=bar_id)
+
     def compose(self) -> ComposeResult:
         with VerticalScroll():
             yield Static("At-a-glance status across the LLM stack.", classes="subtitle")
-            with Vertical(classes="panel", id="dashboard-resources"):
+            with Vertical(id="dashboard-resources"):
                 yield Static("Resources", classes="panel-title")
-                with Horizontal(classes="resource-row"):
-                    yield Static("CPU", classes="resource-label")
-                    yield ProgressBar(total=100, show_eta=False, id="res-cpu-bar")
-                    yield Sparkline([], id="res-cpu-spark")
-                    yield Static("", id="res-cpu-text", classes="resource-text")
-                with Horizontal(classes="resource-row"):
-                    yield Static("Memory", classes="resource-label")
-                    yield ProgressBar(total=100, show_eta=False, id="res-mem-bar")
-                    yield Sparkline([], id="res-mem-spark")
-                    yield Static("", id="res-mem-text", classes="resource-text")
-                with Horizontal(classes="resource-row"):
-                    yield Static("Disk", classes="resource-label")
-                    yield ProgressBar(total=100, show_eta=False, id="res-disk-bar")
-                    yield Static("", id="res-disk-text", classes="resource-text")
+                yield from self._gauge("CPU", "res-cpu-bar", "res-cpu-text")
+                yield from self._gauge("MEM", "res-mem-bar", "res-mem-text")
+                yield from self._gauge("DISK", "res-disk-bar", "res-disk-text")
                 for slot_idx, gpu in enumerate(self._gpu_slots):
-                    with Vertical(classes="resource-gpu-block"):
-                        yield Static(
-                            f"GPU: {gpu.get('id', slot_idx)} ({gpu['vendor']})",
-                            classes="resource-subtitle",
+                    label = f"GPU {slot_idx} ({gpu.get('id', slot_idx)})"
+                    if gpu["vendor"] == "nvidia":
+                        yield from self._gauge(
+                            f"{label} UTIL", f"res-gpu-{slot_idx}-util-bar", f"res-gpu-{slot_idx}-util-text"
                         )
-                        if gpu["vendor"] == "nvidia":
-                            with Horizontal(classes="resource-row"):
-                                yield Static("Util", classes="resource-label")
-                                yield ProgressBar(total=100, show_eta=False, id=f"res-gpu-{slot_idx}-util-bar")
-                                yield Sparkline([], id=f"res-gpu-{slot_idx}-util-spark")
-                        with Horizontal(classes="resource-row"):
-                            yield Static("Mem", classes="resource-label")
-                            yield ProgressBar(total=100, show_eta=False, id=f"res-gpu-{slot_idx}-mem-bar")
-                            yield Static("", id=f"res-gpu-{slot_idx}-mem-text", classes="resource-text")
+                    yield from self._gauge(
+                        f"{label} MEM", f"res-gpu-{slot_idx}-mem-bar", f"res-gpu-{slot_idx}-mem-text"
+                    )
+                    if gpu["vendor"] == "intel":
                         yield Static("", id=f"res-gpu-{slot_idx}-info-text", classes="status-text")
             with Horizontal(id="dashboard-columns"):
                 with Vertical(id="dashboard-left"):
@@ -176,11 +168,6 @@ class DashboardScreen(Widget):
 
     def on_mount(self) -> None:
         self._refresh_all()
-        # First reading has nothing to delta against — read_cpu_times() here (a plain /proc
-        # read, no subprocess) so the very first tick already has a `prev` to compare to,
-        # rather than skipping a tick or showing a bogus 0%/100% on startup.
-        self._cpu_prev_times = metrics.read_cpu_times()
-        self.set_interval(1.0, self._sample_resources)
 
     def on_refresh_requested(self) -> None:
         """Called by CockpitApp.action_refresh_all — same pattern every other screen follows."""
@@ -190,13 +177,17 @@ class DashboardScreen(Widget):
 
     @work(thread=True)
     def _refresh_all(self) -> None:
-        """One worker computes every panel's text (each of these shells out — build_step is a
-        fast fs read, but swap/wol/docker/scripts status all run subprocesses with real
-        timeouts) — off the main thread like every other status check in this app, then one
-        call_from_thread applies them all so the panels update together. Disk usage rides this
-        same normal-cadence refresh rather than the 1Hz sampler below — a `models_dir` size
-        doesn't change second to second, and shutil.disk_usage() has no reason to run that
-        often."""
+        """One worker computes every panel's text and the Resources gauges (each of these
+        shells out — build_step is a fast fs read, but swap/wol/docker/scripts/nvidia-smi/
+        xpu-smi status all run subprocesses with real timeouts) — off the main thread like
+        every other status check in this app, then one call_from_thread applies them all so
+        the panels update together.
+
+        This is the ONLY place GPU/CPU/disk are read — on mount and on the global manual
+        refresh (the `r` binding), never on a timer. An earlier version polled them every
+        second in the background; that kept an Intel Arc GPU's sysman telemetry active
+        continuously and was observed to ramp its fans to 100% within moments of opening the
+        app. A one-shot snapshot on demand carries none of that risk."""
         texts = {
             "db-backends": self._compute_backends_text(),
             "db-models": self._compute_models_text(),
@@ -206,9 +197,7 @@ class DashboardScreen(Widget):
             "db-scripts": self._compute_scripts_text(),
         }
         self.app.call_from_thread(self._apply_texts, texts)
-        disk_path = self.host_profile.get("paths", {}).get("models_dir")
-        if disk_path:
-            self.app.call_from_thread(self._apply_disk, metrics.read_disk(disk_path))
+        self.app.call_from_thread(self._apply_resources, self._compute_resources())
 
     def _apply_texts(self, texts: dict[str, str]) -> None:
         if not self.is_mounted:
@@ -216,49 +205,49 @@ class DashboardScreen(Widget):
         for widget_id, text in texts.items():
             self.query_one(f"#{widget_id}", Static).update(text)
 
-    def _apply_disk(self, disk: dict) -> None:
-        if not self.is_mounted:
-            return
-        bar = self.query_one("#res-disk-bar", ProgressBar)
-        text = self.query_one("#res-disk-text", Static)
-        if not disk.get("exists"):
-            bar.update(progress=0)
-            text.update("models_dir not found")
-            return
-        bar.update(progress=disk["percent"])
-        text.update(f"{disk['percent']:.0f}% ({_fmt_gb(disk['used_bytes'])} / {_fmt_gb(disk['total_bytes'])})")
+    # ------------------------------------------------------------------ Resources gauges (one-shot snapshot)
 
-    # ------------------------------------------------------------------ 1Hz resource sampler
-    # Runs only while the app is open — an in-memory deque per metric, nothing persisted or
-    # sampled in the background, per the explicit "does not run in the background" requirement.
-
-    @work(thread=True, exclusive=True, group="resource-sampler")
-    def _sample_resources(self) -> None:
-        curr_cpu_times = metrics.read_cpu_times()
-        cpu_pct = metrics.cpu_percent_from_delta(self._cpu_prev_times, curr_cpu_times)
-        self._cpu_prev_times = curr_cpu_times
+    def _compute_resources(self) -> dict:
+        # CPU% needs two readings to derive a delta; a short blocking sleep here is fine since
+        # this whole method already runs off the main thread in a worker.
+        t0 = metrics.read_cpu_times()
+        time.sleep(0.2)
+        cpu_pct = metrics.cpu_percent_from_delta(t0, metrics.read_cpu_times())
         mem = metrics.read_mem()
+        disk_path = self.host_profile.get("paths", {}).get("models_dir")
+        disk = metrics.read_disk(disk_path) if disk_path else None
         gpus = metrics.read_gpus()
-        self.app.call_from_thread(self._apply_resource_sample, cpu_pct, mem, gpus)
+        return {"cpu_pct": cpu_pct, "mem": mem, "disk": disk, "gpus": gpus}
 
-    def _apply_resource_sample(self, cpu_pct: float, mem: dict, gpus: list[dict]) -> None:
+    def _apply_resources(self, resources: dict) -> None:
         if not self.is_mounted:
             return
-        self._cpu_history.append(cpu_pct)
+        cpu_pct = resources["cpu_pct"]
         self.query_one("#res-cpu-bar", ProgressBar).update(progress=cpu_pct)
-        self.query_one("#res-cpu-spark", Sparkline).data = list(self._cpu_history)
         self.query_one("#res-cpu-text", Static).update(f"{cpu_pct:.0f}%")
 
-        self._mem_history.append(mem["percent"])
+        mem = resources["mem"]
         self.query_one("#res-mem-bar", ProgressBar).update(progress=mem["percent"])
-        self.query_one("#res-mem-spark", Sparkline).data = list(self._mem_history)
         self.query_one("#res-mem-text", Static).update(
-            f"{mem['percent']:.0f}% ({_fmt_gb(mem['used_bytes'])} / {_fmt_gb(mem['total_bytes'])})"
+            f"{_fmt_gb(mem['used_bytes'])} / {_fmt_gb(mem['total_bytes'])} ({mem['percent']:.0f}%)"
         )
 
-        self._apply_gpu_samples(gpus)
+        disk = resources["disk"]
+        disk_bar = self.query_one("#res-disk-bar", ProgressBar)
+        disk_text = self.query_one("#res-disk-text", Static)
+        if disk is None:
+            disk_bar.update(progress=0)
+            disk_text.update("models_dir not configured")
+        elif not disk["exists"]:
+            disk_bar.update(progress=0)
+            disk_text.update("models_dir not found")
+        else:
+            disk_bar.update(progress=disk["percent"])
+            disk_text.update(f"{_fmt_gb(disk['used_bytes'])} / {_fmt_gb(disk['total_bytes'])} ({disk['percent']:.0f}%)")
 
-    def _apply_gpu_samples(self, live_gpus: list[dict]) -> None:
+        self._apply_gpus(resources["gpus"])
+
+    def _apply_gpus(self, live_gpus: list[dict]) -> None:
         """Declared host_profile GPU slots are fixed at compose time (Textual widgets can't be
         created on the fly for hardware only discovered at runtime); live GPUs are matched back
         to slots by vendor + ordinal position — the closest thing to an identifier a hosts/*.yaml
@@ -274,48 +263,52 @@ class DashboardScreen(Widget):
             live = by_vendor.get(vendor, [])
             gpu = live[ordinal] if ordinal < len(live) else None
             if vendor == "nvidia":
-                self._apply_nvidia_gpu_sample(slot_idx, gpu)
+                self._apply_nvidia_gpu(slot_idx, gpu)
             else:
-                self._apply_intel_gpu_sample(slot_idx, gpu)
+                self._apply_intel_gpu(slot_idx, gpu)
 
-    def _apply_nvidia_gpu_sample(self, slot_idx: int, gpu: dict | None) -> None:
-        info_text = self.query_one(f"#res-gpu-{slot_idx}-info-text", Static)
+    def _apply_nvidia_gpu(self, slot_idx: int, gpu: dict | None) -> None:
+        util_bar = self.query_one(f"#res-gpu-{slot_idx}-util-bar", ProgressBar)
+        util_text = self.query_one(f"#res-gpu-{slot_idx}-util-text", Static)
+        mem_bar = self.query_one(f"#res-gpu-{slot_idx}-mem-bar", ProgressBar)
+        mem_text = self.query_one(f"#res-gpu-{slot_idx}-mem-text", Static)
         if gpu is None:
-            info_text.update("not detected (nvidia-smi unavailable or no matching device)")
+            util_bar.update(progress=0)
+            util_text.update("not detected")
+            mem_bar.update(progress=0)
+            mem_text.update("not detected")
             return
-        history = self._gpu_util_history.setdefault(slot_idx, deque(maxlen=_HISTORY_LEN))
         util = gpu["utilization_pct"] or 0.0
-        history.append(util)
-        self.query_one(f"#res-gpu-{slot_idx}-util-bar", ProgressBar).update(progress=util)
-        self.query_one(f"#res-gpu-{slot_idx}-util-spark", Sparkline).data = list(history)
+        util_bar.update(progress=util)
+        power = f" ({gpu['power_w']:.0f} W)" if gpu["power_w"] is not None else ""
+        util_text.update(f"{util:.0f}%{power}")
 
         mem_total = gpu["memory_total_mb"] or 0.0
         mem_pct = (100.0 * gpu["memory_used_mb"] / mem_total) if mem_total else 0.0
-        self.query_one(f"#res-gpu-{slot_idx}-mem-bar", ProgressBar).update(progress=mem_pct)
-        self.query_one(f"#res-gpu-{slot_idx}-mem-text", Static).update(
-            f"{_fmt_mb(gpu['memory_used_mb'])} / {_fmt_mb(gpu['memory_total_mb'])}"
-        )
-        power = f"{gpu['power_w']:.0f} W" if gpu["power_w"] is not None else "power: n/a"
-        info_text.update(f"{util:.0f}% util — {gpu['name']} — {power}")
+        mem_bar.update(progress=mem_pct)
+        mem_text.update(f"{_fmt_mb(gpu['memory_used_mb'])} / {_fmt_mb(gpu['memory_total_mb'])} ({mem_pct:.0f}%)")
 
-    def _apply_intel_gpu_sample(self, slot_idx: int, gpu: dict | None) -> None:
-        info_text = self.query_one(f"#res-gpu-{slot_idx}-info-text", Static)
-        if gpu is None:
-            info_text.update("not detected (xpu-smi unavailable or no matching device)")
-            return
+    def _apply_intel_gpu(self, slot_idx: int, gpu: dict | None) -> None:
         mem_bar = self.query_one(f"#res-gpu-{slot_idx}-mem-bar", ProgressBar)
         mem_text = self.query_one(f"#res-gpu-{slot_idx}-mem-text", Static)
+        info_text = self.query_one(f"#res-gpu-{slot_idx}-info-text", Static)
+        if gpu is None:
+            mem_bar.update(progress=0)
+            mem_text.update("not detected")
+            info_text.update("xpu-smi unavailable or no matching device")
+            return
         if gpu["memory_total_mb"]:
-            mem_bar.update(progress=100.0 * gpu["memory_used_mb"] / gpu["memory_total_mb"])
-            mem_text.update(f"{_fmt_mb(gpu['memory_used_mb'])} / {_fmt_mb(gpu['memory_total_mb'])}")
+            mem_pct = 100.0 * gpu["memory_used_mb"] / gpu["memory_total_mb"]
+            mem_bar.update(progress=mem_pct)
+            mem_text.update(f"{_fmt_mb(gpu['memory_used_mb'])} / {_fmt_mb(gpu['memory_total_mb'])} ({mem_pct:.0f}%)")
         else:
             mem_bar.update(progress=0)
-            mem_text.update("memory: n/a")
+            mem_text.update("n/a")
         # utilization_pct is always None here — xpu-smi 2.1.0's utilization telemetry doesn't
         # report real numbers yet (see provision/steps/metrics.py's module docstring).
-        power = f"{gpu['power_w']:.0f} W" if gpu["power_w"] is not None else "power: n/a"
-        freq = f"{gpu['frequency_mhz']:.0f} MHz" if gpu["frequency_mhz"] is not None else "freq: n/a"
-        info_text.update(f"utilization: n/a (xpu-smi) — {power}, {freq}")
+        power = f"{gpu['power_w']:.0f} W" if gpu["power_w"] is not None else "power n/a"
+        freq = f"{gpu['frequency_mhz']:.0f} MHz" if gpu["frequency_mhz"] is not None else "freq n/a"
+        info_text.update(f"utilization n/a (xpu-smi) — {power}, {freq}")
 
     # ------------------------------------------------------------------ panels (pure computation, off main thread)
 
