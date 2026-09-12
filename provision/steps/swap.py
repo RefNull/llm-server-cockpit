@@ -125,6 +125,45 @@ def _build_model_entry(model: dict[str, Any], host_profile: dict[str, Any]) -> d
     return entry
 
 
+def parse_config_for_import(yaml_text: str) -> list[dict[str, Any]]:
+    """Best-effort reverse of _generate_config(), for the cockpit's Models tab "Import from
+    config.yaml" shortcut. Every entry comes back as engine: "unmanaged" with its cmd preserved
+    verbatim, never as a reconstructed engine: "llama-cpp" entry — a llama-swap config's cmd
+    string never carries the repo_id a real llama-cpp models.yaml entry requires (repo_id only
+    matters at download time; by the time a model is running, the served file is already local
+    and nothing in the command line says what Hugging Face repo it came from), so a confident
+    llama-cpp/GPU reconstruction from this alone isn't possible. The operator reviews every
+    proposed entry before anything is merged (see deploy.py) and can hand-convert one to
+    engine: "llama-cpp" afterward if they want that, using the imported cmd as a reference."""
+    try:
+        data = yaml.safe_load(yaml_text) or {}
+    except yaml.YAMLError as e:
+        raise ValueError(f"invalid YAML: {e}") from e
+    if not isinstance(data, dict) or not isinstance(data.get("models"), dict):
+        raise ValueError("expected a top-level 'models' mapping (a llama-swap config.yaml)")
+
+    group_of: dict[str, str] = {}
+    for group_name, group in (data.get("groups") or {}).items():
+        if not isinstance(group, dict):
+            continue
+        for member_id in group.get("members", []) or []:
+            group_of[member_id] = group_name
+
+    proposed: list[dict[str, Any]] = []
+    for model_id, entry in data["models"].items():
+        if not isinstance(entry, dict) or "cmd" not in entry:
+            continue
+        model: dict[str, Any] = {"id": model_id, "engine": "unmanaged", "cmd": entry["cmd"]}
+        if entry.get("env"):
+            model["env"] = list(entry["env"])
+        if entry.get("ttl"):
+            model["ttl"] = entry["ttl"]
+        if model_id in group_of:
+            model["group"] = group_of[model_id]
+        proposed.append(model)
+    return proposed
+
+
 def _generate_config(host_profile: dict[str, Any], models: dict[str, Any]) -> str:
     config: dict[str, Any] = {}
     timeout = host_profile["network"]["gateway"].get("health_check_timeout")

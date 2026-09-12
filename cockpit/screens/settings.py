@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import copy
 import socket
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -44,7 +45,7 @@ from textual.widgets import (
 from cockpit.widgets import ConfirmModal, InfoModal, run_shell_capture
 from provision import schema
 from provision.common import Runner
-from provision.steps import drivers, swap, wol
+from provision.steps import drivers, swap, tailscale, wol
 
 _RESTART_POLICY_OPTIONS = [("on-failure", "on-failure"), ("always", "always"), ("no", "no")]
 _GPU_VENDOR_OPTIONS = [("nvidia", "nvidia"), ("amd", "amd"), ("intel", "intel")]
@@ -258,6 +259,12 @@ class SettingsScreen(Widget):
                         yield Label("Health check timeout (opt.)")
                         yield Input(id="f-gw-timeout")
 
+                    with Vertical(classes="panel"):
+                        yield Static("Tailscale", classes="panel-title")
+                        yield Static("not checked yet", id="tailscale-status", classes="status-text")
+                        with Horizontal(classes="button-row"):
+                            yield Button("Check / Enable Tailscale", id="btn-tailscale-check", classes="thin-button")
+
             with TabPane("Hardware", id="settings-hardware"):
                 with VerticalScroll():
                     with Vertical(classes="panel"):
@@ -315,15 +322,17 @@ class SettingsScreen(Widget):
             self._populate_service_form()
             self._refresh_wol_status()
             self._refresh_drivers_status()
+            self._refresh_tailscale_status()
 
         self._update_vpn_preview(self.query_one("#f-vpn-interface", Input).value)
 
     def on_refresh_requested(self) -> None:
-        """Called by CockpitApp.action_refresh_all — re-reads WOL/driver status only."""
+        """Called by CockpitApp.action_refresh_all — re-reads WOL/driver/Tailscale status only."""
         if self.host_profile is None:
             return
         self._refresh_wol_status()
         self._refresh_drivers_status()
+        self._refresh_tailscale_status()
 
     # -- form population -----------------------------------------------------------
 
@@ -818,6 +827,62 @@ class SettingsScreen(Widget):
         finally:
             self.app.call_from_thread(self._refresh_wol_status)
 
+    # -- Tailscale status + check/enable ---------------------------------------------
+
+    @work(thread=True)
+    def _refresh_tailscale_status(self) -> None:
+        if self.host_profile is None:
+            return
+        try:
+            status = tailscale.status(self.host_profile)
+            if not status["installed"]:
+                text = "not installed"
+            elif status["logged_in"]:
+                text = f"logged in — {status['ip'] or 'no IP yet'}"
+            else:
+                text = f"not logged in (state: {status['backend_state'] or status.get('error') or 'unknown'})"
+        except Exception as e:
+            text = f"not available: {e}"
+        self.app.call_from_thread(self._apply_tailscale_status_text, text)
+
+    def _apply_tailscale_status_text(self, text: str) -> None:
+        if not self.is_mounted:
+            return
+        self.query_one("#tailscale-status", Static).update(text)
+
+    @work
+    async def _confirm_and_check_tailscale(self) -> None:
+        message = (
+            "Check / enable Tailscale? Installs the client if missing. If not already logged "
+            "in, this suspends the TUI and hands you an interactive `tailscale up` login "
+            "prompt in the real terminal — complete it there, then you'll return here."
+        )
+        confirmed = await self.app.push_screen_wait(ConfirmModal(message, confirm_label="Check / Enable"))
+        if not confirmed:
+            return
+        self.query_one("#tailscale-status", Static).update("checking...")
+        # Deliberately NOT @work(thread=True): `tailscale up`'s interactive login can only be
+        # mediated by actually suspending the TUI and handing over the real terminal (see
+        # containers.py's Exec shell for the same pattern) — that has to happen on the main
+        # thread, so this runs synchronously rather than threading the whole flow only to hop
+        # back for the suspend step.
+        self._run_tailscale_check()
+
+    def _run_tailscale_check(self) -> None:
+        try:
+            tailscale.ensure_installed(self.runner)
+        except Exception as e:
+            self.notify(f"tailscale install failed: {e}", severity="error")
+            self._refresh_tailscale_status()
+            return
+        status = tailscale.status(self.host_profile)
+        if status["logged_in"]:
+            self.notify(f"tailscale already logged in — {status['ip'] or 'no IP yet'}")
+        else:
+            with self.app.suspend():
+                subprocess.run(["tailscale", "up"])
+        self._refresh_tailscale_status()
+
     # -- driver-drift status + check --------------------------------------------------
 
     def _refresh_drivers_status(self) -> None:
@@ -948,6 +1013,8 @@ class SettingsScreen(Widget):
             self._confirm_and_save_profile()
         elif bid == "btn-wol-check":
             self._confirm_and_check_wol()
+        elif bid == "btn-tailscale-check":
+            self._confirm_and_check_tailscale()
         elif bid == "btn-drivers-check":
             self._confirm_and_check_drivers()
         elif bid == "btn-apply-service":

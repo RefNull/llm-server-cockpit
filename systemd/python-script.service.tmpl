@@ -1,0 +1,17 @@
+[Unit]
+Description=cockpit-managed script: $script_id
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=$working_dir
+# Wrapped in `sh -c` with the inner command POSIX-shell-quoted (see
+# provision/steps/scripts.py::_build_exec_start) rather than relying on systemd's own
+# ExecStart= word-splitting rules directly — one predictable quoting scheme instead of two.
+ExecStart=/bin/sh -c $exec_start
+Restart=$restart_policy
+RestartSec=$restart_sec
+
+[Install]
+WantedBy=multi-user.target

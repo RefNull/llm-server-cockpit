@@ -10,20 +10,68 @@ reload. A failed validation never touches the real file.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import yaml
 from textual import work
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.screen import ModalScreen
 from textual.widget import Widget
 from textual.widgets import Button, DataTable, Input, Label, Select, Static, TextArea
 
-from cockpit.widgets import ConfirmModal
+from cockpit.widgets import ConfirmModal, SingleClickDataTable, selection_marker
 from provision import schema
 from provision.common import Runner
 from provision.steps import swap
 
 _ENGINE_OPTIONS = [("llama-cpp", "llama-cpp"), ("unmanaged", "unmanaged")]
+
+
+class ConfigPasteModal(ModalScreen[str | None]):
+    """Paste-a-llama-swap-config.yaml modal for the "Import from config.yaml" shortcut.
+    Returns the pasted text on Parse, None on Cancel — deploy.py does the actual parsing
+    (swap.parse_config_for_import) after the modal closes, so parse errors can be shown
+    inline on the main screen's status line rather than re-opening this modal."""
+
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    DEFAULT_CSS = """
+    ConfigPasteModal {
+        align: center middle;
+    }
+    #paste-dialog {
+        width: 90%;
+        height: 80%;
+        border: thick $background 80%;
+        background: $surface;
+        padding: 1 2;
+    }
+    #paste-title {
+        text-style: bold;
+        margin-bottom: 1;
+    }
+    #paste-text {
+        height: 1fr;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="paste-dialog"):
+            yield Static("Paste a llama-swap config.yaml below", id="paste-title")
+            yield TextArea(id="paste-text")
+            with Horizontal(classes="button-row"):
+                yield Button("Parse", id="btn-parse", variant="primary", classes="thin-button")
+                yield Button("Cancel", id="btn-paste-cancel", classes="thin-button")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-parse":
+            self.dismiss(self.query_one("#paste-text", TextArea).text)
+        elif event.button.id == "btn-paste-cancel":
+            self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
 
 
 class DeployScreen(Widget):
@@ -69,6 +117,9 @@ class DeployScreen(Widget):
         self.repo_root = repo_root
         self.app_ref = app_ref
         self._editing_id: str | None = None  # None while the form is in "add" mode
+        # id -> proposed model dict, for the current "Import from config.yaml" review table.
+        self._import_candidates: dict[str, dict[str, Any]] = {}
+        self._import_selected: set[str] = set()
 
     # -- layout ---------------------------------------------------------------
 
@@ -82,7 +133,25 @@ class DeployScreen(Widget):
                 yield Button("Edit", id="btn-edit", classes="thin-button")
                 yield Button("Delete", id="btn-delete", variant="error", classes="thin-button")
                 yield Button("Preview config.yaml", id="btn-preview", classes="thin-button")
+                yield Button("Import from config.yaml", id="btn-import", classes="thin-button")
             yield Static("", id="status-message", classes="status-text")
+
+            with Vertical(id="import-review", classes="panel"):
+                yield Static("Proposed models from pasted config.yaml", classes="panel-title")
+                yield Static(
+                    "Every entry imports as engine: unmanaged with its original cmd preserved — a "
+                    "llama-swap config never carries the repo_id a real llama-cpp entry needs, so "
+                    "there's no confident way to reconstruct one. Tick the ones to keep, then hand-"
+                    "convert any to llama-cpp afterward via Edit if you want that.",
+                    classes="subtitle",
+                )
+                table = SingleClickDataTable(id="import-table", zebra_stripes=True, classes="data-table")
+                table.cursor_type = "row"
+                yield table
+                yield Static("", id="import-error", classes="error-text")
+                with Horizontal(classes="button-row"):
+                    yield Button("Import selected", id="btn-import-selected", variant="primary", classes="thin-button")
+                    yield Button("Close", id="btn-import-close", classes="thin-button")
 
             with Vertical(id="edit-form", classes="panel"):
                 yield Static("", id="form-title", classes="panel-title")
@@ -139,6 +208,8 @@ class DeployScreen(Widget):
         self.query_one("#preview-text", TextArea).read_only = True
         self.query_one("#edit-form").display = False
         self.query_one("#preview-area").display = False
+        self.query_one("#import-review").display = False
+        self.query_one("#import-table", DataTable).add_columns("", "ID", "Engine", "cmd")
         self._populate_table()
 
     # -- host-profile-derived option lists -------------------------------------
@@ -207,6 +278,7 @@ class DeployScreen(Widget):
 
     def _show_form(self) -> None:
         self.query_one("#preview-area").display = False
+        self.query_one("#import-review").display = False
         self.query_one("#edit-form").display = True
 
     def _hide_form(self) -> None:
@@ -214,10 +286,19 @@ class DeployScreen(Widget):
 
     def _show_preview(self) -> None:
         self.query_one("#edit-form").display = False
+        self.query_one("#import-review").display = False
         self.query_one("#preview-area").display = True
 
     def _hide_preview(self) -> None:
         self.query_one("#preview-area").display = False
+
+    def _show_import_review(self) -> None:
+        self.query_one("#edit-form").display = False
+        self.query_one("#preview-area").display = False
+        self.query_one("#import-review").display = True
+
+    def _hide_import_review(self) -> None:
+        self.query_one("#import-review").display = False
 
     def _toggle_engine_fields(self, engine: str) -> None:
         is_llama = engine == "llama-cpp"
@@ -414,6 +495,86 @@ class DeployScreen(Widget):
         self._write_models_yaml(validated)
         self._after_write(f"deleted model {model_id!r}")
 
+    # -- import from config.yaml ------------------------------------------------------------
+
+    @work
+    async def _open_import_modal(self) -> None:
+        text = await self.app.push_screen_wait(ConfigPasteModal())
+        if text is None or not text.strip():
+            return
+        try:
+            proposed = swap.parse_config_for_import(text)
+        except ValueError as e:
+            self._set_status(f"import failed: {e}")
+            return
+        if not proposed:
+            self._set_status("no models found in that config.yaml")
+            return
+        self._import_candidates = {m["id"]: m for m in proposed}
+        self._import_selected = set()
+        self._refresh_import_table()
+        self._show_import_review()
+
+    def _refresh_import_table(self) -> None:
+        table = self.query_one("#import-table", DataTable)
+        table.clear()
+        for model_id, model in self._import_candidates.items():
+            cmd_preview = model["cmd"][:80] + ("…" if len(model["cmd"]) > 80 else "")
+            table.add_row(
+                selection_marker(model_id in self._import_selected),
+                model_id,
+                model["engine"],
+                cmd_preview,
+                key=model_id,
+            )
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        if event.data_table.id != "import-table" or event.row_key is None or event.row_key.value is None:
+            return
+        model_id = event.row_key.value
+        if model_id in self._import_selected:
+            self._import_selected.discard(model_id)
+        else:
+            self._import_selected.add(model_id)
+        self._refresh_import_table()
+
+    @work
+    async def _confirm_and_import_selected(self) -> None:
+        error_widget = self.query_one("#import-error", Static)
+        error_widget.update("")
+        if not self._import_selected:
+            error_widget.update("tick at least one row to import")
+            return
+
+        existing_ids = {m["id"] for m in self.models.get("models", [])}
+        colliding = sorted(self._import_selected & existing_ids)
+        if colliding:
+            error_widget.update(f"id(s) already exist in models.yaml, deselect or remove first: {', '.join(colliding)}")
+            return
+
+        to_import = [self._import_candidates[mid] for mid in sorted(self._import_selected)]
+        candidate = {"models": list(self.models.get("models", [])) + to_import}
+        ok, err, validated = self._validate_candidate(candidate)
+        if not ok:
+            error_widget.update(err)
+            return
+
+        confirmed = await self.app.push_screen_wait(
+            ConfirmModal(
+                f"Import {len(to_import)} model(s) into models.yaml?\n{', '.join(m['id'] for m in to_import)}",
+                confirm_label="Import",
+                danger=True,
+            )
+        )
+        if not confirmed:
+            return
+
+        self._write_models_yaml(validated)
+        self._after_write(f"imported {len(to_import)} model(s)")
+        self._import_candidates = {}
+        self._import_selected = set()
+        self._hide_import_review()
+
     # -- preview + apply ------------------------------------------------------------
 
     def _on_preview_pressed(self) -> None:
@@ -468,6 +629,14 @@ class DeployScreen(Widget):
             self._confirm_and_apply()
         elif bid == "btn-close-preview":
             self._hide_preview()
+        elif bid == "btn-import":
+            self._open_import_modal()
+        elif bid == "btn-import-selected":
+            self._confirm_and_import_selected()
+        elif bid == "btn-import-close":
+            self._import_candidates = {}
+            self._import_selected = set()
+            self._hide_import_review()
 
     def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id == "f-engine":

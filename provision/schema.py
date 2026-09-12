@@ -20,8 +20,10 @@ __all__ = [
     "try_load_host_profile",
     "validate_host_profile_dict",
     "validate_models_dict",
+    "validate_scripts_dict",
     "load_manifest",
     "load_models",
+    "load_scripts",
 ]
 
 
@@ -150,6 +152,28 @@ def validate_models_dict(data: dict, host_profile: dict, manifest: dict, source:
     return data
 
 
+def validate_scripts_dict(data: dict, source: str = "scripts.yaml") -> dict:
+    """Validate an in-memory scripts dict without writing to disk. No cross-file checks against
+    host_profile/manifest — unlike models, a registered script doesn't bind to a GPU/backend."""
+    if not isinstance(data, dict) or "scripts" not in data or not isinstance(data["scripts"], list):
+        raise ValidationError(f"{source}: expected 'scripts' list at root")
+
+    seen_ids: set[str] = set()
+    for i, s in enumerate(data["scripts"]):
+        _require(s, ["id", "path"], f"{source}.scripts[{i}]")
+        sid = s["id"]
+        if sid in seen_ids:
+            raise ValidationError(f"{source}: duplicate script id {sid!r}")
+        seen_ids.add(sid)
+        if "args" in s and not isinstance(s["args"], list):
+            raise ValidationError(f"{source}.scripts[{i}] ({sid}).args: must be a list")
+        restart_policy = s.get("restart_policy", "on-failure")
+        if restart_policy not in ("on-failure", "always", "no"):
+            raise ValidationError(f"{source}.scripts[{i}] ({sid}).restart_policy: invalid value {restart_policy!r}")
+
+    return data
+
+
 def load_host_profile(path: Path) -> dict:
     if not path.exists():
         raise ValidationError(f"no host profile at {path} — create hosts/<hostname>.yaml for this machine")
@@ -179,3 +203,13 @@ def load_models(path: Path, host_profile: dict, manifest: dict) -> dict:
         raise ValidationError(f"no models file at {path} — create models.yaml for this machine")
     data = _load_yaml(path)
     return validate_models_dict(data, host_profile, manifest, source=str(path))
+
+
+def load_scripts(path: Path) -> dict:
+    if not path.exists():
+        raise ValidationError(
+            f"no scripts file at {path} — create scripts.yaml for this machine "
+            "(optional; copy scripts.example.yaml to get started)"
+        )
+    data = _load_yaml(path)
+    return validate_scripts_dict(data, source=str(path))

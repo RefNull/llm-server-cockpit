@@ -7,8 +7,8 @@ stack right now".
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
+from textual import work
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widget import Widget
@@ -16,7 +16,8 @@ from textual.widgets import Static
 
 from provision.common import Runner
 from provision.steps import build as build_step
-from provision.steps import drivers, hf, swap, wol
+from provision.steps import docker, drivers, hf, swap, wol
+from provision.steps import scripts as scripts_step
 
 
 class DashboardScreen(Widget):
@@ -57,6 +58,7 @@ class DashboardScreen(Widget):
         self.runner = runner
         self.repo_root = repo_root
         self.cockpit_app = app_ref
+        self.scripts = getattr(app_ref, "scripts", {"scripts": []})
         self.backends = self._compute_backends()
 
     def _compute_backends(self) -> list[str]:
@@ -78,6 +80,9 @@ class DashboardScreen(Widget):
                     with Vertical(classes="panel"):
                         yield Static("Models & llama-swap", classes="panel-title")
                         yield Static("", id="db-models")
+                    with Vertical(classes="panel"):
+                        yield Static("Containers", classes="panel-title")
+                        yield Static("", id="db-containers")
                 with Vertical(id="dashboard-right"):
                     with Vertical(classes="panel"):
                         yield Static("HF Downloads", classes="panel-title")
@@ -85,6 +90,9 @@ class DashboardScreen(Widget):
                     with Vertical(classes="panel"):
                         yield Static("Hardware & Networking", classes="panel-title")
                         yield Static("", id="db-hardware")
+                    with Vertical(classes="panel"):
+                        yield Static("Scripts", classes="panel-title")
+                        yield Static("", id="db-scripts")
 
     def on_mount(self) -> None:
         self._refresh_all()
@@ -92,23 +100,38 @@ class DashboardScreen(Widget):
     def on_refresh_requested(self) -> None:
         """Called by CockpitApp.action_refresh_all — same pattern every other screen follows."""
         self.models = getattr(self.cockpit_app, "models", self.models)
+        self.scripts = getattr(self.cockpit_app, "scripts", self.scripts)
         self._refresh_all()
 
+    @work(thread=True)
     def _refresh_all(self) -> None:
-        self._refresh_backends()
-        self._refresh_models()
-        self._refresh_downloads()
-        self._refresh_hardware()
+        """One worker computes every panel's text (each of these shells out — build_step is a
+        fast fs read, but swap/wol/docker/scripts status all run subprocesses with real
+        timeouts) — off the main thread like every other status check in this app, then one
+        call_from_thread applies them all so the panels update together."""
+        texts = {
+            "db-backends": self._compute_backends_text(),
+            "db-models": self._compute_models_text(),
+            "db-containers": self._compute_containers_text(),
+            "db-downloads": self._compute_downloads_text(),
+            "db-hardware": self._compute_hardware_text(),
+            "db-scripts": self._compute_scripts_text(),
+        }
+        self.app.call_from_thread(self._apply_texts, texts)
 
-    # ------------------------------------------------------------------ panels
+    def _apply_texts(self, texts: dict[str, str]) -> None:
+        if not self.is_mounted:
+            return
+        for widget_id, text in texts.items():
+            self.query_one(f"#{widget_id}", Static).update(text)
 
-    def _refresh_backends(self) -> None:
+    # ------------------------------------------------------------------ panels (pure computation, off main thread)
+
+    def _compute_backends_text(self) -> str:
         """Current installed state per backend — deliberately not an upstream-version check
         (that stays a manual action on the Backends tab); this answers "what's running now"."""
-        widget = self.query_one("#db-backends", Static)
         if not self.backends:
-            widget.update("no GPU backends declared in host profile")
-            return
+            return "no GPU backends declared in host profile"
         lines: list[str] = []
         for backend in self.backends:
             builds = build_step.list_builds(self.host_profile, backend)
@@ -119,10 +142,9 @@ class DashboardScreen(Widget):
                 ref = (current.get("ref") or "")[:10]
                 sane = "ok" if current.get("sane") else "NOT SANE"
                 lines.append(f"{backend}: {ref} ({sane})")
-        widget.update("\n".join(lines))
+        return "\n".join(lines)
 
-    def _refresh_models(self) -> None:
-        widget = self.query_one("#db-models", Static)
+    def _compute_models_text(self) -> str:
         counts: dict[str, int] = {}
         for model in self.models.get("models", []):
             engine = model.get("engine", "unknown")
@@ -131,18 +153,30 @@ class DashboardScreen(Widget):
         try:
             swap_status = swap.status(self.host_profile)
         except Exception as e:
-            widget.update(f"{count_line}\nllama-swap: error checking status ({e})")
-            return
+            return f"{count_line}\nllama-swap: error checking status ({e})"
         swap_line = (
             f"llama-swap: {'running' if swap_status['unit_active'] else 'stopped'} "
             f"({'enabled' if swap_status['unit_enabled'] else 'disabled'} on boot)"
         )
         if swap_status["installed_version"]:
             swap_line += f" — {swap_status['installed_version']}"
-        widget.update(f"{count_line}\n{swap_line}")
+        return f"{count_line}\n{swap_line}"
 
-    def _refresh_downloads(self) -> None:
-        widget = self.query_one("#db-downloads", Static)
+    def _compute_containers_text(self) -> str:
+        try:
+            containers = docker.list_containers()
+        except RuntimeError as e:
+            return f"not available: {e}"
+        if not containers:
+            return "no containers found"
+        running = sum(1 for c in containers if c.get("state") == "running")
+        unhealthy = [c["name"] for c in containers if "unhealthy" in (c.get("status") or "").lower()]
+        text = f"{running}/{len(containers)} running"
+        if unhealthy:
+            text += f"\nunhealthy: {', '.join(unhealthy)}"
+        return text
+
+    def _compute_downloads_text(self) -> str:
         downloaded = missing = placeholder = 0
         for model in self.models.get("models", []):
             if model.get("engine") != "llama-cpp":
@@ -156,12 +190,10 @@ class DashboardScreen(Widget):
                 placeholder += 1
         total = downloaded + missing + placeholder
         if total == 0:
-            widget.update("no llama-cpp models configured")
-            return
-        widget.update(f"{downloaded}/{total} downloaded, {missing} missing, {placeholder} placeholder")
+            return "no llama-cpp models configured"
+        return f"{downloaded}/{total} downloaded, {missing} missing, {placeholder} placeholder"
 
-    def _refresh_hardware(self) -> None:
-        widget = self.query_one("#db-hardware", Static)
+    def _compute_hardware_text(self) -> str:
         gpu_count = len(self.host_profile.get("gpus", []))
         lines = [f"{gpu_count} GPU(s) configured"]
 
@@ -184,4 +216,18 @@ class DashboardScreen(Widget):
                 f"Wake-on-LAN: {wol_status['wake_flags'] or 'unknown'} flags, "
                 f"persistence {'enabled' if wol_status['unit_enabled'] else 'disabled'}"
             )
-        widget.update("\n".join(lines))
+        return "\n".join(lines)
+
+    def _compute_scripts_text(self) -> str:
+        registered = self.scripts.get("scripts", [])
+        if not registered:
+            return "no scripts registered"
+        running = 0
+        for script in registered:
+            try:
+                st = scripts_step.status(script["id"])
+                if st["unit_active"]:
+                    running += 1
+            except Exception:
+                continue
+        return f"{running}/{len(registered)} running"

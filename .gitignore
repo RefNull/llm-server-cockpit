@@ -11,3 +11,4 @@ screenshots/
 !/hosts/example.yaml
 /hosts/*.lock.yaml
 /models.yaml
+/scripts.yaml

@@ -1,0 +1,27 @@
+# Template registered-scripts list. This file IS tracked by git. Copy it to scripts.yaml
+# (gitignored, see .gitignore) — a real per-deployment list of ad-hoc `python serve.py`
+# processes shouldn't live in a public repo, even though the scripts themselves usually aren't
+# secret. Optional: if you have no ad-hoc Python scripts to supervise, don't create scripts.yaml
+# at all — the Scripts tab just shows an empty list.
+#
+# Each entry gets its own generated systemd unit (see systemd/python-script.service.tmpl) —
+# cockpit never holds a live subprocess handle itself, so a script survives a cockpit restart
+# and gets restart-on-failure / `journalctl` logs for free, same as llama-swap.
+
+scripts:
+  - id: example-reranker-shim
+    path: /opt/example-reranker-shim/serve.py
+    # working_dir defaults to path's directory if omitted.
+    working_dir: /opt/example-reranker-shim
+    args:
+      - "--port"
+      - "8099"
+    # python defaults to "python3" if omitted — set this to a venv interpreter if the script
+    # needs one, e.g. /opt/example-reranker-shim/.venv/bin/python3.
+    python: /opt/example-reranker-shim/.venv/bin/python3
+    # restart_policy defaults to "on-failure" if omitted (matches host_profile's own service
+    # defaults) — one of: on-failure, always, no.
+    restart_policy: on-failure
+    # enabled controls systemd `enable` (start on boot), not whether it's currently running —
+    # start/stop from the Scripts tab is independent of this.
+    enabled: false

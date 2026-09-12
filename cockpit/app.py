@@ -18,9 +18,11 @@ from provision.common import Runner
 
 from cockpit import __version__
 from cockpit.screens.builds import BuildsScreen
+from cockpit.screens.containers import ContainersScreen
 from cockpit.screens.dashboard import DashboardScreen
 from cockpit.screens.deploy import DeployScreen
 from cockpit.screens.downloads import DownloadsScreen
+from cockpit.screens.scripts import ScriptsScreen
 from cockpit.screens.settings import SettingsScreen
 from cockpit.widgets import AMBER_THEME, SHARED_CSS
 
@@ -124,8 +126,13 @@ class CockpitApp(App):
                 self.models = schema.load_models(REPO_ROOT / "models.yaml", self.host_profile, self.manifest)
             except schema.ValidationError:
                 self.models = {"models": []}
+            try:
+                self.scripts = schema.load_scripts(REPO_ROOT / "scripts.yaml")
+            except schema.ValidationError:
+                self.scripts = {"scripts": []}
         else:
             self.models = {"models": []}
+            self.scripts = {"scripts": []}
         self.runner = Runner(dry_run=False)
 
     def compose(self) -> ComposeResult:
@@ -147,13 +154,20 @@ class CockpitApp(App):
                             yield DeployScreen(self.host_profile, self.manifest, self.models, self.runner, self.repo_root, self)
                         with TabPane("HF Downloads", id="hf-downloads"):
                             yield DownloadsScreen(self.host_profile, self.manifest, self.models, self.runner, self.repo_root, self)
+                with TabPane("Containers", id="containers"):
+                    yield ContainersScreen(self.host_profile, self.manifest, self.models, self.runner, self.repo_root, self)
+                with TabPane("Scripts", id="scripts"):
+                    yield ScriptsScreen(self.host_profile, self.manifest, self.models, self.runner, self.repo_root, self)
                 with TabPane("Settings", id="settings"):
                     yield SettingsScreen(self.host_profile, self.manifest, self.models, self.runner, self.repo_root, self)
         yield Footer()
 
     def action_refresh_all(self) -> None:
         self.reload_models()
-        for widget in self.query("DashboardScreen, BuildsScreen, DeployScreen, DownloadsScreen, SettingsScreen"):
+        self.reload_scripts()
+        for widget in self.query(
+            "DashboardScreen, BuildsScreen, DeployScreen, DownloadsScreen, ContainersScreen, ScriptsScreen, SettingsScreen"
+        ):
             if hasattr(widget, "on_refresh_requested"):
                 widget.on_refresh_requested()
 
@@ -164,6 +178,20 @@ class CockpitApp(App):
             self.models = schema.load_models(self.repo_root / "models.yaml", self.host_profile, self.manifest)
         except schema.ValidationError as e:
             self.notify(f"models.yaml error: {e}", severity="error")
+
+    def reload_scripts(self) -> None:
+        if self.host_profile is None:
+            return
+        scripts_path = self.repo_root / "scripts.yaml"
+        if not scripts_path.exists():
+            # scripts.yaml is optional (unlike models.yaml) — no scripts registered is the
+            # normal case, not something to notify about.
+            self.scripts = {"scripts": []}
+            return
+        try:
+            self.scripts = schema.load_scripts(scripts_path)
+        except schema.ValidationError as e:
+            self.notify(f"scripts.yaml error: {e}", severity="error")
 
 
 def main() -> None:
