@@ -3,6 +3,7 @@ __pycache__/
 .claude/
 .DS_Store
 screenshots/
+/HANDOVER.md
 
 # Real per-deployment data — hostnames, MACs, home-dir paths, driver fingerprints. Never
 # committed to a public repo. See hosts/example.yaml and models.example.yaml for the
