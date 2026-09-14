@@ -1,12 +1,21 @@
-"""Cockpit "Downloads" tab: view + confirm layer over provision.steps.hf — no parallel
-download/auth logic, just a table of llama-cpp models, their HF download status, and
-buttons that call the same hf.py functions the CLI uses.
+"""Cockpit "Downloads" tab: track models against models.yaml, see their live Hugging Face
+status (downloaded / ready for download / needs auth to verify / not found), and download —
+view + confirm layer over provision.steps.hf, no parallel download/auth logic.
+
+HF metadata (size, dates, existence) is read straight from the public HF Hub API via plain
+urllib.request (huggingface_hub is not importable from .venv — provision/steps/hf.py's module
+docstring; cockpit/update_check.py already sets this precedent for cockpit-side HF calls).
+Unauthenticated, a nonexistent repo returns 401 (anti-enumeration), not 404 — so "not found" is
+only ever reported once a token is available to disambiguate it from "private/gated".
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -18,16 +27,38 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Input, Label, Static
 
-from cockpit.widgets import CockpitScreenBase, SingleClickDataTable, selection_marker
+from cockpit.widgets import CockpitScreenBase, SingleClickDataTable, TableAction, selection_marker
 from provision import schema
 from provision.common import Runner
 from provision.steps import hf
 
-STATUS_ICONS = {
-    "downloaded": "✅ downloaded",
-    "missing": "⬜ missing",
-    "placeholder": "⚠️  PLACEHOLDER — edit models.yaml",
+_HF_TIMEOUT_S = 10
+_LOCAL_STATUS_LABELS = {
+    "placeholder": "PLACEHOLDER — edit models.yaml",
+    "unmanaged": "unmanaged",
+    "downloaded": "downloaded",
 }
+
+
+def _hf_api_lookup(repo_id: str, token: str | None) -> tuple[int, dict | None]:
+    """Live HF Hub metadata probe. Returns (http_status, json_or_None). Never raises — a
+    network failure degrades to status 0 like cockpit/update_check.py's GitHub calls do."""
+    url = f"https://huggingface.co/api/models/{repo_id}?blobs=true"
+    headers = {"User-Agent": "llm-server-cockpit"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=_HF_TIMEOUT_S) as resp:
+            return resp.status, json.load(resp)
+    except urllib.error.HTTPError as e:
+        return e.code, None
+    except Exception:
+        return 0, None
+
+
+def _fmt_bytes(num_bytes: float) -> str:
+    return f"{num_bytes / (1024 ** 3):.1f} GB" if num_bytes >= 1024**3 else f"{num_bytes / (1024 ** 2):.0f} MB"
 
 
 class HFTokenModal(ModalScreen[str | None]):
@@ -94,6 +125,9 @@ class DownloadsScreen(CockpitScreenBase):
         height: 1fr;
         padding: 0;
     }
+    #track-row {
+        margin-bottom: $space-section;
+    }
     #disk-usage {
         margin-top: $space-normal;
         color: $text-muted;
@@ -121,20 +155,22 @@ class DownloadsScreen(CockpitScreenBase):
         self.cockpit_app = app_ref
         # id -> model dict, for the llama-cpp models currently shown in the table.
         self._downloadable: dict[str, dict[str, Any]] = {}
+        # id -> {"status": str, "size": int|None, "date": str|None} from the last refresh.
+        self._row_info: dict[str, dict[str, Any]] = {}
         self._selected: set[str] = set()
         self._downloading = False
 
     def compose(self) -> ComposeResult:
         with VerticalScroll():
-            with Horizontal(classes="inline-row"):
+            with Horizontal(classes="inline-row", id="track-row"):
                 yield Input(
-                    placeholder="Hugging Face repo/model or GGUF filename...",
-                    id="adhoc-model-input",
+                    placeholder="Track a model: repo_id:quant_file (e.g. org/Model-GGUF:model.Q4_K_M.gguf)",
+                    id="track-model-input",
                 )
-                yield Button("Download", id="adhoc-download-btn", variant="primary")  # inline archetype (DESIGN.md §9): bare Button inside .inline-row
+                yield Button("Track", id="track-btn", variant="primary")  # inline archetype (DESIGN.md §9): bare Button inside .inline-row
 
             # fixed_columns=2: column 0 is the tick marker, so keeping the model ID visible
-            # while repo_id/quant_file/status scroll horizontally takes both (DESIGN.md §4.2).
+            # while Repo ID/Status/Size/Date scroll horizontally takes both (DESIGN.md §4.2).
             table = SingleClickDataTable(
                 id="model-table", zebra_stripes=True, classes="data-table", fixed_columns=2
             )
@@ -143,7 +179,7 @@ class DownloadsScreen(CockpitScreenBase):
 
             with Horizontal(classes="action-row-primary"):
                 yield Button("Download selected", id="btn-download-selected", variant="primary", classes="thin-button")
-                yield Button("Download all", id="btn-download-all", variant="error", classes="thin-button")
+                yield Button("Download all missing", id="btn-download-all", classes="thin-button")
 
             with Horizontal(classes="action-row-secondary"):
                 yield Static("", id="disk-usage")
@@ -152,10 +188,12 @@ class DownloadsScreen(CockpitScreenBase):
     def on_mount(self) -> None:
         table = self.query_one("#model-table", SingleClickDataTable)
         table.add_column("", width=3)
-        table.add_column("ID", width=24)
-        table.add_column("Repo ID", width=36)
-        table.add_column("Quant File", width=26)
-        table.add_column("Status", width=32)
+        table.add_column("ID", width=22)
+        table.add_column("Repo ID", width=32)
+        table.add_column("Status", width=22)
+        table.add_column("Size", width=10)
+        table.add_column("Release Date", width=12)
+        table.add_action_column(TableAction("download", "Download", confirm="Download {row}?", available=self._can_download))
         self._refresh_table()
         self._refresh_disk_usage()
 
@@ -163,39 +201,75 @@ class DownloadsScreen(CockpitScreenBase):
     # Rendering
     # ------------------------------------------------------------------
 
+    def _can_download(self, model_id: str) -> bool:
+        info = self._row_info.get(model_id)
+        return bool(info) and info["status"] == "ready for download" and not self._downloading
+
+    @work(thread=True)
     def _refresh_table(self) -> None:
+        """Batched on refresh (mount / 'r' / after a track/download), never per-row on render
+        and never per keystroke — every HF lookup below is a live network call."""
+        token_env = self.host_profile.get("hf", {}).get("token_env", "HF_TOKEN")
+        token = os.environ.get(token_env)
+
+        models = [m for m in self.models.get("models", []) if m.get("engine") == "llama-cpp"]
+        rows: list[tuple[dict, dict]] = []
+        for model in models:
+            rows.append((model, self._compute_row_info(model, token)))
+        self.app.call_from_thread(self._apply_rows, models, rows)
+
+    def _compute_row_info(self, model: dict, token: str | None) -> dict:
+        local = hf.model_status(model, self.host_profile)
+        if local in ("downloaded", "placeholder", "unmanaged"):
+            return {"status": local, "size": None, "date": None}
+
+        # local == "missing" — ask HF whether it actually exists / is downloadable.
+        code, data = _hf_api_lookup(model["repo_id"], token)
+        if code == 200:
+            size = date = None
+            if data:
+                sibling = next(
+                    (s for s in data.get("siblings", []) if s.get("rfilename") == model.get("quant_file")),
+                    None,
+                )
+                size = sibling.get("size") if sibling else None
+                date = data.get("createdAt")
+            return {"status": "ready for download", "size": size, "date": date}
+        if code == 404:
+            # Only reachable with a token — unauthenticated HF returns 401 for a nonexistent
+            # repo too (anti-enumeration), so "not found" is never reported without one.
+            return {"status": "not found", "size": None, "date": None}
+        if code == 401:
+            return {"status": "needs auth to verify", "size": None, "date": None}
+        return {"status": "check failed", "size": None, "date": None}
+
+    def _apply_rows(self, models: list[dict], rows: list[tuple[dict, dict]]) -> None:
+        if not self.is_mounted:
+            return
         table = self.query_one("#model-table", SingleClickDataTable)
         table.clear()
-        self._downloadable.clear()
-        for model in self.models.get("models", []):
-            if model.get("engine") != "llama-cpp":
-                continue
-            self._downloadable[model["id"]] = model
-            status = hf.model_status(model, self.host_profile)
-            repo_id = model["repo_id"]
-            repo_display = "PLACEHOLDER — edit models.yaml" if status == "placeholder" else repo_id
+        self._downloadable = {m["id"]: m for m in models}
+        self._row_info = {m["id"]: info for m, info in rows}
+        self._selected &= self._downloadable.keys()
+
+        for model, info in rows:
+            status = info["status"]
+            status_label = _LOCAL_STATUS_LABELS.get(status, status)
+            size_label = _fmt_bytes(info["size"]) if info.get("size") else "—"
+            date_label = (info.get("date") or "—")[:10]
+            repo_display = "PLACEHOLDER — edit models.yaml" if status == "placeholder" else model["repo_id"]
             table.add_row(
                 selection_marker(model["id"] in self._selected),
                 model["id"],
                 repo_display,
-                model["quant_file"],
-                STATUS_ICONS.get(status, status),
+                status_label,
+                size_label,
+                date_label,
+                *table.action_cells(model["id"]),
                 key=model["id"],
             )
-        self._selected &= self._downloadable.keys()
 
-        btn_selected = self.query("#btn-download-selected")
-        btn_all = self.query("#btn-download-all")
-
-        if not self._downloadable:
-            if btn_selected:
-                btn_selected.first(Button).disabled = True
-            if btn_all:
-                btn_all.first(Button).disabled = True
-        else:
-            if btn_all:
-                btn_all.first(Button).disabled = self._downloading
-            self._sync_button_state()
+        self._sync_button_state()
 
     def _refresh_disk_usage(self) -> None:
         widget = self.query_one("#disk-usage", Static)
@@ -213,20 +287,21 @@ class DownloadsScreen(CockpitScreenBase):
             widget.update(f"Disk usage: {total_gb:.1f} GiB in {models_dir}")
 
     def _sync_button_state(self) -> None:
-        """Enable 'Download selected' only when at least one ticked model is still
-        downloadable ('missing') and no download is already running."""
-        btn = self.query("#btn-download-selected")
-        if not btn:
+        """'Download selected'/'Download all missing' enable only when there's a ticked (resp.
+        any) model whose live status is 'ready for download' and no download is running."""
+        btn_selected = self.query("#btn-download-selected")
+        btn_all = self.query("#btn-download-all")
+        if not self._downloadable:
+            if btn_selected:
+                btn_selected.first(Button).disabled = True
+            if btn_all:
+                btn_all.first(Button).disabled = True
             return
-        button = btn.first(Button)
-        if self._downloading:
-            button.disabled = True
-            return
-        button.disabled = not any(
-            hf.model_status(self._downloadable[model_id], self.host_profile) == "missing"
-            for model_id in self._selected
-            if model_id in self._downloadable
-        )
+        ready_ids = {mid for mid, info in self._row_info.items() if info["status"] == "ready for download"}
+        if btn_selected:
+            btn_selected.first(Button).disabled = self._downloading or not (self._selected & ready_ids)
+        if btn_all:
+            btn_all.first(Button).disabled = self._downloading or not ready_ids
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         if event.data_table.id != "model-table" or event.row_key is None or event.row_key.value is None:
@@ -238,7 +313,10 @@ class DownloadsScreen(CockpitScreenBase):
             self._selected.discard(model_id)
         else:
             self._selected.add(model_id)
-        self._refresh_table()
+        self._apply_rows(
+            list(self._downloadable.values()),
+            [(m, self._row_info[m["id"]]) for m in self._downloadable.values()],
+        )
 
     # ------------------------------------------------------------------
     # Refresh entry point (called by app.py's action_refresh_all)
@@ -264,6 +342,20 @@ class DownloadsScreen(CockpitScreenBase):
         return True
 
     # ------------------------------------------------------------------
+    # Per-row table action
+    # ------------------------------------------------------------------
+
+    async def handle_table_action(self, action_id: str, row_key: str, table: DataTable) -> None:
+        if action_id != "download":
+            return
+        model = self._downloadable.get(row_key)
+        if model is None:
+            return
+        if not await self._ensure_hf_auth():
+            return
+        self._run_download_batch([model])
+
+    # ------------------------------------------------------------------
     # Button handling & download actions
     # ------------------------------------------------------------------
 
@@ -271,16 +363,16 @@ class DownloadsScreen(CockpitScreenBase):
         if event.button.id == "btn-download-selected":
             await self._on_download_selected()
         elif event.button.id == "btn-download-all":
-            await self._on_download_all()
-        elif event.button.id == "adhoc-download-btn":
-            await self._on_adhoc_download()
+            await self._on_download_all_missing()
+        elif event.button.id == "track-btn":
+            await self._on_track_model()
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:
-        if event.input.id == "adhoc-model-input":
-            await self._on_adhoc_download()
+        if event.input.id == "track-model-input":
+            await self._on_track_model()
 
     @staticmethod
-    def _parse_adhoc_input(raw: str) -> tuple[str, str] | None:
+    def _parse_track_input(raw: str) -> tuple[str, str] | None:
         raw = raw.strip()
         if raw.startswith("https://huggingface.co/"):
             raw = raw.removeprefix("https://huggingface.co/").strip()
@@ -307,12 +399,15 @@ class DownloadsScreen(CockpitScreenBase):
         return None
 
     @work
-    async def _on_adhoc_download(self) -> None:
-        raw = self.query_one("#adhoc-model-input", Input).value.strip()
+    async def _on_track_model(self) -> None:
+        """Register a model in models.yaml without downloading it — download stays an explicit
+        per-row action once its live status comes back 'ready for download'. Tracking-without-
+        downloading already exists in the data model as hf.model_status() == 'missing'."""
+        raw = self.query_one("#track-model-input", Input).value.strip()
         if not raw:
             self.notify("Enter a Hugging Face repo and model file", severity="warning")
             return
-        parsed = self._parse_adhoc_input(raw)
+        parsed = self._parse_track_input(raw)
         if not parsed:
             self.notify(
                 "Could not parse input. Provide repo and filename (e.g. 'repo/model/file.gguf' or 'repo:file.gguf')",
@@ -321,18 +416,6 @@ class DownloadsScreen(CockpitScreenBase):
             return
         repo_id, quant_file = parsed
 
-        if not await self._ensure_hf_auth():
-            return
-
-        confirmed = await self.confirm(
-            f"Download {quant_file} from {repo_id} and register in models.yaml?",
-            confirm_label="Download",
-            danger=True,
-        )
-        if not confirmed:
-            return
-
-        # Check if already present in models
         existing = next(
             (
                 m for m in self.models.get("models", [])
@@ -341,51 +424,51 @@ class DownloadsScreen(CockpitScreenBase):
             None,
         )
         if existing:
-            target_model = existing
-        else:
-            stem = Path(quant_file).stem
-            clean_id = re.sub(r"[^a-zA-Z0-9_\.\-]", "-", stem).lower().strip("-") or "model"
-            candidate_id = clean_id
-            existing_ids = {m.get("id") for m in self.models.get("models", [])}
-            counter = 2
-            while candidate_id in existing_ids:
-                candidate_id = f"{clean_id}-{counter}"
-                counter += 1
+            self.notify(f"already tracked as {existing['id']!r}", severity="warning")
+            return
 
-            gpus = self.host_profile.get("gpus", [])
-            gpu_id = gpus[0]["id"] if gpus else "gpu-0"
-            backend = gpus[0]["backends"][0] if gpus and gpus[0].get("backends") else "cuda"
+        stem = Path(quant_file).stem
+        clean_id = re.sub(r"[^a-zA-Z0-9_\.\-]", "-", stem).lower().strip("-") or "model"
+        candidate_id = clean_id
+        existing_ids = {m.get("id") for m in self.models.get("models", [])}
+        counter = 2
+        while candidate_id in existing_ids:
+            candidate_id = f"{clean_id}-{counter}"
+            counter += 1
 
-            target_model = {
-                "id": candidate_id,
-                "engine": "llama-cpp",
-                "repo_id": repo_id,
-                "quant_file": quant_file,
-                "bind": {"gpu": gpu_id, "backend": backend},
-                "ttl": 300,
-            }
+        gpus = self.host_profile.get("gpus", [])
+        gpu_id = gpus[0]["id"] if gpus else "gpu-0"
+        backend = gpus[0]["backends"][0] if gpus and gpus[0].get("backends") else "cuda"
 
-            models_list = list(self.models.get("models", []))
-            models_list.append(target_model)
-            candidate_data = {"models": models_list}
-            try:
-                validated = schema.validate_models_dict(
-                    candidate_data, self.host_profile, self.manifest, source="models.yaml"
-                )
-                models_yaml_path = self.repo_root / "models.yaml"
-                models_yaml_path.write_text(yaml.safe_dump(validated, sort_keys=False), encoding="utf-8")
-                if hasattr(self.cockpit_app, "reload_models"):
-                    self.cockpit_app.reload_models()
-                    self.models = self.cockpit_app.models
-                else:
-                    self.models = candidate_data
-            except Exception as e:
-                self.notify(f"Failed to register model in models.yaml: {e}", severity="error")
-                return
+        target_model = {
+            "id": candidate_id,
+            "engine": "llama-cpp",
+            "repo_id": repo_id,
+            "quant_file": quant_file,
+            "bind": {"gpu": gpu_id, "backend": backend},
+            "ttl": 300,
+        }
+        models_list = list(self.models.get("models", []))
+        models_list.append(target_model)
+        candidate_data = {"models": models_list}
+        try:
+            validated = schema.validate_models_dict(
+                candidate_data, self.host_profile, self.manifest, source="models.yaml"
+            )
+            models_yaml_path = self.repo_root / "models.yaml"
+            models_yaml_path.write_text(yaml.safe_dump(validated, sort_keys=False), encoding="utf-8")
+            if hasattr(self.cockpit_app, "reload_models"):
+                self.cockpit_app.reload_models()
+                self.models = self.cockpit_app.models
+            else:
+                self.models = candidate_data
+        except Exception as e:
+            self.notify(f"Failed to register model in models.yaml: {e}", severity="error")
+            return
 
-        self.query_one("#adhoc-model-input", Input).value = ""
+        self.query_one("#track-model-input", Input).value = ""
+        self.notify(f"tracking {candidate_id!r} — checking Hugging Face status...")
         self._refresh_table()
-        self._run_download_batch([target_model])
 
     @work
     async def _on_download_selected(self) -> None:
@@ -393,7 +476,7 @@ class DownloadsScreen(CockpitScreenBase):
             self._downloadable[model_id]
             for model_id in sorted(self._selected)
             if model_id in self._downloadable
-            and hf.model_status(self._downloadable[model_id], self.host_profile) == "missing"
+            and self._row_info.get(model_id, {}).get("status") == "ready for download"
         ]
         if not pending:
             return
@@ -404,26 +487,33 @@ class DownloadsScreen(CockpitScreenBase):
             f"Download {len(pending)} selected model(s)?\n{names}\n"
             "This can take a while and uses bandwidth.",
             confirm_label="Download",
-            danger=True,
+            mutates_system=True,
         )
         if not confirmed:
             return
         self._run_download_batch(pending)
 
     @work
-    async def _on_download_all(self) -> None:
+    async def _on_download_all_missing(self) -> None:
+        pending = [
+            model
+            for model_id, model in self._downloadable.items()
+            if self._row_info.get(model_id, {}).get("status") == "ready for download"
+        ]
+        if not pending:
+            return
         if not await self._ensure_hf_auth():
             return
+        names = ", ".join(m["id"] for m in pending)
         confirmed = await self.confirm(
-            "Download ALL non-placeholder models?\n"
-            "This provisions/updates the hf venv, logs in, and downloads every model "
-            "not marked as a placeholder. Can take a long time and uses significant bandwidth.",
+            f"Download all {len(pending)} model(s) currently ready for download?\n{names}\n"
+            "This can take a long time and uses significant bandwidth.",
             confirm_label="Download all",
-            danger=True,
+            mutates_system=True,
         )
         if not confirmed:
             return
-        self._run_download_all()
+        self._run_download_batch(pending)
 
     @work(thread=True)
     def _run_download_batch(self, models: list[dict[str, Any]]) -> None:
@@ -460,33 +550,9 @@ class DownloadsScreen(CockpitScreenBase):
             self.app.call_from_thread(self._refresh_disk_usage)
             self.app.call_from_thread(self._set_downloading, False)
 
-    @work(thread=True)
-    def _run_download_all(self) -> None:
-        self.app.call_from_thread(self._set_downloading, True)
-        status_label = self.query_one("#download-status", Label)
-        self.app.call_from_thread(status_label.update, "Running full download (venv provision + login + all models)...")
-        try:
-            hf.run(self.host_profile, self.manifest, self.models, self.runner, self.repo_root)
-        except BaseException as exc:  # noqa: BLE001
-            message = str(exc) or repr(exc)
-            self.app.call_from_thread(status_label.update, f"Download-all stopped: {message}")
-            self.app.call_from_thread(self.app.notify, f"Download-all stopped: {message}", severity="error")
-            self.app.call_from_thread(self._refresh_table)
-            self.app.call_from_thread(self._refresh_disk_usage)
-            self.app.call_from_thread(self._set_downloading, False)
-            return
-        self.app.call_from_thread(status_label.update, "Download-all complete.")
-        self.app.call_from_thread(self.app.notify, "Download-all complete")
-        self.app.call_from_thread(self._refresh_table)
-        self.app.call_from_thread(self._refresh_disk_usage)
-        self.app.call_from_thread(self._set_downloading, False)
-
     def _set_downloading(self, active: bool) -> None:
         self._downloading = active
-        all_btn = self.query("#btn-download-all")
-        if all_btn:
-            all_btn.first(Button).disabled = active or not self._downloadable
-        adhoc_btn = self.query("#adhoc-download-btn")
-        if adhoc_btn:
-            adhoc_btn.first(Button).disabled = active
+        track_btn = self.query("#track-btn")
+        if track_btn:
+            track_btn.first(Button).disabled = active
         self._sync_button_state()
