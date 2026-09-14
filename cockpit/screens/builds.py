@@ -16,11 +16,24 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Label, RichLog, Static
 
 from cockpit import update_check
-from cockpit.widgets import CockpitDataTable, CockpitScreenBase, SingleClickDataTable, selection_marker
+from cockpit.widgets import (
+    CockpitDataTable,
+    CockpitScreenBase,
+    ConfirmModal,
+    SingleClickDataTable,
+    TableAction,
+    TableActionInvoked,
+)
 from provision.common import Runner
 from provision.steps import build as build_step
 
 log = logging.getLogger("provision")
+
+
+def _short(ref: str | None) -> str:
+    if not ref:
+        return ""
+    return ref[:10]
 
 
 class _BuildLogHandler(logging.Handler):
@@ -128,6 +141,171 @@ class BuildHistoryModal(ModalScreen[None]):
             self.dismiss(None)
 
 
+class RetainedBuildsModal(ModalScreen[None]):
+    """Per-backend retained build inventory — previously an always-visible third DataTable on
+    the Installs tab (the DESIGN.md §3.1 "max 2 tables" violation named in the QA pass), now
+    behind a button so BuildsScreen itself composes only backends-table directly.
+
+    Rollback and Remove are per-row actions here rather than a cursor-select + action-row
+    button pair: each row already identifies one specific (backend, ref) build, which is
+    exactly the (backend, target_ref) pair build_step.rollback() needs — no separate selection
+    step to get wrong. Not a CockpitScreenBase (it's a ModalScreen, a different widget-tree
+    root), so it can't inherit CockpitScreenBase's TableActionInvoked handling — this modal
+    implements the same confirm-then-dispatch shape itself, same as every other modal in this
+    codebase that calls ConfirmModal directly (DESIGN.md §5's declarative-write idiom).
+    """
+
+    BINDINGS = [("escape", "dismiss_modal", "Close")]
+
+    DEFAULT_CSS = """
+    RetainedBuildsModal {
+        align: center middle;
+    }
+    #retained-dialog {
+        width: 90%;
+        height: 80%;
+        border: thick $background 80%;
+        background: $surface;
+        padding: $space-normal $space-section;
+    }
+    #retained-header {
+        height: auto;
+        margin-bottom: $space-normal;
+    }
+    #retained-title {
+        width: 1fr;
+        text-style: bold;
+    }
+    #retained-table {
+        height: 1fr;
+        margin-bottom: $space-normal;
+    }
+    """
+
+    def __init__(self, host_profile: dict, backends: list[str], runner: Runner) -> None:
+        super().__init__()
+        self.host_profile = host_profile
+        self.backends = backends
+        self.runner = runner
+        # "backend:ref" -> build dict (+ "backend"), refreshed on every _refresh() call.
+        self._builds: dict[str, dict] = {}
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="retained-dialog"):
+            with Horizontal(id="retained-header"):
+                yield Static("Retained Builds", id="retained-title")
+                yield Button("×", id="retained-close", classes="close-button", variant="error")
+            table = SingleClickDataTable(id="retained-table", zebra_stripes=True, fixed_columns=1)
+            table.cursor_type = "row"
+            yield table
+            with Horizontal(classes="action-row-secondary"):
+                yield Button("Close", id="btn-retained-close-bottom", classes="thin-button")
+
+    def on_mount(self) -> None:
+        table = self.query_one("#retained-table", SingleClickDataTable)
+        table.add_column("Backend", width=12)
+        table.add_column("Ref", width=14)
+        table.add_column("Status", width=12)
+        table.add_column("Integrity", width=12)
+        table.add_action_column(
+            TableAction(
+                "rollback",
+                "Rollback",
+                confirm="Roll back {row}? Points 'current' at this already-built prefix — "
+                "no rebuild, no re-smoke-test.",
+                available=self._can_rollback,
+            )
+        )
+        table.add_action_column(
+            TableAction(
+                "remove",
+                "Remove",
+                destructive=True,
+                confirm="Delete retained build {row}? Frees disk space; cannot be undone.",
+                available=self._can_remove,
+            )
+        )
+        self._refresh()
+
+    def _can_rollback(self, row_key: str) -> bool:
+        build = self._builds.get(row_key)
+        return bool(build) and not build["current"] and build["sane"]
+
+    def _can_remove(self, row_key: str) -> bool:
+        build = self._builds.get(row_key)
+        return bool(build) and not build["current"]
+
+    def _refresh(self) -> None:
+        if not self.is_mounted:
+            return
+        table = self.query_one("#retained-table", SingleClickDataTable)
+        table.clear()
+        self._builds.clear()
+        for backend in self.backends:
+            for b in build_step.list_builds(self.host_profile, backend):
+                key = f"{backend}:{b.get('ref', '')}"
+                self._builds[key] = {**b, "backend": backend}
+                current_cell = Text("current", style="bold green") if b.get("current") else Text("retained", style="dim")
+                sane_cell = Text("ok", style="green") if b.get("sane") else Text("NOT SANE", style="bold red")
+                table.add_row(
+                    Text(backend),
+                    Text(_short(b.get("ref", ""))),
+                    current_cell,
+                    sane_cell,
+                    *table.action_cells(key),
+                    key=key,
+                )
+
+    def action_dismiss_modal(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id in ("retained-close", "btn-retained-close-bottom"):
+            self.dismiss(None)
+
+    @work
+    async def _on_table_action_invoked(self, event: TableActionInvoked) -> None:
+        event.stop()
+        message = event.action.confirm_message(event.row_key)
+        if message is not None:
+            confirmed = await self.app.push_screen_wait(
+                ConfirmModal(message, confirm_label=event.action.label, danger=True)
+            )
+            if not confirmed:
+                return
+        build = self._builds.get(event.row_key)
+        if build is None:
+            return
+        if event.action.id == "rollback":
+            self._run_rollback(build["backend"], build["ref"])
+        elif event.action.id == "remove":
+            self._run_remove(build["backend"], build["ref"])
+
+    @work(thread=True)
+    def _run_rollback(self, backend: str, ref: str) -> None:
+        try:
+            build_step.rollback(self.host_profile, backend, ref, self.runner)
+        except SystemExit as e:
+            self.app.call_from_thread(self.app.notify, f"rollback failed: {e}", severity="error")
+            return
+        except Exception as e:
+            self.app.call_from_thread(self.app.notify, f"rollback failed: {e}", severity="error")
+            return
+        self.app.call_from_thread(self.app.notify, f"{backend}: current now points at {_short(ref)}")
+        self.app.call_from_thread(self._refresh)
+
+    @work(thread=True)
+    def _run_remove(self, backend: str, ref: str) -> None:
+        target = Path(self.host_profile["paths"]["prefix_root"]) / backend / ref
+        try:
+            self.runner.run(["rm", "-rf", str(target)])
+        except Exception as e:
+            self.app.call_from_thread(self.app.notify, f"remove failed: {e}", severity="error")
+            return
+        self.app.call_from_thread(self.app.notify, f"{backend}: removed retained build {_short(ref)}")
+        self.app.call_from_thread(self._refresh)
+
+
 class BuildsScreen(CockpitScreenBase):
     """The 'Installs' tab. One panel per backend the host's GPUs actually use (cuda, vulkan,
     etc. per hosts/<hostname>.yaml), plus one upstream-version-check panel.
@@ -168,11 +346,7 @@ class BuildsScreen(CockpitScreenBase):
         self.app_ref = app_ref
         self.backends = self._compute_backends()
 
-        self._selected_backend: str | None = None
-        self._selected_ref: str | None = None
-        self._builds_cache: dict[str, list[dict]] = {backend: [] for backend in self.backends}
         self._build_in_progress = False
-        self._selected_backends: set[str] = set()
         self._llama_cpp_check: dict | None = None
         self._llama_swap_check: dict | None = None
 
@@ -184,20 +358,13 @@ class BuildsScreen(CockpitScreenBase):
                     seen.append(backend)
         return seen
 
-    @staticmethod
-    def _short(ref: str | None) -> str:
-        if not ref:
-            return ""
-        return ref[:10]
-
     # ------------------------------------------------------------------ compose / mount
 
     def compose(self) -> ComposeResult:
         with VerticalScroll():
             with Vertical(id="update-panel", classes="panel"):
-                yield Static("Components", classes="section-title")
                 backends_table = SingleClickDataTable(
-                    id="backends-table", zebra_stripes=True, classes="data-table", fixed_columns=2
+                    id="backends-table", zebra_stripes=True, classes="data-table", fixed_columns=1
                 )
                 backends_table.cursor_type = "row"
                 yield backends_table
@@ -209,18 +376,9 @@ class BuildsScreen(CockpitScreenBase):
                     id="no-backends",
                     classes="panel",
                 )
-            else:
-                with Vertical(id="builds-panel", classes="panel"):
-                    yield Static("Retained Builds", classes="section-title")
-                    builds_table = SingleClickDataTable(id="builds-table", classes="data-table", fixed_columns=1)
-                    builds_table.cursor_type = "row"
-                    yield builds_table
-
-            with Horizontal(classes="action-row-primary"):
-                yield Button("Update selected", id="btn-update-selected", variant="primary", classes="thin-button")
-                yield Button("Rollback", id="btn-rollback", variant="warning", classes="thin-button")
 
             with Horizontal(classes="action-row-secondary"):
+                yield Button("Retained Builds", id="btn-retained-builds", classes="thin-button")
                 yield Button("Build History", id="btn-build-history", classes="thin-button")
                 yield Button("Check for Updates", id="btn-check-updates", classes="thin-button")
 
@@ -231,79 +389,59 @@ class BuildsScreen(CockpitScreenBase):
         backends_table = self.query_one("#backends-table", SingleClickDataTable)
         backends_table.cursor_type = "row"
         backends_table.zebra_stripes = True
-        backends_table.add_column("", width=3)
         backends_table.add_column("Component", width=22)
-        backends_table.add_column("Pinned", width=8)
-        backends_table.add_column("Update", width=34)
+        backends_table.add_column("Pinned ref", width=14)
+        backends_table.add_column("Status", width=34)
+        backends_table.add_action_column(
+            TableAction(
+                "update",
+                "Update",
+                confirm="Build/update {row}? This can take several minutes.",
+                available=self._backend_has_update,
+            )
+        )
 
-        if self.backends:
-            builds_table = self.query_one("#builds-table", SingleClickDataTable)
-            builds_table.cursor_type = "row"
-            builds_table.zebra_stripes = True
-            builds_table.add_column("Backend", width=12)
-            builds_table.add_column("Ref", width=14)
-            builds_table.add_column("Status", width=12)
-            builds_table.add_column("Integrity", width=12)
-
-        self._refresh_builds()
         self._refresh_backends_table()
         # Initial check on mount so the panel isn't blank; the button below is for
         # re-checking on demand afterwards — refresh (the 'r' binding) never re-hits it.
         self._run_update_check(notify_result=False)
 
     def on_refresh_requested(self) -> None:
-        """Called by the app's global 'r' binding. Re-reads local build state only — never
-        re-triggers the network update check."""
-        self._refresh_builds()
+        """Called by the app's global 'r' binding. Re-reads local (manifest/check) state —
+        never re-triggers the network update check."""
+        self._refresh_backends_table()
 
     # ------------------------------------------------------------------ rendering
 
-    def _refresh_builds(self) -> None:
-        if not self.backends:
-            return
-
-        table = self.query_one("#builds-table", DataTable)
-        table.clear()
-        for backend in self.backends:
-            builds = build_step.list_builds(self.host_profile, backend)
-            self._builds_cache[backend] = builds
-            for b in builds:
-                current_cell = Text("current", style="bold green") if b.get("current") else Text("retained", style="dim")
-                sane_cell = Text("ok", style="green") if b.get("sane") else Text("NOT SANE", style="bold red")
-                table.add_row(
-                    Text(backend),
-                    Text(self._short(b.get("ref", ""))),
-                    current_cell,
-                    sane_cell,
-                    key=f"{backend}:{b.get('ref', '')}",
-                )
-
-        if self._selected_backend and self._selected_ref:
-            backend_builds = self._builds_cache.get(self._selected_backend, [])
-            if not any(b.get("ref") == self._selected_ref for b in backend_builds):
-                self._selected_backend = None
-                self._selected_ref = None
+    def _backend_has_update(self, row_key: str) -> bool:
+        return (
+            row_key in self.backends
+            and self._llama_cpp_check is not None
+            and self._llama_cpp_check.get("ok")
+            and self._llama_cpp_check.get("update_available")
+        )
 
     def _refresh_backends_table(self) -> None:
-        table = self.query_one("#backends-table", DataTable)
+        table = self.query_one("#backends-table", SingleClickDataTable)
         table.clear()
         cpp_ref = self.manifest.get("llama_cpp", {}).get("ref", "")
         for backend in self.backends:
-            pinned_cell = Text("[★]", style="bold green") if cpp_ref else Text("[-]", style="dim")
             table.add_row(
-                selection_marker(backend in self._selected_backends),
                 Text(f"llama.cpp ({backend})"),
-                pinned_cell,
+                Text(_short(cpp_ref)),
                 self._format_update_cell(self._llama_cpp_check, shorten=True),
+                *table.action_cells(backend),
                 key=backend,
             )
         swap_version = self.manifest.get("llama_swap", {}).get("version", "")
-        swap_pinned = Text("[★]", style="bold green") if swap_version else Text("[-]", style="dim")
         table.add_row(
-            Text("—", style="dim"),
             Text("llama-swap"),
-            swap_pinned,
+            Text(swap_version),
             self._format_update_cell(self._llama_swap_check, shorten=False),
+            # The llama-swap row is informational only — updated from the Deploy tab's deploy
+            # action, not from here — so its Update cell is always blank (_backend_has_update
+            # is False for any key not in self.backends).
+            *table.action_cells("llama-swap"),
             key="llama-swap",
         )
 
@@ -314,43 +452,18 @@ class BuildsScreen(CockpitScreenBase):
             return Text(f"couldn't check ({result.get('error')})", style="dim")
         if not result["update_available"]:
             return Text("up to date", style="green")
-        latest = self._short(result["latest"]) if shorten else result["latest"]
+        latest = _short(result["latest"]) if shorten else result["latest"]
         return Text(f"update available (latest {latest})", style="bold yellow")
 
-    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
-        if event.data_table.id != "builds-table":
-            return
-        if event.row_key is None or event.row_key.value is None:
-            self._selected_backend = None
-            self._selected_ref = None
-        else:
-            key_str = str(event.row_key.value)
-            backend, _, ref = key_str.partition(":")
-            self._selected_backend = backend
-            self._selected_ref = ref
+    # ------------------------------------------------------------------ per-row action dispatch
 
-    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        if event.data_table.id == "backends-table":
-            if event.row_key is None or event.row_key.value is None:
-                return
-            backend = event.row_key.value
-            if backend not in self.backends:
-                # The llama-swap row is informational only — updated from the Deploy tab's
-                # deploy action, not from here — so it isn't a valid tick target.
-                return
-            if backend in self._selected_backends:
-                self._selected_backends.discard(backend)
-            else:
-                self._selected_backends.add(backend)
-            self._refresh_backends_table()
+    async def handle_table_action(self, action_id: str, row_key: str, table: DataTable) -> None:
+        if action_id != "update":
             return
-        if event.data_table.id != "builds-table":
+        if self._build_in_progress:
+            self.notify("a build is already in progress", severity="warning")
             return
-        if event.row_key is not None and event.row_key.value is not None:
-            key_str = str(event.row_key.value)
-            backend, _, ref = key_str.partition(":")
-            self._selected_backend = backend
-            self._selected_ref = ref
+        self._run_build([row_key])
 
     # ------------------------------------------------------------------ button dispatch
 
@@ -358,55 +471,10 @@ class BuildsScreen(CockpitScreenBase):
         button_id = event.button.id or ""
         if button_id == "btn-check-updates":
             self._run_update_check()
-        elif button_id == "btn-update-selected":
-            await self._handle_update_selected_press()
-        elif button_id == "btn-rollback":
-            await self._handle_rollback_press()
         elif button_id == "btn-build-history":
             self.app.push_screen(BuildHistoryModal(self.host_profile, self.backends))
-
-    async def _handle_update_selected_press(self) -> None:
-        if self._build_in_progress:
-            self.notify("a build is already in progress", severity="warning")
-            return
-        if not self._selected_backends:
-            self.notify("tick at least one backend in the table first", severity="warning")
-            return
-
-        backends = sorted(self._selected_backends)
-        ref = self.manifest["llama_cpp"]["ref"]
-        message = f"Build/update {', '.join(backends)} at pinned ref {ref}? This can take several minutes."
-
-        # DESIGN.md §5 tier 3: compiles and swaps the backend runtime binary `current` points at.
-        confirmed = await self.confirm(message, confirm_label="Update", mutates_system=True)
-        if confirmed:
-            self._run_build(backends)
-
-    async def _handle_rollback_press(self) -> None:
-        if not self._selected_backend or not self._selected_ref:
-            self.notify("select a build in the table first", severity="warning")
-            return
-
-        backend = self._selected_backend
-        target_ref = self._selected_ref
-
-        matching = next((b for b in self._builds_cache.get(backend, []) if b.get("ref") == target_ref), None)
-        if matching is None:
-            self.notify("selected build is no longer available — refresh and try again", severity="warning")
-            return
-        if matching.get("current"):
-            self.notify(f"{backend}: {self._short(target_ref)} is already current", severity="information")
-            return
-
-        message = (
-            f"Roll back {backend} to {target_ref}? This points 'current' at an "
-            f"already-built, retained prefix — no rebuild, no re-smoke-test."
-        )
-
-        # DESIGN.md §5 tier 3: repoints `current` at a different runtime binary.
-        confirmed = await self.confirm(message, confirm_label="Roll back", mutates_system=True)
-        if confirmed:
-            self._run_rollback(backend, target_ref)
+        elif button_id == "btn-retained-builds":
+            self.app.push_screen(RetainedBuildsModal(self.host_profile, self.backends, self.runner))
 
     # ------------------------------------------------------------------ build (blocking, off main thread)
 
@@ -432,20 +500,12 @@ class BuildsScreen(CockpitScreenBase):
         finally:
             provision_logger.removeHandler(handler)
             provision_logger.setLevel(prior_level)
-            self.app.call_from_thread(self._selected_backends.clear)
             self.app.call_from_thread(self._set_building, False)
-            self.app.call_from_thread(self._refresh_builds)
             self.app.call_from_thread(self._refresh_backends_table)
 
     def _set_building(self, active: bool) -> None:
         self._build_in_progress = active
         self.query_one("#build-status", Static).update("building... (see log below)" if active else "")
-        update_btn = self.query("#btn-update-selected")
-        if update_btn:
-            update_btn.first(Button).disabled = active
-        rollback_btn = self.query("#btn-rollback")
-        if rollback_btn:
-            rollback_btn.first(Button).disabled = active
         if active:
             log_widget = self.query_one("#build-log", RichLog)
             log_widget.clear()
@@ -453,23 +513,6 @@ class BuildsScreen(CockpitScreenBase):
 
     def _append_build_log(self, msg: str) -> None:
         self.query_one("#build-log", RichLog).write(msg)
-
-    # ------------------------------------------------------------------ rollback (blocking, off main thread)
-
-    @work(thread=True)
-    def _run_rollback(self, backend: str, target_ref: str) -> None:
-        try:
-            build_step.rollback(self.host_profile, backend, target_ref, self.runner)
-        except SystemExit as e:
-            self.app.call_from_thread(self.app.notify, f"rollback failed: {e}", severity="error")
-            return
-        except Exception as e:
-            self.app.call_from_thread(self.app.notify, f"rollback failed: {e}", severity="error")
-            return
-
-        msg = f"{backend}: current now points at {self._short(target_ref)}"
-        self.app.call_from_thread(self.app.notify, msg)
-        self.app.call_from_thread(self._refresh_builds)
 
     # ------------------------------------------------------------------ upstream version check (network, off main thread)
 
