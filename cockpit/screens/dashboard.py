@@ -12,9 +12,9 @@ from pathlib import Path
 from textual import work
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.widget import Widget
 from textual.widgets import ProgressBar, Static
 
+from cockpit.widgets import CockpitScreenBase
 from provision.common import Runner
 from provision.steps import build as build_step
 from provision.steps import docker, drivers, hf, metrics, swap, wol
@@ -29,7 +29,7 @@ def _fmt_mb(num_mb: float) -> str:
     return f"{num_mb / 1024:.1f} GB" if num_mb >= 1024 else f"{num_mb:.0f} MB"
 
 
-class DashboardScreen(Widget):
+class DashboardScreen(CockpitScreenBase):
     """Mounted as the app's default tab by cockpit/app.py — not a Textual Screen."""
 
     # .panel / .panel-title / .subtitle come from cockpit/widgets.py's SHARED_CSS.
@@ -42,9 +42,18 @@ class DashboardScreen(Widget):
     }
     DashboardScreen #dashboard-left, DashboardScreen #dashboard-right {
         width: 1fr;
+        height: auto;
     }
-    DashboardScreen #dashboard-left {
+    /* DESIGN.md §2/§3.5: side-by-side only above the 110-cell breakpoint. The layout switch
+       itself is SHARED_CSS's .columns-responsive rule; these two only fix up the gutter, which
+       is a right margin between columns when they sit beside each other and a bottom margin
+       between stacked panels when they don't. */
+    Screen.-wide DashboardScreen #dashboard-left {
         margin-right: 1;
+    }
+    Screen.-narrow DashboardScreen #dashboard-left {
+        margin-right: 0;
+        margin-bottom: 1;
     }
     DashboardScreen .panel Static {
         margin-top: 1;
@@ -144,7 +153,7 @@ class DashboardScreen(Widget):
                     )
                     if gpu["vendor"] == "intel":
                         yield Static("", id=f"res-gpu-{slot_idx}-info-text", classes="status-text")
-            with Horizontal(id="dashboard-columns"):
+            with Horizontal(id="dashboard-columns", classes="columns-responsive"):
                 with Vertical(id="dashboard-left"):
                     with Vertical(classes="panel"):
                         yield Static("LLM Backends", classes="panel-title")
@@ -188,16 +197,25 @@ class DashboardScreen(Widget):
         second in the background; that kept an Intel Arc GPU's sysman telemetry active
         continuously and was observed to ramp its fans to 100% within moments of opening the
         app. A one-shot snapshot on demand carries none of that risk."""
-        texts = {
-            "db-backends": self._compute_backends_text(),
-            "db-models": self._compute_models_text(),
-            "db-containers": self._compute_containers_text(),
-            "db-downloads": self._compute_downloads_text(),
-            "db-hardware": self._compute_hardware_text(),
-            "db-scripts": self._compute_scripts_text(),
-        }
-        self.app.call_from_thread(self._apply_texts, texts)
-        self.app.call_from_thread(self._apply_resources, self._compute_resources())
+        # DESIGN.md §6: no success toast — this is a passive status read that runs on mount
+        # and on the global refresh, and every panel already renders its own outcome inline.
+        # A *failure* has nowhere else to go, though: these all run in a worker thread, where
+        # an uncaught exception just kills the thread and leaves the panels blank forever.
+        try:
+            texts = {
+                "db-backends": self._compute_backends_text(),
+                "db-models": self._compute_models_text(),
+                "db-containers": self._compute_containers_text(),
+                "db-downloads": self._compute_downloads_text(),
+                "db-hardware": self._compute_hardware_text(),
+                "db-scripts": self._compute_scripts_text(),
+            }
+            self.app.call_from_thread(self._apply_texts, texts)
+            self.app.call_from_thread(self._apply_resources, self._compute_resources())
+        except Exception as e:
+            self.app.call_from_thread(
+                self.app.notify, f"dashboard refresh failed: {e}", severity="error"
+            )
 
     def _apply_texts(self, texts: dict[str, str]) -> None:
         if not self.is_mounted:

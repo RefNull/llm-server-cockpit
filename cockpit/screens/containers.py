@@ -12,16 +12,15 @@ from typing import Any
 from textual import work
 from textual.app import ComposeResult
 from textual.containers import Horizontal, VerticalScroll
-from textual.widget import Widget
 from textual.widgets import Button, DataTable, Label, Static
 
 from provision.common import Runner
 from provision.steps import docker
 
-from cockpit.widgets import ConfirmModal, InfoModal, SingleClickDataTable
+from cockpit.widgets import CockpitScreenBase, InfoModal, SingleClickDataTable
 
 
-class ContainersScreen(Widget):
+class ContainersScreen(CockpitScreenBase):
     """Mounted inside a TabPane by cockpit/app.py — not a Textual Screen.
 
     Single-select, not tick-able: every per-row action (view compose/logs, exec, restart)
@@ -67,7 +66,11 @@ class ContainersScreen(Widget):
         with VerticalScroll():
             yield Static("Running and stopped Docker containers on this host.", classes="subtitle")
             yield Static("", id="docker-banner")
-            table = SingleClickDataTable(id="containers-table", zebra_stripes=True, classes="data-table")
+            # fixed_columns=1: Name is the identifier and the five columns together run well
+            # past 80 cells, so it stays pinned while Image/Status/Ports scroll (DESIGN.md §4.2).
+            table = SingleClickDataTable(
+                id="containers-table", zebra_stripes=True, classes="data-table", fixed_columns=1
+            )
             table.cursor_type = "row"
             yield table
             with Horizontal(classes="button-row"):
@@ -80,8 +83,12 @@ class ContainersScreen(Widget):
             yield Label("", id="docker-status", classes="status-text")
 
     def on_mount(self) -> None:
-        table = self.query_one("#containers-table", DataTable)
-        table.add_columns("Name", "Image", "Status", "Ports", "Compose")
+        table = self.query_one("#containers-table", SingleClickDataTable)
+        table.add_column("Name", width=24)
+        table.add_column("Image", width=30)
+        table.add_column("Status", width=22)
+        table.add_column("Ports", width=24)
+        table.add_column("Compose", width=9)
         self._refresh_table()
 
     def on_refresh_requested(self) -> None:
@@ -91,6 +98,9 @@ class ContainersScreen(Widget):
 
     @work(thread=True)
     def _refresh_table(self) -> None:
+        # Passive status read, no completion toast (DESIGN.md §6): a `docker ps` failure is
+        # surfaced in the inline #docker-banner, and this runs on mount/refresh, not on an
+        # operator action.
         try:
             containers = docker.list_containers()
             error = None
@@ -103,7 +113,7 @@ class ContainersScreen(Widget):
         if not self.is_mounted:
             return
         banner = self.query_one("#docker-banner", Static)
-        table = self.query_one("#containers-table", DataTable)
+        table = self.query_one("#containers-table", SingleClickDataTable)
         self._containers = {c["name"]: c for c in containers}
 
         if error:
@@ -203,8 +213,9 @@ class ContainersScreen(Widget):
         name = self._selected_name
         if name is None:
             return
-        confirmed = await self.app.push_screen_wait(
-            ConfirmModal(f"Restart container {name!r}?", confirm_label="Restart", danger=True)
+        # DESIGN.md §5 tier 2: restarts a running background service on the host.
+        confirmed = await self.confirm(
+            f"Restart container {name!r}?", confirm_label="Restart", mutates_system=True
         )
         if confirmed:
             self._run_restart(name)
@@ -223,12 +234,11 @@ class ContainersScreen(Widget):
         names = list(self._containers.keys())
         if not names:
             return
-        confirmed = await self.app.push_screen_wait(
-            ConfirmModal(
-                f"Restart all {len(names)} container(s)?\n{', '.join(names)}",
-                confirm_label="Restart all",
-                danger=True,
-            )
+        # DESIGN.md §5 tier 2: restarts every container service on the host at once.
+        confirmed = await self.confirm(
+            f"Restart all {len(names)} container(s)?\n{', '.join(names)}",
+            confirm_label="Restart all",
+            mutates_system=True,
         )
         if confirmed:
             self._run_restart_all(names)

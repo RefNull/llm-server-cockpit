@@ -13,11 +13,10 @@ from rich.text import Text
 from textual import work
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.widget import Widget
 from textual.widgets import Button, DataTable, Label, RichLog, Static
 
 from cockpit import update_check
-from cockpit.widgets import ConfirmModal, SingleClickDataTable, selection_marker
+from cockpit.widgets import CockpitScreenBase, SingleClickDataTable, selection_marker
 from provision.common import Runner
 from provision.steps import build as build_step
 
@@ -49,7 +48,7 @@ class _BuildLogHandler(logging.Handler):
             pass  # app shutting down or no longer running in a thread context — drop it
 
 
-class BuildsScreen(Widget):
+class BuildsScreen(CockpitScreenBase):
     """The 'Installs' tab. One panel per backend the host's GPUs actually use (cuda, vulkan,
     etc. per hosts/<hostname>.yaml), plus one upstream-version-check panel.
     """
@@ -129,7 +128,11 @@ class BuildsScreen(Widget):
                 ref = self.manifest.get("llama_cpp", {}).get("ref", "")
                 yield Static(f"pinned llama.cpp ref: {self._short(ref)}", id="pinned-ref")
                 yield Label("Tick a llama.cpp backend, then Update selected — llama-swap is informational here (updated from the Deploy tab):")
-                backends_table = SingleClickDataTable(id="backends-table", zebra_stripes=True, classes="data-table")
+                # fixed_columns=2: column 0 is the tick marker, so pinning the identifier
+                # ("Component") during horizontal scroll takes both (DESIGN.md §4.2).
+                backends_table = SingleClickDataTable(
+                    id="backends-table", zebra_stripes=True, classes="data-table", fixed_columns=2
+                )
                 backends_table.cursor_type = "row"
                 yield backends_table
                 with Horizontal(classes="button-row"):
@@ -149,36 +152,45 @@ class BuildsScreen(Widget):
                         yield Button("Roll back to selected", id="rollback-btn", variant="error", classes="thin-button")
 
                     yield Label("Retained builds (click a row to select it for rollback):")
-                    yield SingleClickDataTable(id="builds-table", classes="data-table")
+                    yield SingleClickDataTable(id="builds-table", classes="data-table", fixed_columns=1)
                     yield Static("selected for rollback: (none — click a row above)", id="selected-build")
 
                     yield Label("Recent build history:")
-                    yield SingleClickDataTable(id="history-table", classes="data-table")
+                    yield SingleClickDataTable(id="history-table", classes="data-table", fixed_columns=1)
 
             yield Static("", id="build-status")
             yield RichLog(id="build-log", highlight=False, markup=False, max_lines=400)
 
     def on_mount(self) -> None:
-        backends_table = self.query_one("#backends-table", DataTable)
+        backends_table = self.query_one("#backends-table", SingleClickDataTable)
         backends_table.cursor_type = "row"
         backends_table.zebra_stripes = True
-        backends_table.add_columns("", "Component", "Pinned", "Update")
+        backends_table.add_column("", width=3)
+        backends_table.add_column("Component", width=22)
+        backends_table.add_column("Pinned", width=12)
+        backends_table.add_column("Update", width=34)
 
         if self.backends:
-            builds_table = self.query_one("#builds-table", DataTable)
+            builds_table = self.query_one("#builds-table", SingleClickDataTable)
             builds_table.cursor_type = "row"
             builds_table.zebra_stripes = True
-            builds_table.add_columns("Backend", "Ref", "Status", "Integrity")
+            builds_table.add_column("Backend", width=12)
+            builds_table.add_column("Ref", width=14)
+            builds_table.add_column("Status", width=12)
+            builds_table.add_column("Integrity", width=12)
 
-            history_table = self.query_one("#history-table", DataTable)
+            history_table = self.query_one("#history-table", SingleClickDataTable)
             history_table.zebra_stripes = True
-            history_table.add_columns("Backend", "Timestamp (UTC)", "Outcome", "Detail")
+            history_table.add_column("Backend", width=12)
+            history_table.add_column("Timestamp (UTC)", width=22)
+            history_table.add_column("Outcome", width=16)
+            history_table.add_column("Detail", width=40)
 
         self._refresh_builds_and_history()
         self._refresh_backends_table()
         # Initial check on mount so the panel isn't blank; the button below is for
         # re-checking on demand afterwards — refresh (the 'r' binding) never re-hits it.
-        self._run_update_check()
+        self._run_update_check(notify_result=False)
 
     def on_refresh_requested(self) -> None:
         """Called by the app's global 'r' binding. Re-reads local build state only — never
@@ -342,7 +354,8 @@ class BuildsScreen(Widget):
         ref = self.manifest["llama_cpp"]["ref"]
         message = f"Build/update {', '.join(backends)} at pinned ref {ref}? This can take several minutes."
 
-        confirmed = await self.app.push_screen_wait(ConfirmModal(message, confirm_label="Update", danger=True))
+        # DESIGN.md §5 tier 3: compiles and swaps the backend runtime binary `current` points at.
+        confirmed = await self.confirm(message, confirm_label="Update", mutates_system=True)
         if confirmed:
             self._run_build(backends)
 
@@ -367,9 +380,8 @@ class BuildsScreen(Widget):
             f"already-built, retained prefix — no rebuild, no re-smoke-test."
         )
 
-        confirmed = await self.app.push_screen_wait(
-            ConfirmModal(message, confirm_label="Roll back", danger=True)
-        )
+        # DESIGN.md §5 tier 3: repoints `current` at a different runtime binary.
+        confirmed = await self.confirm(message, confirm_label="Roll back", mutates_system=True)
         if confirmed:
             self._run_rollback(backend, target_ref)
 
@@ -439,11 +451,28 @@ class BuildsScreen(Widget):
     # ------------------------------------------------------------------ upstream version check (network, off main thread)
 
     @work(thread=True)
-    def _run_update_check(self) -> None:
+    def _run_update_check(self, *, notify_result: bool = True) -> None:
+        # DESIGN.md §6: a network check the operator can navigate away from reports its outcome
+        # as a toast, not only in the table cell they may no longer be looking at. The one
+        # exception is the automatic check on mount (notify_result=False) — nobody triggered it.
         self.app.call_from_thread(self._set_checking_status, True)
-        result_cpp = update_check.check_llama_cpp(self.manifest)
-        result_swap = update_check.check_llama_swap(self.manifest)
+        try:
+            result_cpp = update_check.check_llama_cpp(self.manifest)
+            result_swap = update_check.check_llama_swap(self.manifest)
+        except Exception as e:
+            self.app.call_from_thread(self.app.notify, f"version check failed: {e}", severity="error")
+            self.app.call_from_thread(self._set_checking_status, False)
+            return
         self.app.call_from_thread(self._apply_update_check_results, result_cpp, result_swap)
+        if notify_result:
+            if not result_cpp.get("ok") or not result_swap.get("ok"):
+                self.app.call_from_thread(
+                    self.app.notify, "version check completed with errors", severity="warning"
+                )
+            elif result_cpp.get("update_available") or result_swap.get("update_available"):
+                self.app.call_from_thread(self.app.notify, "updates available for upstream components")
+            else:
+                self.app.call_from_thread(self.app.notify, "upstream components are up to date")
         self.app.call_from_thread(self._set_checking_status, False)
 
     def _set_checking_status(self, checking: bool) -> None:

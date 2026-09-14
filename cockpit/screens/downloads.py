@@ -11,13 +11,12 @@ from typing import Any
 from textual import work
 from textual.app import ComposeResult
 from textual.containers import Horizontal, VerticalScroll
-from textual.widget import Widget
 from textual.widgets import Button, DataTable, Label, Static
 
 from provision.common import Runner
 from provision.steps import hf
 
-from cockpit.widgets import ConfirmModal, SingleClickDataTable, selection_marker
+from cockpit.widgets import CockpitScreenBase, ConfirmModal, SingleClickDataTable, selection_marker
 
 STATUS_ICONS = {
     "downloaded": "✅ downloaded",   # ✅
@@ -26,7 +25,7 @@ STATUS_ICONS = {
 }
 
 
-class DownloadsScreen(Widget):
+class DownloadsScreen(CockpitScreenBase):
     """Not a Textual Screen — mounted inside a TabPane by cockpit/app.py.
 
     Judgment call: per-model download buttons are DISABLED (not just left to fail) for
@@ -100,7 +99,11 @@ class DownloadsScreen(Widget):
                 id="empty-models-notice",
                 classes="status-text",
             )
-            table = SingleClickDataTable(id="model-table", zebra_stripes=True, classes="data-table")
+            # fixed_columns=2: column 0 is the tick marker, so keeping the model ID visible
+            # while repo_id/quant_file/status scroll horizontally takes both (DESIGN.md §4.2).
+            table = SingleClickDataTable(
+                id="model-table", zebra_stripes=True, classes="data-table", fixed_columns=2
+            )
             table.cursor_type = "row"
             yield table
             with Horizontal(classes="button-row"):
@@ -109,8 +112,12 @@ class DownloadsScreen(Widget):
             yield Label("", id="download-status", classes="status-text")
 
     def on_mount(self) -> None:
-        table = self.query_one("#model-table", DataTable)
-        table.add_columns("", "ID", "Repo ID", "Quant File", "Status")
+        table = self.query_one("#model-table", SingleClickDataTable)
+        table.add_column("", width=3)
+        table.add_column("ID", width=24)
+        table.add_column("Repo ID", width=36)
+        table.add_column("Quant File", width=26)
+        table.add_column("Status", width=32)
         self._refresh_auth_banner()
         self._refresh_table()
         self._refresh_disk_usage()
@@ -136,7 +143,7 @@ class DownloadsScreen(Widget):
             )
 
     def _refresh_table(self) -> None:
-        table = self.query_one("#model-table", DataTable)
+        table = self.query_one("#model-table", SingleClickDataTable)
         table.clear()
         self._downloadable.clear()
         for model in self.models.get("models", []):

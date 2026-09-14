@@ -17,10 +17,15 @@ from textual import work
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widget import Widget
 from textual.widgets import Button, DataTable, Input, Label, Select, Static, TextArea
 
-from cockpit.widgets import ConfirmModal, SingleClickDataTable, selection_marker
+from cockpit.widgets import (
+    CockpitDataTable,
+    CockpitScreenBase,
+    ConfirmModal,
+    SingleClickDataTable,
+    selection_marker,
+)
 from provision import schema
 from provision.common import Runner
 from provision.steps import swap
@@ -74,7 +79,7 @@ class ConfigPasteModal(ModalScreen[str | None]):
         self.dismiss(None)
 
 
-class DeployScreen(Widget):
+class DeployScreen(CockpitScreenBase):
     """Mounted inside a TabPane by cockpit/app.py — not a Textual Screen."""
 
     # .panel / .button-row / .status-text / .error-text come from cockpit/widgets.py's
@@ -127,7 +132,7 @@ class DeployScreen(Widget):
         with VerticalScroll():
             yield Static("Configure models.yaml and deploy the llama-swap inference routing service", classes="subtitle")
             yield Static("Models (models.yaml)", classes="section-title")
-            yield DataTable(id="models-table", classes="data-table")
+            yield CockpitDataTable(id="models-table", classes="data-table", fixed_columns=1)
             with Horizontal(classes="button-row"):
                 yield Button("Add", id="btn-add", variant="primary", classes="thin-button")
                 yield Button("Edit", id="btn-edit", classes="thin-button")
@@ -145,7 +150,11 @@ class DeployScreen(Widget):
                     "convert any to llama-cpp afterward via Edit if you want that.",
                     classes="subtitle",
                 )
-                table = SingleClickDataTable(id="import-table", zebra_stripes=True, classes="data-table")
+                # fixed_columns=2: column 0 is the tick marker, so the ID stays visible while
+                # the wide cmd column scrolls (DESIGN.md §4.2).
+                table = SingleClickDataTable(
+                    id="import-table", zebra_stripes=True, classes="data-table", fixed_columns=2
+                )
                 table.cursor_type = "row"
                 yield table
                 yield Static("", id="import-error", classes="error-text")
@@ -203,13 +212,17 @@ class DeployScreen(Widget):
                     yield Button("Close preview", id="btn-close-preview", classes="thin-button")
 
     def on_mount(self) -> None:
-        table = self.query_one("#models-table", DataTable)
+        table = self.query_one("#models-table", CockpitDataTable)
         table.cursor_type = "row"
         self.query_one("#preview-text", TextArea).read_only = True
         self.query_one("#edit-form").display = False
         self.query_one("#preview-area").display = False
         self.query_one("#import-review").display = False
-        self.query_one("#import-table", DataTable).add_columns("", "ID", "Engine", "cmd")
+        import_table = self.query_one("#import-table", SingleClickDataTable)
+        import_table.add_column("", width=3)
+        import_table.add_column("ID", width=24)
+        import_table.add_column("Engine", width=12)
+        import_table.add_column("cmd", width=60)
         self._populate_table()
 
     # -- host-profile-derived option lists -------------------------------------
@@ -237,9 +250,14 @@ class DeployScreen(Widget):
     # -- table ------------------------------------------------------------------
 
     def _populate_table(self) -> None:
-        table = self.query_one("#models-table", DataTable)
+        table = self.query_one("#models-table", CockpitDataTable)
         table.clear(columns=True)
-        table.add_columns("ID", "Engine", "GPU", "Backend", "Group", "TTL")
+        table.add_column("ID", width=24)
+        table.add_column("Engine", width=12)
+        table.add_column("GPU", width=10)
+        table.add_column("Backend", width=10)
+        table.add_column("Group", width=12)
+        table.add_column("TTL", width=8)
         for m in self.models["models"]:
             if m["engine"] == "llama-cpp":
                 gpu = m.get("bind", {}).get("gpu", "")
@@ -252,7 +270,7 @@ class DeployScreen(Widget):
             )
 
     def _selected_model_id(self) -> str | None:
-        table = self.query_one("#models-table", DataTable)
+        table = self.query_one("#models-table", CockpitDataTable)
         if table.row_count == 0:
             return None
         try:
@@ -516,7 +534,7 @@ class DeployScreen(Widget):
         self._show_import_review()
 
     def _refresh_import_table(self) -> None:
-        table = self.query_one("#import-table", DataTable)
+        table = self.query_one("#import-table", SingleClickDataTable)
         table.clear()
         for model_id, model in self._import_candidates.items():
             cmd_preview = model["cmd"][:80] + ("…" if len(model["cmd"]) > 80 else "")
@@ -588,9 +606,11 @@ class DeployScreen(Widget):
 
     @work
     async def _confirm_and_apply(self) -> None:
-        message = "Deploy llama-swap service and apply configuration to systemd?"
-        confirmed = await self.app.push_screen_wait(
-            ConfirmModal(message, confirm_label="Deploy", danger=True)
+        # DESIGN.md §5 tier 2: installs units and restarts llama-swap.
+        confirmed = await self.confirm(
+            "Deploy llama-swap service and apply configuration to systemd?",
+            confirm_label="Deploy",
+            mutates_system=True,
         )
         if not confirmed:
             return
@@ -599,15 +619,21 @@ class DeployScreen(Widget):
 
     @work(thread=True)
     def _apply_in_background(self) -> None:
+        # DESIGN.md §6: the inline #status-message is invisible once the operator switches tab
+        # mid-deploy, so every exit path also toasts.
         try:
             swap.run(self.host_profile, self.manifest, self.models, self.runner, self.repo_root)
         except SystemExit as e:
-            self.app.call_from_thread(self._set_status, f"deploy failed: {e.code}")
-            return
+            msg = f"deploy failed: {e.code}"
         except Exception as e:
-            self.app.call_from_thread(self._set_status, f"deploy failed: {e}")
+            msg = f"deploy failed: {e}"
+        else:
+            msg = "deployed configuration and restarted llama-swap"
+            self.app.call_from_thread(self._set_status, msg)
+            self.app.call_from_thread(self.app.notify, msg)
             return
-        self.app.call_from_thread(self._set_status, "deployed configuration and restarted llama-swap")
+        self.app.call_from_thread(self._set_status, msg)
+        self.app.call_from_thread(self.app.notify, msg, severity="error")
 
     # -- button dispatch ------------------------------------------------------------
 

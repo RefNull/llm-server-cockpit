@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import socket
 from pathlib import Path
+from typing import ClassVar
 
 from textual.app import App, ComposeResult
 from textual.containers import Vertical
@@ -24,7 +25,7 @@ from cockpit.screens.deploy import DeployScreen
 from cockpit.screens.downloads import DownloadsScreen
 from cockpit.screens.scripts import ScriptsScreen
 from cockpit.screens.settings import SettingsScreen
-from cockpit.widgets import AMBER_THEME, SHARED_CSS
+from cockpit.widgets import AMBER_THEME, SHARED_CSS, CockpitScreenBase
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -113,6 +114,11 @@ class CockpitApp(App):
         ("q", "quit", "Quit"),
     ]
 
+    # DESIGN.md §2. Textual stamps exactly one of these classes onto the active Screen on every
+    # resize (width < 110 -> Screen.-narrow, >= 110 -> Screen.-wide); the reflow itself lives in
+    # SHARED_CSS / screen DEFAULT_CSS, so no screen implements on_resize geometry by hand.
+    HORIZONTAL_BREAKPOINTS: ClassVar[list[tuple[int, str]]] = [(0, "-narrow"), (110, "-wide")]
+
     def __init__(self, host: str | None = None) -> None:
         super().__init__()
         self.register_theme(AMBER_THEME)
@@ -165,11 +171,11 @@ class CockpitApp(App):
     def action_refresh_all(self) -> None:
         self.reload_models()
         self.reload_scripts()
-        for widget in self.query(
-            "DashboardScreen, BuildsScreen, DeployScreen, DownloadsScreen, ContainersScreen, ScriptsScreen, SettingsScreen"
-        ):
-            if hasattr(widget, "on_refresh_requested"):
-                widget.on_refresh_requested()
+        # Every tab subclasses CockpitScreenBase, which makes on_refresh_requested() abstract —
+        # so this is a type query, not a hand-maintained list of screen names plus a hasattr
+        # guard that silently skipped any tab that forgot to implement it.
+        for screen in self.query(CockpitScreenBase):
+            screen.on_refresh_requested()
 
     def reload_models(self) -> None:
         if self.host_profile is None:

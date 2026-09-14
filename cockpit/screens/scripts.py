@@ -12,19 +12,18 @@ import yaml
 from textual import work
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.widget import Widget
 from textual.widgets import Button, DataTable, Input, Label, Select, Static, Switch, TextArea
 
 from provision import schema
 from provision.common import Runner
 from provision.steps import scripts as scripts_step
 
-from cockpit.widgets import ConfirmModal, SingleClickDataTable, selection_marker
+from cockpit.widgets import CockpitScreenBase, ConfirmModal, SingleClickDataTable, selection_marker
 
 _RESTART_POLICY_OPTIONS = [("on-failure", "on-failure"), ("always", "always"), ("no", "no")]
 
 
-class ScriptsScreen(Widget):
+class ScriptsScreen(CockpitScreenBase):
     """Mounted inside a TabPane by cockpit/app.py — not a Textual Screen.
 
     Two independent selection mechanisms on the one table, matching what each needs: the
@@ -67,7 +66,11 @@ class ScriptsScreen(Widget):
     def compose(self) -> ComposeResult:
         with VerticalScroll():
             yield Static("Ad-hoc Python scripts, supervised via one generated systemd unit each.", classes="subtitle")
-            table = SingleClickDataTable(id="scripts-table", zebra_stripes=True, classes="data-table")
+            # fixed_columns=2: column 0 is the tick marker, so pinning the ID takes both while
+            # the absolute Path and Status columns scroll past 80 cells (DESIGN.md §4.2).
+            table = SingleClickDataTable(
+                id="scripts-table", zebra_stripes=True, classes="data-table", fixed_columns=2
+            )
             table.cursor_type = "row"
             yield table
             with Horizontal(classes="button-row"):
@@ -104,8 +107,11 @@ class ScriptsScreen(Widget):
                     yield Button("Cancel", id="btn-cancel", classes="thin-button")
 
     def on_mount(self) -> None:
-        table = self.query_one("#scripts-table", DataTable)
-        table.add_columns("", "ID", "Path", "Status")
+        table = self.query_one("#scripts-table", SingleClickDataTable)
+        table.add_column("", width=3)
+        table.add_column("ID", width=20)
+        table.add_column("Path", width=40)
+        table.add_column("Status", width=30)
         self.query_one("#edit-form").display = False
         self._refresh_table()
 
@@ -117,6 +123,9 @@ class ScriptsScreen(Widget):
 
     @work(thread=True)
     def _refresh_table(self) -> None:
+        # Passive status read, no completion toast (DESIGN.md §6): per-script systemctl errors
+        # are rendered into the row's own Status cell, and this runs on mount/refresh rather
+        # than on an operator action.
         rows = []
         for script in self.scripts.get("scripts", []):
             try:
@@ -130,7 +139,7 @@ class ScriptsScreen(Widget):
     def _apply_rows(self, rows: list[tuple[dict, str]]) -> None:
         if not self.is_mounted:
             return
-        table = self.query_one("#scripts-table", DataTable)
+        table = self.query_one("#scripts-table", SingleClickDataTable)
         table.clear()
         known_ids = {script["id"] for script, _ in rows}
         self._selected_ids &= known_ids
@@ -212,8 +221,11 @@ class ScriptsScreen(Widget):
         ids = sorted(self._selected_ids)
         if not ids:
             return
-        confirmed = await self.app.push_screen_wait(
-            ConfirmModal(f"{verb.capitalize()} {len(ids)} script(s)?\n{', '.join(ids)}", confirm_label=verb.capitalize(), danger=True)
+        # DESIGN.md §5 tier 2: start/stop/enable/disable all act on generated systemd units.
+        confirmed = await self.confirm(
+            f"{verb.capitalize()} {len(ids)} script(s)?\n{', '.join(ids)}",
+            confirm_label=verb.capitalize(),
+            mutates_system=True,
         )
         if confirmed:
             self._run_bulk(verb, action, ids)

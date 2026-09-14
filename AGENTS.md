@@ -39,6 +39,7 @@ below, never mixed into the routing above.
 3. **Declarative configuration & zero drift**: Upstream component versions and compilation recipes belong in `manifest.yaml`. Deployment configurations belong in `hosts/` and `models.yaml`.
 4. **Secret & environmental hygiene**: Never commit deployment facts, tokens, or private endpoints. `hosts/<hostname>.yaml` and `models.yaml` must remain gitignored; use `hosts/example.yaml` and `models.example.yaml` as templates. Hugging Face tokens are resolved via environment variables and never persisted to disk.
 5. **Character budget**: All harness rule files must adhere to Antigravity's strict `< 12,000` character limit.
+6. **TUI design standards**: Interactive screens (`cockpit/screens/*.py`) must adhere to layout, token, breakpoint, and modal contracts defined in `cockpit/DESIGN.md`.
 
 ### Key Commands
 - **Environment setup**:

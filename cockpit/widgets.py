@@ -15,14 +15,15 @@ defined once below instead of redeclared per screen.
 from __future__ import annotations
 
 import subprocess
-
-from rich.text import Text
+from rich.text import Text, TextType
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.coordinate import Coordinate
 from textual.screen import ModalScreen
 from textual.theme import Theme
+from textual.widget import Widget
 from textual.widgets import Button, DataTable, Static
+from textual.widgets.data_table import CellType, ColumnKey
 
 AMBER_THEME = Theme(
     name="cockpit-amber",
@@ -39,6 +40,12 @@ AMBER_THEME = Theme(
 )
 
 SHARED_CSS = """
+/* Spacing scale (DESIGN.md §1). Cell units, declared once and referenced below and from
+   screen-level DEFAULT_CSS so a spacing change happens here rather than in 7 files. */
+$space-tight: 1;
+$space-normal: 1;
+$space-section: 2;
+
 Header {
     background: #e5a93c;
     color: #000000;
@@ -67,8 +74,8 @@ Tab {
        of the scroll viewport instead of hugging its content, opening large dead gaps between
        panels (most visible once a panel holds little content, e.g. a short DataTable). */
     height: auto;
-    padding: 0 1;
-    margin-bottom: 1;
+    padding: 0 $space-normal;
+    margin-bottom: $space-normal;
 }
 .panel-title {
     text-style: bold;
@@ -113,24 +120,36 @@ Tab {
 }
 .button-row {
     height: auto;
-    margin-top: 1;
-    margin-bottom: 1;
+    margin-top: $space-normal;
+    margin-bottom: $space-normal;
 }
 .button-row Button {
-    margin-right: 2;
+    margin-right: $space-section;
 }
 .status-text {
     color: $text-muted;
-    margin-top: 1;
+    margin-top: $space-tight;
 }
 .error-text {
     color: $error;
-    margin-top: 1;
+    margin-top: $space-tight;
 }
 .data-table {
     height: auto;
     max-height: 15;
-    margin-bottom: 1;
+    margin-bottom: $space-normal;
+}
+
+/* Responsive breakpoint hooks (DESIGN.md §2, §3.5). CockpitApp.HORIZONTAL_BREAKPOINTS makes
+   Textual stamp exactly one of these classes onto the Screen on every resize; layout reflow
+   is expressed here as CSS, never as an on_resize geometry calculation in a screen.
+   Any multi-column Horizontal that must collapse below 110 cells carries .columns-responsive. */
+Screen.-narrow .columns-responsive {
+    layout: vertical;
+    height: auto;
+}
+Screen.-wide .columns-responsive {
+    layout: horizontal;
 }
 """
 
@@ -154,7 +173,39 @@ def selection_marker(selected: bool) -> Text:
     return Text("[x]" if selected else "[ ]", style="bold" if selected else "")
 
 
-class SingleClickDataTable(DataTable):
+class CockpitDataTable(DataTable):
+    """DataTable with the DESIGN.md §4 column contract enforced at the API boundary.
+
+    Textual's DataTable is a ScrollView with `overflow-x: auto`: a column without an explicit
+    width sizes to its content, so one long cell silently pushes later columns off-screen with
+    no visual cue that they exist. Rather than re-auditing every screen for that, `add_column`
+    refuses a call that omits `width=`, and `add_columns` (the plural convenience wrapper,
+    which has no width parameter at all) is refused outright. Failing loudly at construction
+    is the point — this raises during on_mount, not at some later render.
+    """
+
+    def add_column(
+        self,
+        label: TextType,
+        *,
+        width: int | None = None,
+        key: str | None = None,
+        default: CellType | None = None,
+    ) -> ColumnKey:
+        if width is None:
+            raise ValueError(
+                f"DESIGN.md §4: {type(self).__name__}.add_column({label!r}) must pass an explicit width="
+            )
+        return super().add_column(label, width=width, key=key, default=default)
+
+    def add_columns(self, *labels: TextType) -> list[ColumnKey]:
+        raise ValueError(
+            "DESIGN.md §4: add_columns() can't express per-column widths — "
+            "call add_column(label, width=N) once per column instead"
+        )
+
+
+class SingleClickDataTable(CockpitDataTable):
     """A DataTable that selects a row on the first click instead of Textual's default, which
     requires the cursor to already be on a row before a click there counts as a selection (i.e.
     two clicks to select an unvisited row). A tick-able table (Installs backends, Downloads
@@ -273,3 +324,95 @@ class ConfirmModal(ModalScreen[bool]):
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         self.dismiss(event.button.id == "confirm-yes")
+
+
+class CockpitScreenBase(Widget):
+    """Base for every tab widget in cockpit/screens/ — not a Textual Screen (they are mounted
+    inside TabPanes, see cockpit/app.py).
+
+    Two things it makes structural rather than conventional:
+
+    1. `on_refresh_requested()` is abstract. It used to be duck-typed — app.py did
+       `if hasattr(widget, "on_refresh_requested")` — so a new tab that forgot it simply
+       never responded to the global `r` binding, silently. Now the class won't mount.
+       (Textual dispatches `on_mount` to every handler in the MRO, not just the most derived
+       one, so a subclass defining its own `on_mount` does not shadow this check.)
+    2. `confirm(..., mutates_system=True)` collapses the DESIGN.md §5 danger tier into one
+       argument: "this restarts a service / changes host state / is irreversible" is what a
+       call site knows, and the $error styling follows from it rather than being re-decided
+       per call site.
+    """
+
+    def on_mount(self) -> None:
+        if type(self).on_refresh_requested is CockpitScreenBase.on_refresh_requested:
+            raise NotImplementedError(
+                f"{type(self).__name__} must implement on_refresh_requested() "
+                "(DESIGN.md — every tab answers the global 'r' refresh binding)"
+            )
+        scroll_bounded = (
+            isinstance(self, VerticalScroll)
+            or bool(self.query(VerticalScroll))
+            or any(isinstance(ancestor, VerticalScroll) for ancestor in self.ancestors)
+        )
+        if not scroll_bounded:
+            raise RuntimeError(
+                f"DESIGN.md §3: {type(self).__name__} must contain (or sit inside) a VerticalScroll "
+                "so its content scrolls instead of clipping below the 80x24 floor"
+            )
+
+    def on_refresh_requested(self) -> None:
+        """Re-read this tab's state. Called by CockpitApp.action_refresh_all ('r')."""
+        raise NotImplementedError
+
+    async def confirm(
+        self,
+        message: str,
+        *,
+        confirm_label: str = "Confirm",
+        mutates_system: bool = False,
+        danger: bool = False,
+    ) -> bool:
+        """Await a ConfirmModal. `mutates_system=True` forces the DESIGN.md §5 danger tier
+        (host-level state, a service restart, or an irreversible change) — pass it instead of
+        deciding `danger=` independently at each call site."""
+        return bool(
+            await self.app.push_screen_wait(
+                ConfirmModal(message, confirm_label=confirm_label, danger=mutates_system or danger)
+            )
+        )
+
+
+def _self_check() -> None:
+    """`python3 -m cockpit.widgets` — asserts the two DESIGN.md contracts this module exists
+    to enforce still bite. Not a test framework, just the smallest thing that fails if the
+    enforcement is ever quietly weakened."""
+    table = CockpitDataTable()
+    try:
+        table.add_column("no width")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("DESIGN.md §4: add_column() without width= must raise")
+    try:
+        table.add_columns("a", "b")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("DESIGN.md §4: add_columns() must raise")
+    # The positive path (add_column with a width) needs a running App for text measurement —
+    # it's covered by every screen's on_mount instead, not duplicated here.
+
+    class _Forgetful(CockpitScreenBase):
+        pass
+
+    try:
+        _Forgetful().on_mount()
+    except NotImplementedError:
+        pass
+    else:
+        raise AssertionError("a screen without on_refresh_requested() must not mount")
+    print("cockpit.widgets self-check OK")
+
+
+if __name__ == "__main__":
+    _self_check()

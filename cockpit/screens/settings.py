@@ -27,11 +27,9 @@ import yaml
 from textual import work
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.widget import Widget
 from textual.widgets import (
     Button,
     ContentSwitcher,
-    DataTable,
     Input,
     Label,
     Select,
@@ -42,7 +40,13 @@ from textual.widgets import (
     TextArea,
 )
 
-from cockpit.widgets import ConfirmModal, InfoModal, run_shell_capture
+from cockpit.widgets import (
+    CockpitDataTable,
+    CockpitScreenBase,
+    ConfirmModal,
+    InfoModal,
+    run_shell_capture,
+)
 from provision import schema
 from provision.common import Runner
 from provision.steps import drivers, swap, tailscale, wol
@@ -69,7 +73,7 @@ def _default_paths() -> dict[str, str]:
     return {"models_dir": f"{root}/models", "state_dir": f"{root}/state", "prefix_root": f"{root}/builds"}
 
 
-class SettingsScreen(Widget):
+class SettingsScreen(CockpitScreenBase):
     """Mounted inside a TabPane by cockpit/app.py — not a Textual Screen."""
 
     DEFAULT_CSS = """
@@ -183,7 +187,7 @@ class SettingsScreen(Widget):
                 yield Input(id="f-token-env")
 
                 yield Static("GPUs", classes="section-title")
-                yield DataTable(id="gpu-table", zebra_stripes=True, classes="data-table")
+                yield CockpitDataTable(id="gpu-table", zebra_stripes=True, classes="data-table", fixed_columns=1)
                 with Horizontal(classes="button-row"):
                     yield Button("Add GPU", id="btn-add-gpu", variant="primary", classes="thin-button")
                     yield Button("Remove Selected", id="btn-remove-gpu", variant="error", classes="thin-button")
@@ -269,7 +273,7 @@ class SettingsScreen(Widget):
                 with VerticalScroll():
                     with Vertical(classes="panel"):
                         yield Static("GPUs", classes="panel-title")
-                        yield DataTable(id="gpu-table", zebra_stripes=True, classes="data-table")
+                        yield CockpitDataTable(id="gpu-table", zebra_stripes=True, classes="data-table", fixed_columns=1)
                         with Horizontal(classes="button-row"):
                             yield Button("List PCIe devices", id="btn-lspci", classes="thin-button")
 
@@ -310,9 +314,11 @@ class SettingsScreen(Widget):
 
     def on_mount(self) -> None:
         self._populate_profile_form()
-        table = self.query_one("#gpu-table", DataTable)
+        table = self.query_one("#gpu-table", CockpitDataTable)
         table.cursor_type = "row"
-        table.add_columns("GPU ID", "Vendor", "Backends")
+        table.add_column("GPU ID", width=16)
+        table.add_column("Vendor", width=16)
+        table.add_column("Backends", width=30)
 
         if self.host_profile is None:
             self._populate_wizard_gpu_table()
@@ -364,13 +370,13 @@ class SettingsScreen(Widget):
     # -- GPUs DataTable helpers -----------------------------------------------------
 
     def _populate_wizard_gpu_table(self) -> None:
-        table = self.query_one("#gpu-table", DataTable)
+        table = self.query_one("#gpu-table", CockpitDataTable)
         table.clear()
         for gpu in self._pending_gpus:
             table.add_row(gpu["id"], gpu["vendor"], ", ".join(gpu["backends"]), key=gpu["id"])
 
     def _render_gpu_list(self) -> None:
-        table = self.query_one("#gpu-table", DataTable)
+        table = self.query_one("#gpu-table", CockpitDataTable)
         table.clear()
         if self.host_profile and "gpus" in self.host_profile:
             for gpu in self.host_profile["gpus"]:
@@ -422,7 +428,7 @@ class SettingsScreen(Widget):
         if len(self._pending_gpus) <= 1:
             self.query_one("#step-hardware-error", Static).update("At least one GPU is required")
             return
-        table = self.query_one("#gpu-table", DataTable)
+        table = self.query_one("#gpu-table", CockpitDataTable)
         selected_id = None
         if table.row_count > 0 and table.cursor_row is not None and 0 <= table.cursor_row < table.row_count:
             row_data = table.get_row_at(table.cursor_row)
@@ -779,6 +785,9 @@ class SettingsScreen(Widget):
 
     @work(thread=True)
     def _refresh_wol_status(self) -> None:
+        # No toast on completion (DESIGN.md §6): this is a passive status read that renders into
+        # the inline #wol-status label and is triggered by mount/refresh, not by an operator
+        # action — every failure mode is already reported in that label.
         # wol.status() shells out to ip/ethtool/systemctl (see provision/steps/wol.py) — off
         # the main thread like every other status/apply call in this file, so a slow or hung
         # command can't freeze the whole TUI.
@@ -808,7 +817,8 @@ class SettingsScreen(Widget):
             "Check / enable Wake-on-LAN? (may change NIC wake flags, "
             "TLP/NetworkManager config, and enable a systemd persistence unit)"
         )
-        confirmed = await self.app.push_screen_wait(ConfirmModal(message, confirm_label="Check / Enable"))
+        # DESIGN.md §5 tier 1+2: NIC wake flags, TLP/NetworkManager config, a systemd unit.
+        confirmed = await self.confirm(message, confirm_label="Check / Enable", mutates_system=True)
         if not confirmed:
             return
         self.query_one("#wol-status", Static).update("checking...")
@@ -831,6 +841,7 @@ class SettingsScreen(Widget):
 
     @work(thread=True)
     def _refresh_tailscale_status(self) -> None:
+        # Passive status read, no toast — see _refresh_wol_status (DESIGN.md §6).
         if self.host_profile is None:
             return
         try:
@@ -857,7 +868,9 @@ class SettingsScreen(Widget):
             "in, this suspends the TUI and hands you an interactive `tailscale up` login "
             "prompt in the real terminal — complete it there, then you'll return here."
         )
-        confirmed = await self.app.push_screen_wait(ConfirmModal(message, confirm_label="Check / Enable"))
+        # DESIGN.md §5 tier 1: installs a system package if missing and joins the host to a
+        # tailnet — host-level state, not a declarative preview file.
+        confirmed = await self.confirm(message, confirm_label="Check / Enable", mutates_system=True)
         if not confirmed:
             return
         self.query_one("#tailscale-status", Static).update("checking...")
@@ -953,7 +966,8 @@ class SettingsScreen(Widget):
             "Apply service/update-check settings? (writes hosts/<hostname>.yaml and may "
             "restart llama-swap and (re)install/remove systemd timers)"
         )
-        confirmed = await self.app.push_screen_wait(ConfirmModal(message, confirm_label="Apply"))
+        # DESIGN.md §5 tier 2: restarts llama-swap and (re)installs/removes systemd timers.
+        confirmed = await self.confirm(message, confirm_label="Apply", mutates_system=True)
         if not confirmed:
             return
 
@@ -967,17 +981,23 @@ class SettingsScreen(Widget):
 
     @work(thread=True)
     def _apply_service_in_background(self, profile: dict) -> None:
+        # DESIGN.md §6: #service-status is on a Settings sub-tab the operator may well have
+        # navigated away from while systemd is restarting, so toast every outcome too.
         try:
             swap.run(profile, self.manifest, self.models, self.runner, self.repo_root)
             swap.sync_scheduled_restart(profile, self.repo_root, self.runner)
             swap.sync_update_check_timer(profile, self.repo_root, self.runner)
         except SystemExit as e:
-            self.app.call_from_thread(self._set_service_status, f"apply failed: {e.code}")
-            return
+            msg = f"apply failed: {e.code}"
         except Exception as e:
-            self.app.call_from_thread(self._set_service_status, f"apply failed: {e}")
+            msg = f"apply failed: {e}"
+        else:
+            msg = "service settings applied"
+            self.app.call_from_thread(self._set_service_status, msg)
+            self.app.call_from_thread(self.app.notify, msg)
             return
-        self.app.call_from_thread(self._set_service_status, "service settings applied")
+        self.app.call_from_thread(self._set_service_status, msg)
+        self.app.call_from_thread(self.app.notify, msg, severity="error")
 
     # -- button dispatch ------------------------------------------------------------
 
