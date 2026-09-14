@@ -73,6 +73,17 @@ class DashboardScreen(CockpitScreenBase):
     DashboardScreen .service-line {
         margin-top: 0;
     }
+    /* Bar defaults to width: 32 (textual/widgets/_progress_bar.py) — 1fr makes it fill the
+       row so PercentageStatus (width 5, right-aligned) sits immediately against its right
+       edge instead of floating in the middle of the row (DESIGN.md — Phase 6's "values feel
+       disconnected from the bars" fix; composition per _progress_bar.py:293-302). */
+    DashboardScreen .res-row Bar {
+        width: 1fr;
+    }
+    DashboardScreen .gpu-unavailable {
+        color: $text-muted;
+        margin-bottom: $space-normal;
+    }
     """
 
     def __init__(
@@ -93,6 +104,17 @@ class DashboardScreen(CockpitScreenBase):
         self.cockpit_app = app_ref
         self.scripts = getattr(app_ref, "scripts", {"scripts": []})
         self.backends = self._compute_backends()
+        # Static at construction time (host_profile is declarative, no hardware probe): one
+        # slot per configured GPU, ordinal position within its own vendor — metrics.read_gpus()
+        # has no shared identifier with a hosts/*.yaml gpu entry (metrics.py module docstring),
+        # so a live reading is matched back to a slot by (vendor, ordinal) at apply time.
+        self._gpu_slots: list[dict] = []
+        seen_idx: dict[str, int] = {}
+        for gpu in self.host_profile.get("gpus", []):
+            vendor = gpu.get("vendor", "")
+            idx = seen_idx.get(vendor, 0)
+            seen_idx[vendor] = idx + 1
+            self._gpu_slots.append({"id": gpu.get("id", vendor), "vendor": vendor, "vendor_idx": idx})
 
     def _compute_backends(self) -> list[str]:
         seen: list[str] = []
@@ -102,6 +124,34 @@ class DashboardScreen(CockpitScreenBase):
                     seen.append(backend)
         return seen
 
+    def _compose_gpu_slot(self, i: int, slot: dict) -> ComposeResult:
+        """One dashboard section per configured GPU (decision 0d.4): never a 0% bar for a stat
+        that isn't real. Intel's utilization_pct is always None (xpu-smi 2.1.0 doesn't report
+        it — metrics.py module docstring) and AMD has zero telemetry at all (metrics.read_gpus()
+        is nvidia+intel only) — both known statically, so those gaps are composed as plain text
+        up front rather than decided later from a live reading. A configured nvidia/intel GPU
+        that the live tool doesn't currently see is the one gap that can't be known until the
+        one-shot sample comes back — res-gpu-{i}-*-unavail rows exist for that and start hidden.
+        """
+        vendor = slot["vendor"]
+        yield Static(f"GPU {i}: {slot['id']} ({vendor})", classes="section-title")
+        if vendor == "amd":
+            yield Static("no AMD telemetry", id=f"res-gpu-{i}-unavail", classes="gpu-unavailable")
+            return
+        if vendor == "nvidia":
+            with Horizontal(classes="res-row", id=f"res-gpu-{i}-util-row"):
+                yield Static("Util", classes="res-label")
+                yield ProgressBar(total=100, show_eta=False, id=f"res-gpu-{i}-util-bar")
+                yield Static("", id=f"res-gpu-{i}-util-extra", classes="res-val")
+            yield Static("", id=f"res-gpu-{i}-util-unavail", classes="gpu-unavailable")
+        else:  # intel — utilization_pct is always None, never composed as a bar
+            yield Static("Util: not reported by xpu-smi", classes="gpu-unavailable")
+        with Horizontal(classes="res-row", id=f"res-gpu-{i}-mem-row"):
+            yield Static("Mem", classes="res-label")
+            yield ProgressBar(total=100, show_eta=False, id=f"res-gpu-{i}-mem-bar")
+            yield Static("", id=f"res-gpu-{i}-mem-text", classes="res-val")
+        yield Static("", id=f"res-gpu-{i}-mem-unavail", classes="gpu-unavailable")
+
     def compose(self) -> ComposeResult:
         with VerticalScroll():
             with Horizontal(id="dashboard-columns", classes="columns-responsive"):
@@ -109,25 +159,15 @@ class DashboardScreen(CockpitScreenBase):
                     yield Static("Hardware & Resources", classes="panel-title")
                     with Horizontal(classes="res-row"):
                         yield Static("CPU", classes="res-label")
-                        yield ProgressBar(total=100, show_bar=True, show_percentage=False, show_eta=False, id="res-cpu-bar")
-                        yield Static("", id="res-cpu-text", classes="res-val")
+                        yield ProgressBar(total=100, show_eta=False, id="res-cpu-bar")
                     with Horizontal(classes="res-row"):
                         yield Static("RAM", classes="res-label")
-                        yield ProgressBar(total=100, show_bar=True, show_percentage=False, show_eta=False, id="res-mem-bar")
+                        yield ProgressBar(total=100, show_eta=False, id="res-mem-bar")
                         yield Static("", id="res-mem-text", classes="res-val")
-                    with Horizontal(classes="res-row"):
-                        yield Static("DISK", classes="res-label")
-                        yield ProgressBar(total=100, show_bar=True, show_percentage=False, show_eta=False, id="res-disk-bar")
-                        yield Static("", id="res-disk-text", classes="res-val")
-                    with Horizontal(classes="res-row"):
-                        yield Static("GPU", classes="res-label")
-                        yield ProgressBar(total=100, show_bar=True, show_percentage=False, show_eta=False, id="res-gpu-bar")
-                        yield Static("", id="res-gpu-text", classes="res-val")
-                    with Horizontal(classes="res-row"):
-                        yield Static("VRAM", classes="res-label")
-                        yield ProgressBar(total=100, show_bar=True, show_percentage=False, show_eta=False, id="res-vram-bar")
-                        yield Static("", id="res-vram-text", classes="res-val")
                     yield Static("", id="db-hardware", classes="hardware-meta")
+
+                    for i, slot in enumerate(self._gpu_slots):
+                        yield from self._compose_gpu_slot(i, slot)
 
                 with Vertical(id="dashboard-right", classes="panel"):
                     yield Static("Stack & Services", classes="panel-title")
@@ -197,17 +237,19 @@ class DashboardScreen(CockpitScreenBase):
             mem = {"used_bytes": 0, "total_bytes": 0, "percent": 0.0}
 
         try:
-            disk_path = self.host_profile.get("paths", {}).get("models_dir")
-            disk = metrics.read_disk(disk_path) if disk_path else None
-        except Exception:
-            disk = None
-
-        try:
             gpus = metrics.read_gpus()
         except Exception:
             gpus = []
 
-        return {"cpu_pct": cpu_pct, "mem": mem, "disk": disk, "gpus": gpus}
+        return {"cpu_pct": cpu_pct, "mem": mem, "gpus": gpus}
+
+    def _match_live_gpu(self, slot: dict, live_gpus: list[dict]) -> dict | None:
+        """Pair a configured GPU slot with its live reading by (vendor, ordinal position) —
+        metrics.py's module docstring: there's no shared identifier between a hosts/*.yaml gpu
+        entry and an nvidia-smi/xpu-smi device index."""
+        matches = [g for g in live_gpus if g.get("vendor") == slot["vendor"]]
+        idx = slot["vendor_idx"]
+        return matches[idx] if idx < len(matches) else None
 
     def _apply_metrics(self, data: dict) -> None:
         if not self.is_mounted:
@@ -215,15 +257,11 @@ class DashboardScreen(CockpitScreenBase):
 
         # CPU
         cpu_pct = data.get("cpu_pct", 0.0)
-        cpu_bar = self.query_one("#res-cpu-bar", ProgressBar)
-        cpu_bar.progress = cpu_pct
-        self.query_one("#res-cpu-text", Static).update(f"{cpu_pct:.1f}%")
+        self.query_one("#res-cpu-bar", ProgressBar).update(progress=cpu_pct)
 
         # RAM
         mem = data.get("mem", {"percent": 0.0, "used_bytes": 0, "total_bytes": 0})
-        mem_pct = mem.get("percent", 0.0)
-        mem_bar = self.query_one("#res-mem-bar", ProgressBar)
-        mem_bar.progress = mem_pct
+        self.query_one("#res-mem-bar", ProgressBar).update(progress=mem.get("percent", 0.0))
         if mem.get("total_bytes"):
             self.query_one("#res-mem-text", Static).update(
                 f"{_fmt_gb(mem['used_bytes'])} / {_fmt_gb(mem['total_bytes'])}"
@@ -231,54 +269,56 @@ class DashboardScreen(CockpitScreenBase):
         else:
             self.query_one("#res-mem-text", Static).update("n/a")
 
-        # DISK
-        disk = data.get("disk")
-        disk_bar = self.query_one("#res-disk-bar", ProgressBar)
-        disk_text = self.query_one("#res-disk-text", Static)
-        if disk is None:
-            disk_bar.progress = 0
-            disk_text.update("models_dir not configured")
-        elif not disk.get("exists"):
-            disk_bar.progress = 0
-            disk_text.update("models_dir not found")
-        else:
-            disk_bar.progress = disk.get("percent", 0.0)
-            disk_text.update(
-                f"{_fmt_gb(disk['used_bytes'])} / {_fmt_gb(disk['total_bytes'])}"
-            )
+        # GPU — one section per configured slot (decision 0d.4: mark gaps explicitly, never a
+        # 0% bar for a stat that isn't real).
+        live_gpus = data.get("gpus", [])
+        for i, slot in enumerate(self._gpu_slots):
+            if slot["vendor"] == "amd":
+                continue  # static text only, composed once — nothing to update
+            live = self._match_live_gpu(slot, live_gpus)
 
-        # GPU Util & VRAM
-        gpus = data.get("gpus", [])
-        gpu_bar = self.query_one("#res-gpu-bar", ProgressBar)
-        gpu_text = self.query_one("#res-gpu-text", Static)
-        vram_bar = self.query_one("#res-vram-bar", ProgressBar)
-        vram_text = self.query_one("#res-vram-text", Static)
+            if slot["vendor"] == "nvidia":
+                util_row = self.query_one(f"#res-gpu-{i}-util-row", Horizontal)
+                util_unavail = self.query_one(f"#res-gpu-{i}-util-unavail", Static)
+                util = live.get("utilization_pct") if live else None
+                if live is None:
+                    util_row.display = False
+                    util_unavail.update("not detected")
+                    util_unavail.display = True
+                elif util is None:
+                    util_row.display = False
+                    util_unavail.update("n/a")
+                    util_unavail.display = True
+                else:
+                    util_row.display = True
+                    util_unavail.display = False
+                    self.query_one(f"#res-gpu-{i}-util-bar", ProgressBar).update(progress=util)
+                    power = live.get("power_w")
+                    self.query_one(f"#res-gpu-{i}-util-extra", Static).update(
+                        f"({power:.0f}W)" if power is not None else ""
+                    )
 
-        if not gpus:
-            gpu_bar.progress = 0
-            gpu_text.update("not detected")
-            vram_bar.progress = 0
-            vram_text.update("not detected")
-        else:
-            primary = gpus[0]
-            util = primary.get("utilization_pct")
-            if util is not None:
-                gpu_bar.progress = util
-                power = f" ({primary['power_w']:.0f}W)" if primary.get("power_w") is not None else ""
-                gpu_text.update(f"{util:.0f}%{power}")
+            mem_row = self.query_one(f"#res-gpu-{i}-mem-row", Horizontal)
+            mem_unavail = self.query_one(f"#res-gpu-{i}-mem-unavail", Static)
+            mem_total = live.get("memory_total_mb") if live else None
+            if live is None:
+                mem_row.display = False
+                mem_unavail.update("not detected")
+                mem_unavail.display = True
+            elif not mem_total:
+                mem_row.display = False
+                mem_unavail.update("n/a")
+                mem_unavail.display = True
             else:
-                gpu_bar.progress = 0
-                gpu_text.update("n/a (xpu-smi)" if primary.get("vendor") == "intel" else "n/a")
-
-            mem_used = sum(g.get("memory_used_mb") or 0.0 for g in gpus)
-            mem_total = sum(g.get("memory_total_mb") or 0.0 for g in gpus)
-            if mem_total > 0:
-                vram_pct = 100.0 * mem_used / mem_total
-                vram_bar.progress = vram_pct
-                vram_text.update(f"{_fmt_mb(mem_used)} / {_fmt_mb(mem_total)}")
-            else:
-                vram_bar.progress = 0
-                vram_text.update("n/a")
+                mem_row.display = True
+                mem_unavail.display = False
+                mem_used = live.get("memory_used_mb") or 0.0
+                self.query_one(f"#res-gpu-{i}-mem-bar", ProgressBar).update(
+                    progress=100.0 * mem_used / mem_total
+                )
+                self.query_one(f"#res-gpu-{i}-mem-text", Static).update(
+                    f"{_fmt_mb(mem_used)} / {_fmt_mb(mem_total)}"
+                )
 
     # ------------------------------------------------------------------ Panel text computation
 
