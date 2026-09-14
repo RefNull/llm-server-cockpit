@@ -14,10 +14,12 @@ from textual.app import ComposeResult
 from textual.containers import Horizontal, VerticalScroll
 from textual.widgets import Button, DataTable, Label, Static
 
+from rich.text import Text
+
 from provision.common import Runner
 from provision.steps import docker
 
-from cockpit.widgets import CockpitScreenBase, InfoModal, SingleClickDataTable
+from cockpit.widgets import CockpitScreenBase, InfoModal, SingleClickDataTable, TableAction
 
 
 class ContainersScreen(CockpitScreenBase):
@@ -84,9 +86,7 @@ class ContainersScreen(CockpitScreenBase):
             table.cursor_type = "row"
             yield table
             with Horizontal(classes="action-row-primary"):
-                yield Button("Restart selected", id="btn-restart-selected", variant="warning", classes="thin-button")
                 yield Button("Restart all", id="btn-restart-all", variant="error", classes="thin-button")
-            with Horizontal(classes="action-row-secondary"):
                 yield Button("View Logs", id="btn-view-logs", classes="thin-button")
             yield Label("", id="docker-status", classes="status-text")
 
@@ -97,6 +97,9 @@ class ContainersScreen(CockpitScreenBase):
         table.add_column("Status", width=22)
         table.add_column("Ports", width=24)
         table.add_column("Compose", width=9)
+        # Not destructive (that's $error-styled, reserved for Remove/Delete, DESIGN.md §9) —
+        # restarting a container is tier 2 (mutates_system), confirmed, but reversible.
+        table.add_action_column(TableAction("restart", "Restart", confirm="Restart {row}?"))
         self._refresh_table()
 
     def on_refresh_requested(self) -> None:
@@ -133,7 +136,18 @@ class ContainersScreen(CockpitScreenBase):
         table.clear()
         for c in containers:
             compose_label = "yes" if c.get("compose_files") else "—"
-            table.add_row(c["name"], c["image"], c["status"], c["ports"] or "", compose_label, key=c["name"])
+            # rich.text.Text, not raw str (DESIGN.md §4.6 / Phase 0a.6): the app console has
+            # markup=True, so a raw port mapping like "[::]:8080->8080/tcp" gets parsed as a
+            # Rich tag and silently eaten instead of rendered.
+            table.add_row(
+                Text(c["name"]),
+                Text(c["image"]),
+                Text(c["status"]),
+                Text(c["ports"] or ""),
+                Text(compose_label),
+                *table.action_cells(c["name"]),
+                key=c["name"],
+            )
 
         if self._selected_name not in self._containers:
             self._selected_name = None
@@ -144,7 +158,6 @@ class ContainersScreen(CockpitScreenBase):
         has_selection = container is not None
 
         self.query_one("#btn-view-logs", Button).disabled = not has_selection
-        self.query_one("#btn-restart-selected", Button).disabled = not has_selection
         self.query_one("#btn-restart-all", Button).disabled = not self._containers
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
@@ -161,10 +174,12 @@ class ContainersScreen(CockpitScreenBase):
         button_id = event.button.id or ""
         if button_id == "btn-view-logs":
             self._view_logs()
-        elif button_id == "btn-restart-selected":
-            await self._handle_restart_press()
         elif button_id == "btn-restart-all":
             await self._handle_restart_all_press()
+
+    async def handle_table_action(self, action_id: str, row_key: str, table) -> None:
+        if action_id == "restart":
+            self._run_restart(row_key)
 
     # ------------------------------------------------------------------ view compose / logs (off main thread)
 
@@ -208,17 +223,6 @@ class ContainersScreen(CockpitScreenBase):
             subprocess.run(["docker", "exec", "-it", name, "sh"])
 
     # ------------------------------------------------------------------ restart (blocking, off main thread)
-
-    async def _handle_restart_press(self) -> None:
-        name = self._selected_name
-        if name is None:
-            return
-        # DESIGN.md §5 tier 2: restarts a running background service on the host.
-        confirmed = await self.confirm(
-            f"Restart container {name!r}?", confirm_label="Restart", mutates_system=True
-        )
-        if confirmed:
-            self._run_restart(name)
 
     @work(thread=True)
     def _run_restart(self, name: str) -> None:

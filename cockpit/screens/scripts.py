@@ -19,7 +19,7 @@ from provision import schema
 from provision.common import Runner
 from provision.steps import scripts as scripts_step
 
-from cockpit.widgets import CockpitScreenBase, ConfirmModal, SingleClickDataTable, selection_marker
+from cockpit.widgets import CockpitScreenBase, ConfirmModal, SingleClickDataTable, TableAction, selection_marker
 
 _RESTART_POLICY_OPTIONS = [("on-failure", "on-failure"), ("always", "always"), ("no", "no")]
 
@@ -262,7 +262,6 @@ class ScriptsScreen(CockpitScreenBase):
                 yield Button("Stop selected", id="btn-stop-selected", variant="warning", classes="thin-button")
                 yield Button("Enable", id="btn-enable-selected", classes="thin-button")
                 yield Button("Disable", id="btn-disable-selected", classes="thin-button")
-            with Horizontal(classes="action-row-secondary"):
                 yield Button("New Script", id="btn-new-script", classes="thin-button")
                 yield Button("Remove selected", id="btn-remove-selected", variant="error", classes="thin-button")
             yield Static("", id="status-message", classes="status-text")
@@ -273,6 +272,12 @@ class ScriptsScreen(CockpitScreenBase):
         table.add_column("ID", width=20)
         table.add_column("Path", width=40)
         table.add_column("Status", width=30)
+        # Edit already existed as a keybinding ('e') with no clickable affordance — exposing it
+        # as a per-row action column makes it discoverable without a mouse-only regression.
+        table.add_action_column(TableAction("edit", "Edit"))
+        table.add_action_column(
+            TableAction("remove", "Remove", destructive=True, confirm="Remove script {row} from scripts.yaml?")
+        )
         self._refresh_table()
 
     def on_refresh_requested(self) -> None:
@@ -312,6 +317,7 @@ class ScriptsScreen(CockpitScreenBase):
                 sid,
                 script["path"],
                 status_text,
+                *table.action_cells(sid),
                 key=sid,
             )
         if self._cursor_script_id is None and table.row_count > 0:
@@ -323,12 +329,11 @@ class ScriptsScreen(CockpitScreenBase):
 
     def _sync_button_state(self) -> None:
         has_ticked = bool(self._selected_ids)
-        has_cursor = self._cursor_script_id is not None
         self.query_one("#btn-start-selected", Button).disabled = not has_ticked
         self.query_one("#btn-stop-selected", Button).disabled = not has_ticked
         self.query_one("#btn-enable-selected", Button).disabled = not has_ticked
         self.query_one("#btn-disable-selected", Button).disabled = not has_ticked
-        self.query_one("#btn-remove-selected", Button).disabled = not (has_ticked or has_cursor)
+        self.query_one("#btn-remove-selected", Button).disabled = not has_ticked
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
         if event.data_table.id != "scripts-table":
@@ -395,6 +400,17 @@ class ScriptsScreen(CockpitScreenBase):
         else:
             self._set_status("select a script row first")
 
+    # ------------------------------------------------------------------ per-row table actions
+
+    async def handle_table_action(self, action_id: str, row_key: str, table) -> None:
+        if action_id == "edit":
+            self._open_modal_for_edit(row_key)
+        elif action_id == "remove":
+            # Already confirmed (TableAction(destructive=True)) — unlike the bulk "Remove
+            # selected" button below, which still confirms itself via ConfirmModal since it
+            # names every ticked id in the prompt.
+            await self._remove_ids([row_key])
+
     # ------------------------------------------------------------------ button dispatch
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -444,9 +460,11 @@ class ScriptsScreen(CockpitScreenBase):
 
     @work
     async def _confirm_and_remove_selected(self) -> None:
-        ids_to_remove = sorted(self._selected_ids) if self._selected_ids else ([self._cursor_script_id] if self._cursor_script_id else [])
+        # Tick-based only (no cursor fallback) — the single-row case now has its own per-row
+        # Remove action column, already confirmed there; this button is for genuine multi-delete.
+        ids_to_remove = sorted(self._selected_ids)
         if not ids_to_remove:
-            self._set_status("select a script row first")
+            self._set_status("tick at least one script row first")
             return
 
         confirmed = await self.app.push_screen_wait(
@@ -459,7 +477,9 @@ class ScriptsScreen(CockpitScreenBase):
         )
         if not confirmed:
             return
+        await self._remove_ids(ids_to_remove)
 
+    async def _remove_ids(self, ids_to_remove: list[str]) -> None:
         remove_set = set(ids_to_remove)
         new_list = [s for s in self.scripts.get("scripts", []) if s["id"] not in remove_set]
         candidate = {"scripts": new_list}
