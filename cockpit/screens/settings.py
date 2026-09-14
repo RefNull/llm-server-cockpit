@@ -93,20 +93,15 @@ class SettingsScreen(CockpitScreenBase):
     SettingsScreen Label {
         margin-top: 1;
     }
+    SettingsScreen .action-row-primary Button {
+        margin-right: 1;
+    }
     SettingsScreen .hint {
         color: $text-muted;
         margin-bottom: 1;
     }
     SettingsScreen #vpn-resolve-preview {
         color: $text-muted;
-    }
-    SettingsScreen .switch-row {
-        height: auto;
-        margin-top: 1;
-    }
-    SettingsScreen .switch-row Label {
-        margin-top: 1;
-        margin-left: 1;
     }
     SettingsScreen .data-table {
         margin-top: 1;
@@ -158,7 +153,7 @@ class SettingsScreen(CockpitScreenBase):
     def _compose_wizard(self) -> ComposeResult:
         with ContentSwitcher(initial="step-identity", id="wizard-switcher"):
             with VerticalScroll(id="step-identity"):
-                yield Static("Step 1 of 3: Host Identity & Directory Paths", classes="subtitle")
+                yield Static("Step 1 of 3: Host Identity & Directory Paths", classes="panel-title")
                 yield Label("Hostname")
                 yield Input(id="f-hostname")
                 yield Label("Builds to keep")
@@ -174,7 +169,7 @@ class SettingsScreen(CockpitScreenBase):
                     yield Button("Next: Hardware & Network →", id="btn-next-hardware", variant="primary", classes="thin-button")
 
             with VerticalScroll(id="step-hardware"):
-                yield Static("Step 2 of 3: Network Bind & GPU Acceleration", classes="subtitle")
+                yield Static("Step 2 of 3: Network Bind & GPU Acceleration", classes="panel-title")
                 yield Static("Network bind", classes="section-title")
                 yield Label("VPN interface (not an IP)")
                 with Horizontal(classes="inline-row"):
@@ -212,7 +207,7 @@ class SettingsScreen(CockpitScreenBase):
                     yield Button("Next: Review & Deploy →", id="btn-next-review", variant="primary", classes="thin-button")
 
             with VerticalScroll(id="step-review"):
-                yield Static("Step 3 of 3: Review Host Configuration & Deploy", classes="subtitle")
+                yield Static("Step 3 of 3: Review Host Configuration & Deploy", classes="panel-title")
                 yield TextArea(id="review-yaml", language="yaml", read_only=True)
                 yield Static("", id="step-review-error", classes="error-text")
                 yield Static("", id="step-review-status", classes="status-text")
@@ -222,95 +217,108 @@ class SettingsScreen(CockpitScreenBase):
                     yield Button("Deploy Host Profile", id="btn-real-deploy", variant="primary", classes="thin-button")
 
     def _compose_normal(self) -> ComposeResult:
-        yield Static("Host hardware profile, GPU topology, and system services", classes="subtitle")
-        with TabbedContent(initial="settings-host", id="settings-tabs"):
-            with TabPane("Host", id="settings-host"):
+        with TabbedContent(initial="settings-tab-host", id="settings-tabs"):
+            with TabPane("Host Profile", id="settings-tab-host"):
                 with VerticalScroll():
                     with Vertical(classes="panel"):
-                        yield Static("Host identity", classes="panel-title")
-                        yield Label("Hostname")
-                        yield Input(id="f-hostname")
-                        yield Label("Builds to keep")
-                        yield Input(id="f-retain")
-                        yield Label("HF token env var")
-                        yield Input(id="f-token-env")
+                        yield Static("Host Identity & Network", classes="panel-title")
+                        with Horizontal(classes="form-row"):
+                            yield Static("Host Name", classes="form-label")
+                            yield Input(id="f-hostname", classes="form-field")
+                        with Horizontal(classes="form-row"):
+                            yield Static("VPN Interface", classes="form-label")
+                            yield Input(id="f-vpn-interface", placeholder="e.g. tailscale0, wg0", classes="form-field")
+                            yield Button("ip a", id="btn-ip-a", classes="thin-button")
+                        with Horizontal(classes="form-row"):
+                            yield Static("VPN Resolution", classes="form-label")
+                            yield Static("", id="vpn-resolve-preview", classes="form-field")
+                        with Horizontal(classes="form-row"):
+                            yield Static("Gateway Port", classes="form-label")
+                            yield Input(id="f-port", classes="form-field")
+                        with Horizontal(classes="form-row"):
+                            yield Static("Health Timeout (s)", classes="form-label")
+                            yield Input(id="f-gw-timeout", placeholder="optional (seconds)", classes="form-field")
+                        with Horizontal(classes="form-row"):
+                            yield Static("Builds to Keep", classes="form-label")
+                            yield Input(id="f-retain", classes="form-field")
+                        with Horizontal(classes="form-row"):
+                            yield Static("HF Token Env Var", classes="form-label")
+                            yield Input(id="f-token-env", classes="form-field")
 
                     with Vertical(classes="panel"):
-                        yield Static("Paths", classes="panel-title")
-                        yield Label("Model files folder")
-                        yield Input(id="f-models-dir")
-                        yield Label("App state folder")
-                        yield Input(id="f-state-dir")
-                        yield Label("Build output folder")
-                        yield Input(id="f-prefix-root")
+                        yield Static("Storage Paths", classes="panel-title")
+                        with Horizontal(classes="form-row"):
+                            yield Static("Models Directory", classes="form-label")
+                            yield Input(id="f-models-dir", classes="form-field")
+                        with Horizontal(classes="form-row"):
+                            yield Static("State Directory", classes="form-label")
+                            yield Input(id="f-state-dir", classes="form-field")
+                        with Horizontal(classes="form-row"):
+                            yield Static("Builds Directory", classes="form-label")
+                            yield Input(id="f-prefix-root", classes="form-field")
 
                     yield Static("", id="profile-error", classes="error-text")
-                    with Horizontal(classes="button-row"):
-                        yield Button("Save host profile", id="btn-save-profile", variant="primary", classes="thin-button")
+                    with Horizontal(classes="action-row-primary"):
+                        yield Button("Save Profile", id="btn-save-profile", variant="primary")
+                        yield Button("Deploy", id="btn-deploy-profile")
                     yield Static("", id="profile-status", classes="status-text")
 
-            with TabPane("Networking", id="settings-networking"):
+            with TabPane("GPU Topology", id="settings-tab-gpus"):
                 with VerticalScroll():
                     with Vertical(classes="panel"):
-                        yield Static("Network bind", classes="panel-title")
-                        yield Label("VPN interface (not an IP)")
-                        with Horizontal(classes="inline-row"):
-                            yield Input(id="f-vpn-interface", placeholder="e.g. tailscale0, wg0")
-                            yield Button("ip a", id="btn-ip-a", classes="thin-button")
-                        yield Static("", id="vpn-resolve-preview")
-                        yield Label("Gateway port")
-                        yield Input(id="f-port")
-                        yield Label("Health check timeout (opt.)")
-                        yield Input(id="f-gw-timeout")
-
-                    with Vertical(classes="panel"):
-                        yield Static("Tailscale", classes="panel-title")
-                        yield Static("not checked yet", id="tailscale-status", classes="status-text")
-                        with Horizontal(classes="button-row"):
-                            yield Button("Check / Enable Tailscale", id="btn-tailscale-check", classes="thin-button")
-
-            with TabPane("Hardware", id="settings-hardware"):
-                with VerticalScroll():
-                    with Vertical(classes="panel"):
-                        yield Static("GPUs", classes="panel-title")
+                        yield Static("Configured Accelerators", classes="panel-title")
                         yield CockpitDataTable(id="gpu-table", zebra_stripes=True, classes="data-table", fixed_columns=1)
-                        with Horizontal(classes="button-row"):
-                            yield Button("List PCIe devices", id="btn-lspci", classes="thin-button")
+                        with Horizontal(classes="form-row"):
+                            yield Static("Driver Status", classes="form-label")
+                            yield Static("not checked yet", id="drivers-status", classes="form-field status-text")
+                    with Horizontal(classes="action-row-primary"):
+                        yield Button("Check Drivers", id="btn-check-drivers")
+                        yield Button("List PCIe Devices", id="btn-lspci")
 
-                    with Vertical(classes="panel"):
-                        yield Static("GPU driver lockfile", classes="panel-title")
-                        yield Static("not checked yet", id="drivers-status", classes="status-text")
-                        with Horizontal(classes="button-row"):
-                            yield Button("Check drivers", id="btn-drivers-check", classes="thin-button")
-
-            with TabPane("Services", id="settings-services"):
+            with TabPane("System Services", id="settings-tab-services"):
                 with VerticalScroll():
                     with Vertical(classes="panel"):
-                        yield Static("Wake-on-LAN", classes="panel-title")
-                        yield Static("not checked yet", id="wol-status", classes="status-text")
-                        with Horizontal(classes="button-row"):
-                            yield Button("Check / Enable WOL", id="btn-wol-check", classes="thin-button")
+                        yield Static("Inference & Supervision", classes="panel-title")
+                        with Horizontal(classes="form-row"):
+                            yield Static("Restart Policy", classes="form-label")
+                            yield Select(_RESTART_POLICY_OPTIONS, id="f-restart-policy", allow_blank=False, value="on-failure", classes="form-field")
+                        with Horizontal(classes="form-row"):
+                            yield Static("Restart Delay (s)", classes="form-label")
+                            yield Input(id="f-restart-sec", classes="form-field")
+                        with Horizontal(classes="form-row"):
+                            yield Static("Scheduled Restart", classes="form-label")
+                            yield Switch(id="f-scheduled-restart-enabled")
+                        with Horizontal(classes="form-row"):
+                            yield Static("Restart Schedule", classes="form-label")
+                            yield Input(id="f-scheduled-restart-calendar", placeholder="e.g. daily", classes="form-field")
+                        with Horizontal(classes="form-row"):
+                            yield Static("Update-Check Timer", classes="form-label")
+                            yield Switch(id="f-update-check-enabled")
+                        with Horizontal(classes="form-row"):
+                            yield Static("Check Schedule", classes="form-label")
+                            yield Input(id="f-update-check-calendar", placeholder="e.g. daily", classes="form-field")
 
                     with Vertical(classes="panel"):
-                        yield Static("Service & update-check settings", classes="panel-title")
-                        yield Label("Restart policy")
-                        yield Select(_RESTART_POLICY_OPTIONS, id="f-restart-policy", allow_blank=False, value="on-failure")
-                        yield Label("Restart delay (sec)")
-                        yield Input(id="f-restart-sec")
-                        with Horizontal(classes="switch-row"):
-                            yield Switch(id="f-scheduled-restart-enabled")
-                            yield Label("Scheduled restart")
-                        yield Label("Restart schedule")
-                        yield Input(id="f-scheduled-restart-calendar")
-                        with Horizontal(classes="switch-row"):
-                            yield Switch(id="f-update-check-enabled")
-                            yield Label("Scheduled update check")
-                        yield Label("Check schedule")
-                        yield Input(id="f-update-check-calendar")
-                        yield Static("", id="service-error", classes="error-text")
-                        with Horizontal(classes="button-row"):
-                            yield Button("Apply service settings", id="btn-apply-service", variant="primary", classes="thin-button")
-                        yield Static("", id="service-status", classes="status-text")
+                        yield Static("Host & Network Services", classes="panel-title")
+                        with Horizontal(classes="form-row"):
+                            yield Static("WOL Interface", classes="form-label")
+                            yield Input(id="f-wol-interface", placeholder="e.g. enp5s0", classes="form-field")
+                        with Horizontal(classes="form-row"):
+                            yield Static("WOL MAC Address", classes="form-label")
+                            yield Input(id="f-wol-mac", placeholder="e.g. 00:11:22:33:44:55", classes="form-field")
+                        with Horizontal(classes="form-row"):
+                            yield Static("WOL Status", classes="form-label")
+                            yield Static("not checked yet", id="wol-status", classes="form-field status-text")
+                        with Horizontal(classes="form-row"):
+                            yield Static("Tailscale Status", classes="form-label")
+                            yield Static("not checked yet", id="tailscale-status", classes="form-field status-text")
+
+                    yield Static("", id="service-error", classes="error-text")
+                    with Horizontal(classes="action-row-primary"):
+                        yield Button("Apply Service Settings", id="btn-apply-service", variant="primary")
+                        yield Button("Check / Enable WOL", id="btn-check-wol", variant="warning")
+                        yield Button("Check / Enable Tailscale", id="btn-check-tailscale", variant="warning")
+                    yield Static("", id="service-status", classes="status-text")
 
     def on_mount(self) -> None:
         self._populate_profile_form()
@@ -617,6 +625,12 @@ class SettingsScreen(CockpitScreenBase):
         self.query_one("#f-scheduled-restart-calendar", Input).value = scheduled.get("on_calendar", "daily")
         self.query_one("#f-update-check-enabled", Switch).value = update_check_cfg.get("enabled", False)
         self.query_one("#f-update-check-calendar", Input).value = update_check_cfg.get("on_calendar", "daily")
+        if self.query("#f-wol-interface"):
+            wol_cfg = self.host_profile.get("network", {}).get("wol", {})
+            self.query_one("#f-wol-interface", Input).value = wol_cfg.get("interface", "")
+        if self.query("#f-wol-mac"):
+            wol_cfg = self.host_profile.get("network", {}).get("wol", {})
+            self.query_one("#f-wol-mac", Input).value = wol_cfg.get("mac", "")
 
     def _update_vpn_preview(self, interface: str) -> None:
         interface = interface.strip()
@@ -669,10 +683,19 @@ class SettingsScreen(CockpitScreenBase):
                 raise ValueError
         except ValueError:
             return None, "gateway.port must be an integer between 1 and 65535"
+        wol = dict(_WOL_PLACEHOLDER) if self.host_profile is None else dict(self.host_profile.get("network", {}).get("wol", _WOL_PLACEHOLDER))
+        if self.query("#f-wol-interface"):
+            wol_iface = self.query_one("#f-wol-interface", Input).value.strip()
+            if wol_iface:
+                wol["interface"] = wol_iface
+        if self.query("#f-wol-mac"):
+            wol_mac = self.query_one("#f-wol-mac", Input).value.strip()
+            if wol_mac:
+                wol["mac"] = wol_mac
         network: dict[str, Any] = {
             "vpn": {"interface": vpn_interface},
             "gateway": {"port": gw_port},
-            "wol": dict(_WOL_PLACEHOLDER) if self.host_profile is None else self.host_profile["network"]["wol"],
+            "wol": wol,
         }
         if gw_timeout_raw:
             try:
@@ -780,6 +803,38 @@ class SettingsScreen(CockpitScreenBase):
         self.host_profile = candidate
         self._render_gpu_list()
         self._set_profile_status("host profile saved — restart the cockpit for other tabs to see the change")
+
+    @work
+    async def _confirm_and_deploy_profile(self) -> None:
+        candidate, err = self._build_profile_candidate()
+        if err:
+            self._set_profile_error(err)
+            return
+        try:
+            schema.validate_host_profile_dict(candidate)
+        except schema.ValidationError as e:
+            self._set_profile_error(f"validation failed: {e}")
+            return
+        self._set_profile_error("")
+
+        hostname = candidate["hostname"]
+        message = (
+            f"Deploy host profile at hosts/{hostname}.yaml and reconfigure services?\n"
+            "(writes host configuration and restarts background services)"
+        )
+        confirmed = await self.confirm(message, confirm_label="Deploy", mutates_system=True)
+        if not confirmed:
+            return
+
+        content = yaml.safe_dump(candidate, sort_keys=False)
+        target_path = self._host_profile_path()
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        target_path.write_text(content, encoding="utf-8")
+
+        self.host_profile = candidate
+        self._render_gpu_list()
+        self._set_profile_status("deploying host profile and reconfiguring services...")
+        self._apply_service_in_background(candidate)
 
     # -- WOL status + check/enable ---------------------------------------------------
 
@@ -955,6 +1010,13 @@ class SettingsScreen(CockpitScreenBase):
         candidate = copy.deepcopy(self.host_profile)
         candidate["service"] = service
         candidate["update_check"] = update_check_cfg
+        if self.query("#f-wol-interface") and self.query("#f-wol-mac"):
+            wol_iface = self.query_one("#f-wol-interface", Input).value.strip()
+            wol_mac = self.query_one("#f-wol-mac", Input).value.strip()
+            if wol_iface and wol_mac:
+                if "network" not in candidate:
+                    candidate["network"] = {}
+                candidate["network"]["wol"] = {"interface": wol_iface, "mac": wol_mac}
         try:
             schema.validate_host_profile_dict(candidate)
         except schema.ValidationError as e:
@@ -994,9 +1056,11 @@ class SettingsScreen(CockpitScreenBase):
         else:
             msg = "service settings applied"
             self.app.call_from_thread(self._set_service_status, msg)
+            self.app.call_from_thread(self._set_profile_status, "host profile deployed")
             self.app.call_from_thread(self.app.notify, msg)
             return
         self.app.call_from_thread(self._set_service_status, msg)
+        self.app.call_from_thread(self._set_profile_error, msg)
         self.app.call_from_thread(self.app.notify, msg, severity="error")
 
     # -- button dispatch ------------------------------------------------------------
@@ -1031,11 +1095,13 @@ class SettingsScreen(CockpitScreenBase):
             self._show_ip_a()
         elif bid == "btn-save-profile":
             self._confirm_and_save_profile()
-        elif bid == "btn-wol-check":
+        elif bid == "btn-deploy-profile":
+            self._confirm_and_deploy_profile()
+        elif bid in ("btn-check-wol", "btn-wol-check"):
             self._confirm_and_check_wol()
-        elif bid == "btn-tailscale-check":
+        elif bid in ("btn-check-tailscale", "btn-tailscale-check"):
             self._confirm_and_check_tailscale()
-        elif bid == "btn-drivers-check":
+        elif bid in ("btn-check-drivers", "btn-drivers-check"):
             self._confirm_and_check_drivers()
         elif bid == "btn-apply-service":
             self._confirm_and_apply_service()

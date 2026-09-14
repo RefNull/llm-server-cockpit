@@ -140,10 +140,57 @@ Tab {
     margin-bottom: $space-normal;
 }
 
+/* Screen archetype tokens (DESIGN.md §8). Standardized rows, gauges, action containers,
+   and key-value form fields shared across all screens. */
+.res-row {
+    height: 1;
+    align-vertical: middle;
+    margin-bottom: 0;
+}
+.res-label {
+    width: 6;
+    text-style: bold;
+    color: $accent;
+}
+.res-row ProgressBar {
+    width: 1fr;
+    height: 1;
+}
+.res-val {
+    width: 18;
+    text-align: right;
+    color: $text-muted;
+}
+.action-row-primary {
+    height: auto;
+    align: left middle;
+    margin-top: 1;
+    margin-bottom: 0;
+}
+.action-row-secondary {
+    height: auto;
+    align: left middle;
+    margin-top: 1;
+    margin-bottom: 0;
+}
+.form-row {
+    height: auto;
+    align-vertical: middle;
+    margin-bottom: 1;
+}
+.form-label {
+    width: 24;
+    text-style: bold;
+    color: $text-muted;
+}
+.form-field {
+    width: 1fr;
+}
+
 /* Responsive breakpoint hooks (DESIGN.md §2, §3.5). CockpitApp.HORIZONTAL_BREAKPOINTS makes
    Textual stamp exactly one of these classes onto the Screen on every resize; layout reflow
    is expressed here as CSS, never as an on_resize geometry calculation in a screen.
-   Any multi-column Horizontal that must collapse below 110 cells carries .columns-responsive. */
+   Any multi-column Horizontal that must collapse below 120 cells carries .columns-responsive. */
 Screen.-narrow .columns-responsive {
     layout: vertical;
     height: auto;

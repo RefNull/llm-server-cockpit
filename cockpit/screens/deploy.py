@@ -23,6 +23,7 @@ from cockpit.widgets import (
     CockpitDataTable,
     CockpitScreenBase,
     ConfirmModal,
+    InfoModal,
     SingleClickDataTable,
     selection_marker,
 )
@@ -34,10 +35,7 @@ _ENGINE_OPTIONS = [("llama-cpp", "llama-cpp"), ("unmanaged", "unmanaged")]
 
 
 class ConfigPasteModal(ModalScreen[str | None]):
-    """Paste-a-llama-swap-config.yaml modal for the "Import from config.yaml" shortcut.
-    Returns the pasted text on Parse, None on Cancel — deploy.py does the actual parsing
-    (swap.parse_config_for_import) after the modal closes, so parse errors can be shown
-    inline on the main screen's status line rather than re-opening this modal."""
+    """Paste-a-llama-swap-config.yaml modal for importing models."""
 
     BINDINGS = [("escape", "cancel", "Cancel")]
 
@@ -54,6 +52,7 @@ class ConfigPasteModal(ModalScreen[str | None]):
     }
     #paste-title {
         text-style: bold;
+        color: $accent;
         margin-bottom: 1;
     }
     #paste-text {
@@ -79,29 +78,43 @@ class ConfigPasteModal(ModalScreen[str | None]):
         self.dismiss(None)
 
 
-class DeployScreen(CockpitScreenBase):
-    """Mounted inside a TabPane by cockpit/app.py — not a Textual Screen."""
+class EditModelModal(ModalScreen[bool]):
+    """Modal dialog for adding or editing a model in models.yaml.
 
-    # .panel / .button-row / .status-text / .error-text come from cockpit/widgets.py's
-    # SHARED_CSS (CockpitApp.CSS) — only this screen's own rules live here. Root content is
-    # wrapped in a VerticalScroll (see compose()) so a tall form/preview doesn't get clipped
-    # in a short terminal.
+    Validates candidate configuration against schema.validate_models_dict before writing.
+    """
+
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
     DEFAULT_CSS = """
-    DeployScreen {
+    EditModelModal {
+        align: center middle;
+    }
+    #edit-model-dialog {
+        width: 80;
+        height: 85%;
+        border: thick $background 80%;
+        background: $surface;
+        padding: 1 2;
+    }
+    #edit-model-title {
+        text-style: bold;
+        color: $accent;
+        margin-bottom: 1;
+    }
+    #edit-model-scroll {
         height: 1fr;
     }
-    #edit-form, #preview-area {
-        height: auto;
-        max-height: 32;
-    }
-    #edit-form Label {
+    #edit-model-scroll Label {
         margin-top: 1;
+        color: $text-muted;
     }
     #f-args, #f-cmd, #f-env {
         height: 5;
     }
-    #preview-text {
-        height: 22;
+    #form-error {
+        color: $error;
+        margin-top: 1;
     }
     """
 
@@ -110,130 +123,97 @@ class DeployScreen(CockpitScreenBase):
         host_profile: dict,
         manifest: dict,
         models: dict,
-        runner: Runner,
+        editing_id: str | None,
         repo_root: Path,
-        app_ref,
+        app_ref: Any,
     ) -> None:
         super().__init__()
         self.host_profile = host_profile
         self.manifest = manifest
         self.models = models
-        self.runner = runner
+        self.editing_id = editing_id
         self.repo_root = repo_root
         self.app_ref = app_ref
-        self._editing_id: str | None = None  # None while the form is in "add" mode
-        # id -> proposed model dict, for the current "Import from config.yaml" review table.
-        self._import_candidates: dict[str, dict[str, Any]] = {}
-        self._import_selected: set[str] = set()
-
-    # -- layout ---------------------------------------------------------------
+        self._model = (
+            next((m for m in self.models.get("models", []) if m["id"] == editing_id), None)
+            if editing_id
+            else None
+        )
 
     def compose(self) -> ComposeResult:
-        with VerticalScroll():
-            yield Static("Configure models.yaml and deploy the llama-swap inference routing service", classes="subtitle")
-            yield Static("Models (models.yaml)", classes="section-title")
-            yield CockpitDataTable(id="models-table", classes="data-table", fixed_columns=1)
-            with Horizontal(classes="button-row"):
-                yield Button("Add", id="btn-add", variant="primary", classes="thin-button")
-                yield Button("Edit", id="btn-edit", classes="thin-button")
-                yield Button("Delete", id="btn-delete", variant="error", classes="thin-button")
-                yield Button("Preview config.yaml", id="btn-preview", classes="thin-button")
-                yield Button("Import from config.yaml", id="btn-import", classes="thin-button")
-            yield Static("", id="status-message", classes="status-text")
+        title = f"Edit Model: {self.editing_id}" if self.editing_id else "Add Model"
+        m = self._model
+        engine_val = m.get("engine", "llama-cpp") if m else "llama-cpp"
 
-            with Vertical(id="import-review", classes="panel"):
-                yield Static("Proposed models from pasted config.yaml", classes="panel-title")
-                yield Static(
-                    "Every entry imports as engine: unmanaged with its original cmd preserved — a "
-                    "llama-swap config never carries the repo_id a real llama-cpp entry needs, so "
-                    "there's no confident way to reconstruct one. Tick the ones to keep, then hand-"
-                    "convert any to llama-cpp afterward via Edit if you want that.",
-                    classes="subtitle",
-                )
-                # fixed_columns=2: column 0 is the tick marker, so the ID stays visible while
-                # the wide cmd column scrolls (DESIGN.md §4.2).
-                table = SingleClickDataTable(
-                    id="import-table", zebra_stripes=True, classes="data-table", fixed_columns=2
-                )
-                table.cursor_type = "row"
-                yield table
-                yield Static("", id="import-error", classes="error-text")
-                with Horizontal(classes="button-row"):
-                    yield Button("Import selected", id="btn-import-selected", variant="primary", classes="thin-button")
-                    yield Button("Close", id="btn-import-close", classes="thin-button")
-
-            with Vertical(id="edit-form", classes="panel"):
-                yield Static("", id="form-title", classes="panel-title")
+        with Vertical(id="edit-model-dialog"):
+            yield Static(title, id="edit-model-title")
+            with VerticalScroll(id="edit-model-scroll"):
                 yield Label("id")
-                yield Input(id="f-id", placeholder="model id")
+                yield Input(
+                    id="f-id",
+                    placeholder="model id",
+                    value=m["id"] if m else "",
+                    disabled=bool(self.editing_id),
+                )
                 yield Label("engine")
-                yield Select(_ENGINE_OPTIONS, id="f-engine", allow_blank=False, value="llama-cpp")
+                yield Select(_ENGINE_OPTIONS, id="f-engine", allow_blank=False, value=engine_val)
 
                 with Vertical(id="f-llamacpp-fields"):
                     yield Label("repo_id")
-                    yield Input(id="f-repo-id", placeholder="huggingface repo id")
+                    yield Input(id="f-repo-id", placeholder="huggingface repo id", value=m.get("repo_id", "") if m else "")
                     yield Label("quant_file")
-                    yield Input(id="f-quant-file", placeholder="quant filename")
+                    yield Input(id="f-quant-file", placeholder="quant filename", value=m.get("quant_file", "") if m else "")
                     yield Label("mmproj_file (optional)")
-                    yield Input(id="f-mmproj-file", placeholder="")
+                    yield Input(id="f-mmproj-file", placeholder="", value=m.get("mmproj_file", "") if m else "")
                     yield Label("bind.gpu")
                     yield Select(self._gpu_options(), id="f-gpu", allow_blank=False)
                     yield Label("bind.backend")
                     yield Select([], id="f-backend", allow_blank=True)
                     yield Label("llama_server_args (one flag/value per line)")
-                    yield TextArea(id="f-args")
+                    yield TextArea(
+                        "\n".join(m.get("llama_server_args", [])) if m else "",
+                        id="f-args",
+                    )
 
                 with Vertical(id="f-unmanaged-fields"):
                     yield Label("cmd (raw shell command, ${PORT} available)")
-                    yield TextArea(id="f-cmd")
+                    yield TextArea(m.get("cmd", "") if m else "", id="f-cmd")
 
                 yield Label("env (one KEY=VALUE per line)")
-                yield TextArea(id="f-env")
+                yield TextArea("\n".join(m.get("env", [])) if m else "", id="f-env")
                 yield Label("ttl (seconds, 0 = never evict)")
-                yield Input(id="f-ttl", value="0")
+                yield Input(id="f-ttl", value=str(m.get("ttl", 0)) if m else "0")
                 yield Label("group (optional)")
-                yield Input(id="f-group", placeholder="")
+                yield Input(id="f-group", placeholder="", value=m.get("group", "") if m else "")
 
                 yield Static("", id="form-error", classes="error-text")
-                with Horizontal(classes="button-row"):
-                    yield Button("Save", id="btn-save", variant="primary", classes="thin-button")
-                    yield Button("Cancel", id="btn-cancel", classes="thin-button")
 
-            with Vertical(id="preview-area", classes="panel"):
-                yield Static("Generated config.yaml preview", classes="panel-title")
-                yield TextArea(id="preview-text")
-                with Horizontal(classes="button-row"):
-                    yield Button(
-                        "Deploy Host Configuration (llama-swap & systemd)",
-                        id="btn-confirm-apply",
-                        variant="primary",
-                        classes="thin-button",
-                    )
-                    yield Button("Close preview", id="btn-close-preview", classes="thin-button")
+            with Horizontal(classes="button-row"):
+                yield Button("Save", id="btn-save", variant="primary", classes="thin-button")
+                yield Button("Cancel", id="btn-cancel", classes="thin-button")
 
     def on_mount(self) -> None:
-        table = self.query_one("#models-table", CockpitDataTable)
-        table.cursor_type = "row"
-        self.query_one("#preview-text", TextArea).read_only = True
-        self.query_one("#edit-form").display = False
-        self.query_one("#preview-area").display = False
-        self.query_one("#import-review").display = False
-        import_table = self.query_one("#import-table", SingleClickDataTable)
-        import_table.add_column("", width=3)
-        import_table.add_column("ID", width=24)
-        import_table.add_column("Engine", width=12)
-        import_table.add_column("cmd", width=60)
-        self._populate_table()
+        m = self._model
+        engine_val = m.get("engine", "llama-cpp") if m else "llama-cpp"
+        self._toggle_engine_fields(engine_val)
 
-    # -- host-profile-derived option lists -------------------------------------
+        gpus = self.host_profile.get("gpus", [])
+        if gpus:
+            selected_gpu = m.get("bind", {}).get("gpu") if m else gpus[0]["id"]
+            if any(g["id"] == selected_gpu for g in gpus):
+                self.query_one("#f-gpu", Select).value = selected_gpu
+            else:
+                self.query_one("#f-gpu", Select).value = gpus[0]["id"]
+            selected_backend = m.get("bind", {}).get("backend") if m else None
+            self._refresh_backend_options(str(self.query_one("#f-gpu", Select).value), selected=selected_backend)
 
     def _gpu_options(self) -> list[tuple[str, str]]:
-        return [(g["id"], g["id"]) for g in self.host_profile["gpus"]]
+        return [(g["id"], g["id"]) for g in self.host_profile.get("gpus", [])]
 
     def _backend_options_for_gpu(self, gpu_id: str) -> list[tuple[str, str]]:
-        for g in self.host_profile["gpus"]:
+        for g in self.host_profile.get("gpus", []):
             if g["id"] == gpu_id:
-                return [(b, b) for b in g["backends"]]
+                return [(b, b) for b in g.get("backends", [])]
         return []
 
     def _refresh_backend_options(self, gpu_id: str, selected: str | None = None) -> None:
@@ -247,144 +227,22 @@ class DeployScreen(CockpitScreenBase):
         else:
             backend_select.value = Select.BLANK
 
-    # -- table ------------------------------------------------------------------
-
-    def _populate_table(self) -> None:
-        table = self.query_one("#models-table", CockpitDataTable)
-        table.clear(columns=True)
-        table.add_column("ID", width=24)
-        table.add_column("Engine", width=12)
-        table.add_column("GPU", width=10)
-        table.add_column("Backend", width=10)
-        table.add_column("Group", width=12)
-        table.add_column("TTL", width=8)
-        for m in self.models["models"]:
-            if m["engine"] == "llama-cpp":
-                gpu = m.get("bind", {}).get("gpu", "")
-                backend = m.get("bind", {}).get("backend", "")
-            else:
-                gpu, backend = "", ""
-            table.add_row(
-                m["id"], m["engine"], gpu, backend, m.get("group", ""), str(m.get("ttl", "")),
-                key=m["id"],
-            )
-
-    def _selected_model_id(self) -> str | None:
-        table = self.query_one("#models-table", CockpitDataTable)
-        if table.row_count == 0:
-            return None
-        try:
-            cell_key = table.coordinate_to_cell_key(table.cursor_coordinate)
-        except Exception:
-            return None
-        row_key = cell_key.row_key
-        return str(row_key.value) if row_key is not None and row_key.value is not None else None
-
-    def on_refresh_requested(self) -> None:
-        """Called by CockpitApp.action_refresh_all — pick up models.yaml as reloaded by
-        app_ref.reload_models(), in case another tab or an external edit changed it."""
-        self.models = self.app_ref.models
-        self._populate_table()
-
-    # -- status / error helpers --------------------------------------------------
-
-    def _set_status(self, text: str) -> None:
-        self.query_one("#status-message", Static).update(text)
-
-    def _set_form_error(self, text: str) -> None:
-        self.query_one("#form-error", Static).update(text)
-
-    def _show_form(self) -> None:
-        self.query_one("#preview-area").display = False
-        self.query_one("#import-review").display = False
-        self.query_one("#edit-form").display = True
-
-    def _hide_form(self) -> None:
-        self.query_one("#edit-form").display = False
-
-    def _show_preview(self) -> None:
-        self.query_one("#edit-form").display = False
-        self.query_one("#import-review").display = False
-        self.query_one("#preview-area").display = True
-
-    def _hide_preview(self) -> None:
-        self.query_one("#preview-area").display = False
-
-    def _show_import_review(self) -> None:
-        self.query_one("#edit-form").display = False
-        self.query_one("#preview-area").display = False
-        self.query_one("#import-review").display = True
-
-    def _hide_import_review(self) -> None:
-        self.query_one("#import-review").display = False
-
     def _toggle_engine_fields(self, engine: str) -> None:
         is_llama = engine == "llama-cpp"
         self.query_one("#f-llamacpp-fields").display = is_llama
         self.query_one("#f-unmanaged-fields").display = not is_llama
 
-    # -- form open/populate --------------------------------------------------
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id == "f-engine":
+            self._toggle_engine_fields(str(event.value))
+        elif event.select.id == "f-gpu":
+            self._refresh_backend_options(str(event.value))
 
-    def _open_form_for_add(self) -> None:
-        self._editing_id = None
-        self.query_one("#form-title", Static).update("Add model")
-        self.query_one("#f-id", Input).value = ""
-        self.query_one("#f-id", Input).disabled = False
-        engine_select = self.query_one("#f-engine", Select)
-        engine_select.value = "llama-cpp"
-        self._toggle_engine_fields("llama-cpp")
-        self.query_one("#f-repo-id", Input).value = ""
-        self.query_one("#f-quant-file", Input).value = ""
-        self.query_one("#f-mmproj-file", Input).value = ""
-        gpus = self.host_profile["gpus"]
-        if gpus:
-            self.query_one("#f-gpu", Select).value = gpus[0]["id"]
-            self._refresh_backend_options(gpus[0]["id"])
-        self.query_one("#f-args", TextArea).text = ""
-        self.query_one("#f-cmd", TextArea).text = ""
-        self.query_one("#f-env", TextArea).text = ""
-        self.query_one("#f-ttl", Input).value = "0"
-        self.query_one("#f-group", Input).value = ""
-        self._set_form_error("")
-        self._show_form()
+    def _set_form_error(self, text: str) -> None:
+        self.query_one("#form-error", Static).update(text)
 
-    def _on_edit_pressed(self) -> None:
-        model_id = self._selected_model_id()
-        if model_id is None:
-            self._set_status("select a model row first")
-            return
-        model = next((m for m in self.models["models"] if m["id"] == model_id), None)
-        if model is None:
-            self._set_status(f"model {model_id!r} not found — list may be stale, press r to refresh")
-            return
-        self._editing_id = model_id
-        self.query_one("#form-title", Static).update(f"Edit model: {model_id}")
-        self.query_one("#f-id", Input).value = model["id"]
-        engine = model["engine"]
-        self.query_one("#f-engine", Select).value = engine
-        self._toggle_engine_fields(engine)
-        self.query_one("#f-group", Input).value = model.get("group", "")
-        self.query_one("#f-ttl", Input).value = str(model.get("ttl", 0))
-        self.query_one("#f-env", TextArea).text = "\n".join(model.get("env", []))
-        if engine == "llama-cpp":
-            self.query_one("#f-repo-id", Input).value = model.get("repo_id", "")
-            self.query_one("#f-quant-file", Input).value = model.get("quant_file", "")
-            self.query_one("#f-mmproj-file", Input).value = model.get("mmproj_file", "")
-            gpu = model.get("bind", {}).get("gpu", "")
-            backend = model.get("bind", {}).get("backend", "")
-            self.query_one("#f-gpu", Select).value = gpu
-            self._refresh_backend_options(gpu, selected=backend)
-            self.query_one("#f-args", TextArea).text = "\n".join(model.get("llama_server_args", []))
-            self.query_one("#f-cmd", TextArea).text = ""
-        else:
-            self.query_one("#f-repo-id", Input).value = ""
-            self.query_one("#f-quant-file", Input).value = ""
-            self.query_one("#f-mmproj-file", Input).value = ""
-            self.query_one("#f-cmd", TextArea).text = model.get("cmd", "")
-        self._set_form_error("")
-        self._show_form()
-
-    # -- build model dict from form fields --------------------------------------
+    def action_cancel(self) -> None:
+        self.dismiss(False)
 
     def _build_model_from_form(self) -> tuple[dict | None, str | None]:
         model_id = self.query_one("#f-id", Input).value.strip()
@@ -405,7 +263,7 @@ class DeployScreen(CockpitScreenBase):
         group = self.query_one("#f-group", Input).value.strip()
         env_lines = [line.strip() for line in self.query_one("#f-env", TextArea).text.splitlines() if line.strip()]
 
-        model: dict = {"id": model_id, "engine": engine}
+        model: dict[str, Any] = {"id": model_id, "engine": str(engine)}
 
         if engine == "llama-cpp":
             repo_id = self.query_one("#f-repo-id", Input).value.strip()
@@ -421,7 +279,7 @@ class DeployScreen(CockpitScreenBase):
             model["quant_file"] = quant_file
             if mmproj_file:
                 model["mmproj_file"] = mmproj_file
-            model["bind"] = {"gpu": gpu, "backend": backend}
+            model["bind"] = {"gpu": str(gpu), "backend": str(backend)}
             args_lines = [line for line in self.query_one("#f-args", TextArea).text.splitlines() if line.strip() != ""]
             if args_lines:
                 model["llama_server_args"] = args_lines
@@ -438,110 +296,137 @@ class DeployScreen(CockpitScreenBase):
             model["group"] = group
         return model, None
 
-    # -- validation (authoritative: reuses schema.load_models) -------------------
-
-    def _validate_candidate(self, candidate: dict) -> tuple[bool, str, dict | None]:
-        """Run schema.validate_models_dict directly in memory against candidate dict."""
-        try:
-            validated = schema.validate_models_dict(candidate, self.host_profile, self.manifest, source="models.yaml")
-            return True, "", validated
-        except schema.ValidationError as e:
-            return False, str(e), None
-
-    def _write_models_yaml(self, data: dict) -> None:
-        target = self.repo_root / "models.yaml"
-        content = yaml.safe_dump(data, sort_keys=False)
-        target.write_text(content, encoding="utf-8")
-
-    def _after_write(self, action_past_tense: str) -> None:
-        self.app_ref.reload_models()
-        self.models = self.app_ref.models
-        self._populate_table()
-        self._set_status(f"{action_past_tense} — models.yaml written")
-
-    # -- save / delete ------------------------------------------------------------
-
-    def _on_save_pressed(self) -> None:
-        self._confirm_and_save()
-
     @work
-    async def _confirm_and_save(self) -> None:
+    async def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-cancel":
+            self.dismiss(False)
+            return
+        if event.button.id != "btn-save":
+            return
+
         model, error = self._build_model_from_form()
         if error:
             self._set_form_error(error)
             return
 
-        others = [m for m in self.models["models"] if m["id"] != self._editing_id] if self._editing_id else list(self.models["models"])
+        existing_models = self.models.get("models", [])
+        others = [m for m in existing_models if m["id"] != self.editing_id] if self.editing_id else list(existing_models)
         if any(m["id"] == model["id"] for m in others):
             self._set_form_error(f"duplicate model id {model['id']!r}")
             return
         candidate = {"models": others + [model]}
 
-        ok, err, validated = self._validate_candidate(candidate)
-        if not ok:
-            self._set_form_error(err)
-            return
-
-        verb = "Save changes to" if self._editing_id else "Add"
-        message = f"{verb} model {model['id']!r} in models.yaml?"
-        confirmed = await self.app.push_screen_wait(ConfirmModal(message, confirm_label="Save", danger=True))
-        if not confirmed:
-            return
-
-        self._write_models_yaml(validated)
-        self._after_write(f"saved model {model['id']!r}")
-        self._hide_form()
-
-    @work
-    async def _delete_selected(self) -> None:
-        model_id = self._selected_model_id()
-        if model_id is None:
-            self._set_status("select a model row first")
-            return
-        message = f"Delete model {model_id!r} from models.yaml?"
-        confirmed = await self.app.push_screen_wait(ConfirmModal(message, confirm_label="Delete", danger=True))
-        if not confirmed:
-            return
-
-        new_list = [m for m in self.models["models"] if m["id"] != model_id]
-        candidate = {"models": new_list}
-        ok, err, validated = self._validate_candidate(candidate)
-        if not ok:
-            self._set_status(f"delete blocked by validation: {err}")
-            return
-
-        self._write_models_yaml(validated)
-        self._after_write(f"deleted model {model_id!r}")
-
-    # -- import from config.yaml ------------------------------------------------------------
-
-    @work
-    async def _open_import_modal(self) -> None:
-        text = await self.app.push_screen_wait(ConfigPasteModal())
-        if text is None or not text.strip():
-            return
         try:
-            proposed = swap.parse_config_for_import(text)
-        except ValueError as e:
-            self._set_status(f"import failed: {e}")
+            validated = schema.validate_models_dict(candidate, self.host_profile, self.manifest, source="models.yaml")
+        except schema.ValidationError as e:
+            self._set_form_error(str(e))
             return
-        if not proposed:
-            self._set_status("no models found in that config.yaml")
+
+        verb = "Save changes to" if self.editing_id else "Add"
+        confirmed = await self.app.push_screen_wait(
+            ConfirmModal(f"{verb} model {model['id']!r} in models.yaml?", confirm_label="Save", danger=True)
+        )
+        if not confirmed:
             return
-        self._import_candidates = {m["id"]: m for m in proposed}
-        self._import_selected = set()
+
+        target = self.repo_root / "models.yaml"
+        target.write_text(yaml.safe_dump(validated, sort_keys=False), encoding="utf-8")
+        self.app_ref.reload_models()
+        self.app.notify(f"saved model {model['id']!r}")
+        self.dismiss(True)
+
+
+class ImportModelsModal(ModalScreen[bool]):
+    """Modal dialog for importing discovered or pasted models into models.yaml."""
+
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    DEFAULT_CSS = """
+    ImportModelsModal {
+        align: center middle;
+    }
+    #import-dialog {
+        width: 85;
+        height: 85%;
+        border: thick $background 80%;
+        background: $surface;
+        padding: 1 2;
+    }
+    #import-title {
+        text-style: bold;
+        color: $accent;
+        margin-bottom: 1;
+    }
+    #import-scroll {
+        height: 1fr;
+    }
+    #import-error {
+        color: $error;
+        margin-top: 1;
+    }
+    """
+
+    def __init__(
+        self,
+        host_profile: dict,
+        manifest: dict,
+        models: dict,
+        repo_root: Path,
+        app_ref: Any,
+    ) -> None:
+        super().__init__()
+        self.host_profile = host_profile
+        self.manifest = manifest
+        self.models = models
+        self.repo_root = repo_root
+        self.app_ref = app_ref
+        self._import_candidates: dict[str, dict[str, Any]] = {}
+        self._import_selected: set[str] = set()
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="import-dialog"):
+            yield Static("Import Models from Llama-Swap", id="import-title")
+            with VerticalScroll(id="import-scroll"):
+                table = SingleClickDataTable(
+                    id="import-table", zebra_stripes=True, classes="data-table", fixed_columns=2
+                )
+                table.cursor_type = "row"
+                yield table
+                yield Static("", id="import-error", classes="error-text")
+            with Horizontal(classes="button-row"):
+                yield Button("Import selected", id="btn-import-selected", variant="primary", classes="thin-button")
+                yield Button("Paste config.yaml", id="btn-import-paste", classes="thin-button")
+                yield Button("Cancel", id="btn-import-close", classes="thin-button")
+
+    def on_mount(self) -> None:
+        table = self.query_one("#import-table", SingleClickDataTable)
+        table.add_column("", width=3)
+        table.add_column("ID", width=24)
+        table.add_column("Engine", width=12)
+        table.add_column("cmd", width=60)
+
+        # Discover from state_dir config.yaml if present
+        state_dir = self.host_profile.get("paths", {}).get("state_dir")
+        if state_dir:
+            config_path = Path(state_dir) / "llama-swap" / "config.yaml"
+            if config_path.exists():
+                try:
+                    content = config_path.read_text(encoding="utf-8")
+                    proposed = swap.parse_config_for_import(content)
+                    self._import_candidates = {m["id"]: m for m in proposed}
+                except Exception:
+                    pass
         self._refresh_import_table()
-        self._show_import_review()
 
     def _refresh_import_table(self) -> None:
         table = self.query_one("#import-table", SingleClickDataTable)
         table.clear()
         for model_id, model in self._import_candidates.items():
-            cmd_preview = model["cmd"][:80] + ("…" if len(model["cmd"]) > 80 else "")
+            cmd_preview = model.get("cmd", "")[:80] + ("…" if len(model.get("cmd", "")) > 80 else "")
             table.add_row(
                 selection_marker(model_id in self._import_selected),
                 model_id,
-                model["engine"],
+                model.get("engine", "unmanaged"),
                 cmd_preview,
                 key=model_id,
             )
@@ -549,15 +434,44 @@ class DeployScreen(CockpitScreenBase):
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         if event.data_table.id != "import-table" or event.row_key is None or event.row_key.value is None:
             return
-        model_id = event.row_key.value
+        model_id = str(event.row_key.value)
         if model_id in self._import_selected:
             self._import_selected.discard(model_id)
         else:
             self._import_selected.add(model_id)
         self._refresh_import_table()
 
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
     @work
-    async def _confirm_and_import_selected(self) -> None:
+    async def on_button_pressed(self, event: Button.Pressed) -> None:
+        bid = event.button.id
+        if bid == "btn-import-close":
+            self.dismiss(False)
+        elif bid == "btn-import-paste":
+            await self._paste_config()
+        elif bid == "btn-import-selected":
+            await self._confirm_and_import()
+
+    async def _paste_config(self) -> None:
+        text = await self.app.push_screen_wait(ConfigPasteModal())
+        if text is None or not text.strip():
+            return
+        try:
+            proposed = swap.parse_config_for_import(text)
+        except ValueError as e:
+            self.query_one("#import-error", Static).update(f"parse failed: {e}")
+            return
+        if not proposed:
+            self.query_one("#import-error", Static).update("no models found in pasted config.yaml")
+            return
+        self.query_one("#import-error", Static).update("")
+        self._import_candidates = {m["id"]: m for m in proposed}
+        self._import_selected = set()
+        self._refresh_import_table()
+
+    async def _confirm_and_import(self) -> None:
         error_widget = self.query_one("#import-error", Static)
         error_widget.update("")
         if not self._import_selected:
@@ -567,14 +481,15 @@ class DeployScreen(CockpitScreenBase):
         existing_ids = {m["id"] for m in self.models.get("models", [])}
         colliding = sorted(self._import_selected & existing_ids)
         if colliding:
-            error_widget.update(f"id(s) already exist in models.yaml, deselect or remove first: {', '.join(colliding)}")
+            error_widget.update(f"id(s) already exist in models.yaml: {', '.join(colliding)}")
             return
 
         to_import = [self._import_candidates[mid] for mid in sorted(self._import_selected)]
         candidate = {"models": list(self.models.get("models", [])) + to_import}
-        ok, err, validated = self._validate_candidate(candidate)
-        if not ok:
-            error_widget.update(err)
+        try:
+            validated = schema.validate_models_dict(candidate, self.host_profile, self.manifest, source="models.yaml")
+        except schema.ValidationError as e:
+            error_widget.update(str(e))
             return
 
         confirmed = await self.app.push_screen_wait(
@@ -587,22 +502,192 @@ class DeployScreen(CockpitScreenBase):
         if not confirmed:
             return
 
-        self._write_models_yaml(validated)
-        self._after_write(f"imported {len(to_import)} model(s)")
-        self._import_candidates = {}
-        self._import_selected = set()
-        self._hide_import_review()
+        target = self.repo_root / "models.yaml"
+        target.write_text(yaml.safe_dump(validated, sort_keys=False), encoding="utf-8")
+        self.app_ref.reload_models()
+        self.app.notify(f"imported {len(to_import)} model(s)")
+        self.dismiss(True)
 
-    # -- preview + apply ------------------------------------------------------------
 
-    def _on_preview_pressed(self) -> None:
+class DeployScreen(CockpitScreenBase):
+    """Cockpit "Deploy" tab conforming to Archetype B (Table-Driven Inventory)."""
+
+    DEFAULT_CSS = """
+    DeployScreen {
+        height: 1fr;
+    }
+    """
+
+    def __init__(
+        self,
+        host_profile: dict,
+        manifest: dict,
+        models: dict,
+        runner: Runner,
+        repo_root: Path,
+        app_ref: Any,
+    ) -> None:
+        super().__init__()
+        self.host_profile = host_profile
+        self.manifest = manifest
+        self.models = models
+        self.runner = runner
+        self.repo_root = repo_root
+        self.app_ref = app_ref
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll():
+            table = CockpitDataTable(id="models-table", classes="data-table", fixed_columns=1)
+            yield table
+            with Horizontal(classes="action-row-primary"):
+                yield Button("Apply & Restart Service", id="btn-apply", variant="primary")
+                yield Button("Add Model", id="btn-add-model")
+                yield Button("Edit", id="btn-edit-model")
+                yield Button("Delete", id="btn-delete-model", variant="error")
+            with Horizontal(classes="action-row-secondary"):
+                yield Button("Import from Llama-Swap", id="btn-import-toggle")
+                yield Button("Preview YAML", id="btn-preview-yaml")
+            yield Static("", id="status-message", classes="status-text")
+
+    def on_mount(self) -> None:
+        table = self.query_one("#models-table", CockpitDataTable)
+        table.cursor_type = "row"
+        self._populate_table()
+
+    def _populate_table(self) -> None:
+        table = self.query_one("#models-table", CockpitDataTable)
+        table.clear(columns=True)
+        table.add_column("ID", width=24)
+        table.add_column("Engine", width=12)
+        table.add_column("GPU", width=10)
+        table.add_column("Backend", width=10)
+        table.add_column("Group", width=12)
+        table.add_column("TTL", width=8)
+        for m in self.models.get("models", []):
+            if m["engine"] == "llama-cpp":
+                gpu = m.get("bind", {}).get("gpu", "")
+                backend = m.get("bind", {}).get("backend", "")
+            else:
+                gpu, backend = "", ""
+            table.add_row(
+                m["id"],
+                m["engine"],
+                gpu,
+                backend,
+                m.get("group", ""),
+                str(m.get("ttl", "")),
+                key=m["id"],
+            )
+
+    def _selected_model_id(self) -> str | None:
+        table = self.query_one("#models-table", CockpitDataTable)
+        if table.row_count == 0:
+            return None
+        try:
+            cell_key = table.coordinate_to_cell_key(table.cursor_coordinate)
+        except Exception:
+            return None
+        row_key = cell_key.row_key
+        return str(row_key.value) if row_key is not None and row_key.value is not None else None
+
+    def on_refresh_requested(self) -> None:
+        """Called by CockpitApp.action_refresh_all — pick up fresh models.yaml."""
+        self.models = self.app_ref.models
+        self._populate_table()
+
+    def _set_status(self, text: str) -> None:
+        self.query_one("#status-message", Static).update(text)
+
+    # -- Actions ---------------------------------------------------------------
+
+    @work
+    async def _on_add_model(self) -> None:
+        saved = await self.app.push_screen_wait(
+            EditModelModal(
+                host_profile=self.host_profile,
+                manifest=self.manifest,
+                models=self.models,
+                editing_id=None,
+                repo_root=self.repo_root,
+                app_ref=self.app_ref,
+            )
+        )
+        if saved:
+            self.models = self.app_ref.models
+            self._populate_table()
+            self._set_status("model added — models.yaml written")
+
+    @work
+    async def _on_edit_model(self) -> None:
+        model_id = self._selected_model_id()
+        if model_id is None:
+            self._set_status("select a model row first")
+            return
+        saved = await self.app.push_screen_wait(
+            EditModelModal(
+                host_profile=self.host_profile,
+                manifest=self.manifest,
+                models=self.models,
+                editing_id=model_id,
+                repo_root=self.repo_root,
+                app_ref=self.app_ref,
+            )
+        )
+        if saved:
+            self.models = self.app_ref.models
+            self._populate_table()
+            self._set_status(f"model {model_id!r} updated — models.yaml written")
+
+    @work
+    async def _delete_selected(self) -> None:
+        model_id = self._selected_model_id()
+        if model_id is None:
+            self._set_status("select a model row first")
+            return
+        message = f"Delete model {model_id!r} from models.yaml?"
+        confirmed = await self.app.push_screen_wait(ConfirmModal(message, confirm_label="Delete", danger=True))
+        if not confirmed:
+            return
+
+        new_list = [m for m in self.models.get("models", []) if m["id"] != model_id]
+        candidate = {"models": new_list}
+        try:
+            validated = schema.validate_models_dict(candidate, self.host_profile, self.manifest, source="models.yaml")
+        except schema.ValidationError as e:
+            self._set_status(f"delete blocked by validation: {e}")
+            return
+
+        target = self.repo_root / "models.yaml"
+        target.write_text(yaml.safe_dump(validated, sort_keys=False), encoding="utf-8")
+        self.app_ref.reload_models()
+        self.models = self.app_ref.models
+        self._populate_table()
+        self._set_status(f"deleted model {model_id!r} — models.yaml written")
+        self.app.notify(f"deleted model {model_id!r}")
+
+    @work
+    async def _on_import_toggle(self) -> None:
+        imported = await self.app.push_screen_wait(
+            ImportModelsModal(
+                host_profile=self.host_profile,
+                manifest=self.manifest,
+                models=self.models,
+                repo_root=self.repo_root,
+                app_ref=self.app_ref,
+            )
+        )
+        if imported:
+            self.models = self.app_ref.models
+            self._populate_table()
+            self._set_status("imported models — models.yaml written")
+
+    def _on_preview_yaml(self) -> None:
         try:
             text = swap._generate_config(self.host_profile, self.models)
         except Exception as e:
             self._set_status(f"failed to generate config preview: {e}")
             return
-        self.query_one("#preview-text", TextArea).text = text
-        self._show_preview()
+        self.app.push_screen(InfoModal("Generated config.yaml preview", text))
 
     @work
     async def _confirm_and_apply(self) -> None:
@@ -619,8 +704,7 @@ class DeployScreen(CockpitScreenBase):
 
     @work(thread=True)
     def _apply_in_background(self) -> None:
-        # DESIGN.md §6: the inline #status-message is invisible once the operator switches tab
-        # mid-deploy, so every exit path also toasts.
+        # DESIGN.md §6: toasts on both success and failure for background operations.
         try:
             swap.run(self.host_profile, self.manifest, self.models, self.runner, self.repo_root)
         except SystemExit as e:
@@ -635,37 +719,19 @@ class DeployScreen(CockpitScreenBase):
         self.app.call_from_thread(self._set_status, msg)
         self.app.call_from_thread(self.app.notify, msg, severity="error")
 
-    # -- button dispatch ------------------------------------------------------------
+    # -- Button Dispatch -------------------------------------------------------
 
-    def on_button_pressed(self, event: Button.Pressed) -> None:
+    async def on_button_pressed(self, event: Button.Pressed) -> None:
         bid = event.button.id
-        if bid == "btn-add":
-            self._open_form_for_add()
-        elif bid == "btn-edit":
-            self._on_edit_pressed()
-        elif bid == "btn-delete":
-            self._delete_selected()
-        elif bid == "btn-preview":
-            self._on_preview_pressed()
-        elif bid == "btn-save":
-            self._on_save_pressed()
-        elif bid == "btn-cancel":
-            self._hide_form()
-        elif bid == "btn-confirm-apply":
-            self._confirm_and_apply()
-        elif bid == "btn-close-preview":
-            self._hide_preview()
-        elif bid == "btn-import":
-            self._open_import_modal()
-        elif bid == "btn-import-selected":
-            self._confirm_and_import_selected()
-        elif bid == "btn-import-close":
-            self._import_candidates = {}
-            self._import_selected = set()
-            self._hide_import_review()
-
-    def on_select_changed(self, event: Select.Changed) -> None:
-        if event.select.id == "f-engine":
-            self._toggle_engine_fields(event.value)
-        elif event.select.id == "f-gpu":
-            self._refresh_backend_options(event.value)
+        if bid == "btn-apply":
+            await self._confirm_and_apply()
+        elif bid == "btn-add-model":
+            await self._on_add_model()
+        elif bid == "btn-edit-model":
+            await self._on_edit_model()
+        elif bid == "btn-delete-model":
+            await self._delete_selected()
+        elif bid == "btn-import-toggle":
+            await self._on_import_toggle()
+        elif bid == "btn-preview-yaml":
+            self._on_preview_yaml()

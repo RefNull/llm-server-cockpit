@@ -62,9 +62,19 @@ class ContainersScreen(CockpitScreenBase):
         self._containers: dict[str, dict[str, Any]] = {}
         self._selected_name: str | None = None
 
+    BINDINGS = [
+        ("c", "view_compose", "Compose"),
+        ("s", "exec_shell", "Shell"),
+    ]
+
+    def action_view_compose(self) -> None:
+        self._view_compose()
+
+    def action_exec_shell(self) -> None:
+        self._exec_shell()
+
     def compose(self) -> ComposeResult:
         with VerticalScroll():
-            yield Static("Running and stopped Docker containers on this host.", classes="subtitle")
             yield Static("", id="docker-banner")
             # fixed_columns=1: Name is the identifier and the five columns together run well
             # past 80 cells, so it stays pinned while Image/Status/Ports scroll (DESIGN.md §4.2).
@@ -73,13 +83,11 @@ class ContainersScreen(CockpitScreenBase):
             )
             table.cursor_type = "row"
             yield table
-            with Horizontal(classes="button-row"):
-                yield Button("View compose.yaml", id="view-compose-btn", classes="thin-button")
-                yield Button("View logs", id="view-logs-btn", classes="thin-button")
-                yield Button("Exec shell", id="exec-btn", classes="thin-button")
-                yield Button("Restart", id="restart-btn", variant="error", classes="thin-button")
-            with Horizontal(classes="button-row"):
-                yield Button("Restart all", id="restart-all-btn", variant="error", classes="thin-button")
+            with Horizontal(classes="action-row-primary"):
+                yield Button("Restart selected", id="btn-restart-selected", variant="warning")
+                yield Button("Restart all", id="btn-restart-all", variant="error")
+            with Horizontal(classes="action-row-secondary"):
+                yield Button("View Logs", id="btn-view-logs")
             yield Label("", id="docker-status", classes="status-text")
 
     def on_mount(self) -> None:
@@ -134,14 +142,10 @@ class ContainersScreen(CockpitScreenBase):
     def _sync_button_state(self) -> None:
         container = self._containers.get(self._selected_name) if self._selected_name else None
         has_selection = container is not None
-        is_running = has_selection and container.get("state") == "running"
-        has_compose = has_selection and bool(container.get("compose_files"))
 
-        self.query_one("#view-compose-btn", Button).disabled = not has_compose
-        self.query_one("#view-logs-btn", Button).disabled = not has_selection
-        self.query_one("#exec-btn", Button).disabled = not is_running
-        self.query_one("#restart-btn", Button).disabled = not has_selection
-        self.query_one("#restart-all-btn", Button).disabled = not self._containers
+        self.query_one("#btn-view-logs", Button).disabled = not has_selection
+        self.query_one("#btn-restart-selected", Button).disabled = not has_selection
+        self.query_one("#btn-restart-all", Button).disabled = not self._containers
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         if event.data_table.id != "containers-table":
@@ -155,15 +159,11 @@ class ContainersScreen(CockpitScreenBase):
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
         button_id = event.button.id or ""
-        if button_id == "view-compose-btn":
-            self._view_compose()
-        elif button_id == "view-logs-btn":
+        if button_id == "btn-view-logs":
             self._view_logs()
-        elif button_id == "exec-btn":
-            self._exec_shell()
-        elif button_id == "restart-btn":
+        elif button_id == "btn-restart-selected":
             await self._handle_restart_press()
-        elif button_id == "restart-all-btn":
+        elif button_id == "btn-restart-all":
             await self._handle_restart_all_press()
 
     # ------------------------------------------------------------------ view compose / logs (off main thread)

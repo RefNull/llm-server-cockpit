@@ -12,6 +12,7 @@ import yaml
 from textual import work
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Input, Label, Select, Static, Switch, TextArea
 
 from provision import schema
@@ -23,23 +24,208 @@ from cockpit.widgets import CockpitScreenBase, ConfirmModal, SingleClickDataTabl
 _RESTART_POLICY_OPTIONS = [("on-failure", "on-failure"), ("always", "always"), ("no", "no")]
 
 
-class ScriptsScreen(CockpitScreenBase):
-    """Mounted inside a TabPane by cockpit/app.py — not a Textual Screen.
+class EditScriptModal(ModalScreen[bool]):
+    """Modal dialog for adding or editing a script in scripts.yaml.
 
-    Two independent selection mechanisms on the one table, matching what each needs: the
-    ticked set (SingleClickDataTable + selection_marker, same convention as Installs/Downloads)
-    drives the genuinely batch actions (Start/Stop/Enable/Disable selected); the plain
-    highlighted cursor row (RowHighlighted, always up to date on arrow-key navigation too)
-    drives Edit/Remove, which only ever make sense for exactly one entry — mirrors deploy.py's
-    single-row model-editing convention.
+    Validates candidate configuration against schema.validate_scripts_dict before writing.
     """
+
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    DEFAULT_CSS = """
+    EditScriptModal {
+        align: center middle;
+    }
+    #edit-script-dialog {
+        width: 75;
+        height: 85%;
+        border: thick $background 80%;
+        background: $surface;
+        padding: 1 2;
+    }
+    #edit-script-title {
+        text-style: bold;
+        color: $accent;
+        margin-bottom: 1;
+    }
+    #edit-script-scroll {
+        height: 1fr;
+    }
+    #edit-script-scroll Label {
+        margin-top: 1;
+        color: $text-muted;
+    }
+    #f-script-args {
+        height: 5;
+    }
+    #script-form-error {
+        color: $error;
+        margin-top: 1;
+    }
+    .switch-row {
+        height: auto;
+        align-vertical: middle;
+        margin-top: 1;
+    }
+    .switch-row Label {
+        margin-left: 1;
+    }
+    """
+
+    def __init__(
+        self,
+        host_profile: dict,
+        manifest: dict,
+        scripts: dict,
+        editing_id: str | None,
+        repo_root: Path,
+        cockpit_app: Any,
+    ) -> None:
+        super().__init__()
+        self.host_profile = host_profile
+        self.manifest = manifest
+        self.scripts = scripts
+        self.editing_id = editing_id
+        self.repo_root = repo_root
+        self.cockpit_app = cockpit_app
+        self._script = (
+            next((s for s in self.scripts.get("scripts", []) if s["id"] == editing_id), None)
+            if editing_id
+            else None
+        )
+
+    def compose(self) -> ComposeResult:
+        title = f"Edit Script — {self.editing_id}" if self.editing_id else "Add Script"
+        s = self._script
+        restart_policy = s.get("restart_policy", "on-failure") if s else "on-failure"
+        enabled_val = bool(s.get("enabled", False)) if s else False
+
+        with Vertical(id="edit-script-dialog"):
+            yield Static(title, id="edit-script-title")
+            with VerticalScroll(id="edit-script-scroll"):
+                yield Label("id")
+                yield Input(
+                    id="f-script-id",
+                    placeholder="script id",
+                    value=s["id"] if s else "",
+                    disabled=bool(self.editing_id),
+                )
+                yield Label("path (absolute path to the .py file)")
+                yield Input(
+                    id="f-script-path",
+                    placeholder="/opt/myservice/serve.py",
+                    value=s["path"] if s else "",
+                )
+                yield Label("working_dir (optional — defaults to path's directory)")
+                yield Input(
+                    id="f-script-working-dir",
+                    placeholder="",
+                    value=s.get("working_dir", "") if s else "",
+                )
+                yield Label("python (optional — defaults to python3)")
+                yield Input(
+                    id="f-script-python",
+                    placeholder="",
+                    value=s.get("python", "") if s else "",
+                )
+                yield Label("args (one per line)")
+                yield TextArea(
+                    "\n".join(s.get("args", [])) if s else "",
+                    id="f-script-args",
+                )
+                yield Label("restart_policy")
+                yield Select(
+                    _RESTART_POLICY_OPTIONS,
+                    id="f-script-restart-policy",
+                    allow_blank=False,
+                    value=restart_policy,
+                )
+                with Horizontal(classes="switch-row"):
+                    yield Switch(value=enabled_val, id="f-script-enabled")
+                    yield Label("Enable on boot")
+                yield Static("", id="script-form-error", classes="error-text")
+            with Horizontal(classes="button-row"):
+                yield Button("Save", id="btn-save", variant="primary", classes="thin-button")
+                yield Button("Cancel", id="btn-cancel", classes="thin-button")
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+    def _set_form_error(self, text: str) -> None:
+        self.query_one("#script-form-error", Static).update(text)
+
+    def _build_script_from_form(self) -> tuple[dict | None, str | None]:
+        script_id = self.query_one("#f-script-id", Input).value.strip()
+        path = self.query_one("#f-script-path", Input).value.strip()
+        if not script_id:
+            return None, "id is required"
+        if not path:
+            return None, "path is required"
+        working_dir = self.query_one("#f-script-working-dir", Input).value.strip()
+        python = self.query_one("#f-script-python", Input).value.strip()
+        args = [line.strip() for line in self.query_one("#f-script-args", TextArea).text.splitlines() if line.strip()]
+        restart_policy = str(self.query_one("#f-script-restart-policy", Select).value)
+        enabled = self.query_one("#f-script-enabled", Switch).value
+
+        script: dict[str, Any] = {"id": script_id, "path": path, "restart_policy": restart_policy, "enabled": enabled}
+        if working_dir:
+            script["working_dir"] = working_dir
+        if python:
+            script["python"] = python
+        if args:
+            script["args"] = args
+        return script, None
+
+    @work
+    async def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-cancel":
+            self.dismiss(False)
+            return
+        if event.button.id != "btn-save":
+            return
+
+        script, error = self._build_script_from_form()
+        if error:
+            self._set_form_error(error)
+            return
+
+        existing = self.scripts.get("scripts", [])
+        others = [s for s in existing if s["id"] != self.editing_id] if self.editing_id else list(existing)
+        if any(s["id"] == script["id"] for s in others):
+            self._set_form_error(f"duplicate script id {script['id']!r}")
+            return
+        candidate = {"scripts": others + [script]}
+
+        try:
+            validated = schema.validate_scripts_dict(candidate, source="scripts.yaml")
+        except schema.ValidationError as e:
+            self._set_form_error(str(e))
+            return
+
+        verb = "Save changes to" if self.editing_id else "Add"
+        confirmed = await self.app.push_screen_wait(
+            ConfirmModal(f"{verb} script {script['id']!r} in scripts.yaml?", confirm_label="Save", danger=True)
+        )
+        if not confirmed:
+            return
+
+        target = self.repo_root / "scripts.yaml"
+        target.write_text(yaml.safe_dump(validated, sort_keys=False), encoding="utf-8")
+        self.cockpit_app.reload_scripts()
+        self.app.notify(f"saved script {script['id']!r}")
+        self.dismiss(True)
+
+
+class ScriptsScreen(CockpitScreenBase):
+    """Cockpit "Scripts" tab conforming to Archetype B (Table-Driven Inventory)."""
+
+    BINDINGS = [
+        ("e", "edit_script", "Edit"),
+    ]
 
     DEFAULT_CSS = """
     ScriptsScreen {
         height: 1fr;
-    }
-    ScriptsScreen #edit-form {
-        height: auto;
     }
     """
 
@@ -61,11 +247,9 @@ class ScriptsScreen(CockpitScreenBase):
         self.scripts = getattr(app_ref, "scripts", {"scripts": []})
         self._selected_ids: set[str] = set()
         self._cursor_script_id: str | None = None
-        self._editing_id: str | None = None
 
     def compose(self) -> ComposeResult:
         with VerticalScroll():
-            yield Static("Ad-hoc Python scripts, supervised via one generated systemd unit each.", classes="subtitle")
             # fixed_columns=2: column 0 is the tick marker, so pinning the ID takes both while
             # the absolute Path and Status columns scroll past 80 cells (DESIGN.md §4.2).
             table = SingleClickDataTable(
@@ -73,38 +257,15 @@ class ScriptsScreen(CockpitScreenBase):
             )
             table.cursor_type = "row"
             yield table
-            with Horizontal(classes="button-row"):
-                yield Button("Start selected", id="start-btn", variant="primary", classes="thin-button")
-                yield Button("Stop selected", id="stop-btn", variant="error", classes="thin-button")
-                yield Button("Enable on boot", id="enable-btn", classes="thin-button")
-                yield Button("Disable", id="disable-btn", classes="thin-button")
-            with Horizontal(classes="button-row"):
-                yield Button("Add", id="btn-add", variant="primary", classes="thin-button")
-                yield Button("Edit", id="btn-edit", classes="thin-button")
-                yield Button("Remove", id="btn-remove", variant="error", classes="thin-button")
+            with Horizontal(classes="action-row-primary"):
+                yield Button("Start selected", id="btn-start-selected", variant="primary")
+                yield Button("Stop selected", id="btn-stop-selected", variant="warning")
+                yield Button("Enable", id="btn-enable-selected")
+                yield Button("Disable", id="btn-disable-selected")
+            with Horizontal(classes="action-row-secondary"):
+                yield Button("New Script", id="btn-new-script")
+                yield Button("Remove selected", id="btn-remove-selected", variant="error")
             yield Static("", id="status-message", classes="status-text")
-
-            with Vertical(id="edit-form", classes="panel"):
-                yield Static("", id="form-title", classes="panel-title")
-                yield Label("id")
-                yield Input(id="f-id", placeholder="script id")
-                yield Label("path (absolute path to the .py file)")
-                yield Input(id="f-path", placeholder="/opt/myservice/serve.py")
-                yield Label("working_dir (optional — defaults to path's directory)")
-                yield Input(id="f-working-dir", placeholder="")
-                yield Label("python (optional — defaults to python3)")
-                yield Input(id="f-python", placeholder="")
-                yield Label("args (one per line)")
-                yield TextArea(id="f-args")
-                yield Label("restart_policy")
-                yield Select(_RESTART_POLICY_OPTIONS, id="f-restart-policy", allow_blank=False, value="on-failure")
-                with Horizontal(classes="switch-row"):
-                    yield Switch(id="f-enabled")
-                    yield Label("Enable on boot")
-                yield Static("", id="form-error", classes="error-text")
-                with Horizontal(classes="button-row"):
-                    yield Button("Save", id="btn-save", variant="primary", classes="thin-button")
-                    yield Button("Cancel", id="btn-cancel", classes="thin-button")
 
     def on_mount(self) -> None:
         table = self.query_one("#scripts-table", SingleClickDataTable)
@@ -112,7 +273,6 @@ class ScriptsScreen(CockpitScreenBase):
         table.add_column("ID", width=20)
         table.add_column("Path", width=40)
         table.add_column("Status", width=30)
-        self.query_one("#edit-form").display = False
         self._refresh_table()
 
     def on_refresh_requested(self) -> None:
@@ -156,9 +316,7 @@ class ScriptsScreen(CockpitScreenBase):
             )
         if self._cursor_script_id is None and table.row_count > 0:
             # DataTable defaults its cursor to row 0 without firing RowHighlighted for it, so
-            # sync explicitly here — otherwise Edit/Remove stay disabled after the very first
-            # load (or any refresh that lost the previous selection) until the user manually
-            # moves the cursor once.
+            # sync explicitly here.
             row_key, _ = table.coordinate_to_cell_key(table.cursor_coordinate)
             self._cursor_script_id = row_key.value if row_key is not None else None
         self._sync_button_state()
@@ -166,12 +324,11 @@ class ScriptsScreen(CockpitScreenBase):
     def _sync_button_state(self) -> None:
         has_ticked = bool(self._selected_ids)
         has_cursor = self._cursor_script_id is not None
-        self.query_one("#start-btn", Button).disabled = not has_ticked
-        self.query_one("#stop-btn", Button).disabled = not has_ticked
-        self.query_one("#enable-btn", Button).disabled = not has_ticked
-        self.query_one("#disable-btn", Button).disabled = not has_ticked
-        self.query_one("#btn-edit", Button).disabled = not has_cursor
-        self.query_one("#btn-remove", Button).disabled = not has_cursor
+        self.query_one("#btn-start-selected", Button).disabled = not has_ticked
+        self.query_one("#btn-stop-selected", Button).disabled = not has_ticked
+        self.query_one("#btn-enable-selected", Button).disabled = not has_ticked
+        self.query_one("#btn-disable-selected", Button).disabled = not has_ticked
+        self.query_one("#btn-remove-selected", Button).disabled = not (has_ticked or has_cursor)
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
         if event.data_table.id != "scripts-table":
@@ -192,28 +349,68 @@ class ScriptsScreen(CockpitScreenBase):
     def _script_by_id(self, script_id: str) -> dict[str, Any] | None:
         return next((s for s in self.scripts.get("scripts", []) if s["id"] == script_id), None)
 
+    def _set_status(self, text: str) -> None:
+        self.query_one("#status-message", Static).update(text)
+
+    # ------------------------------------------------------------------ modal open
+
+    @work
+    async def _open_modal_for_add(self) -> None:
+        saved = await self.app.push_screen_wait(
+            EditScriptModal(
+                host_profile=self.host_profile,
+                manifest=self.manifest,
+                scripts=self.scripts,
+                editing_id=None,
+                repo_root=self.repo_root,
+                cockpit_app=self.cockpit_app,
+            )
+        )
+        if saved:
+            self.scripts = getattr(self.cockpit_app, "scripts", self.scripts)
+            self._refresh_table()
+            self._set_status("script added — scripts.yaml written")
+
+    @work
+    async def _open_modal_for_edit(self, script_id: str) -> None:
+        saved = await self.app.push_screen_wait(
+            EditScriptModal(
+                host_profile=self.host_profile,
+                manifest=self.manifest,
+                scripts=self.scripts,
+                editing_id=script_id,
+                repo_root=self.repo_root,
+                cockpit_app=self.cockpit_app,
+            )
+        )
+        if saved:
+            self.scripts = getattr(self.cockpit_app, "scripts", self.scripts)
+            self._refresh_table()
+            self._set_status(f"script {script_id!r} updated — scripts.yaml written")
+
+    def action_edit_script(self) -> None:
+        target_id = next(iter(self._selected_ids)) if len(self._selected_ids) == 1 else self._cursor_script_id
+        if target_id:
+            self._open_modal_for_edit(target_id)
+        else:
+            self._set_status("select a script row first")
+
     # ------------------------------------------------------------------ button dispatch
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
         button_id = event.button.id or ""
-        if button_id == "start-btn":
+        if button_id == "btn-start-selected":
             await self._handle_bulk_press("start", scripts_step.start)
-        elif button_id == "stop-btn":
+        elif button_id == "btn-stop-selected":
             await self._handle_bulk_press("stop", scripts_step.stop)
-        elif button_id == "enable-btn":
+        elif button_id == "btn-enable-selected":
             await self._handle_bulk_press("enable", scripts_step.enable)
-        elif button_id == "disable-btn":
+        elif button_id == "btn-disable-selected":
             await self._handle_bulk_press("disable", scripts_step.disable)
-        elif button_id == "btn-add":
-            self._open_form_for_add()
-        elif button_id == "btn-edit":
-            self._open_form_for_edit()
-        elif button_id == "btn-remove":
-            await self._confirm_and_remove()
-        elif button_id == "btn-save":
-            await self._confirm_and_save()
-        elif button_id == "btn-cancel":
-            self._hide_form()
+        elif button_id == "btn-new-script":
+            await self._open_modal_for_add()
+        elif button_id == "btn-remove-selected":
+            await self._confirm_and_remove_selected()
 
     # ------------------------------------------------------------------ bulk start/stop/enable/disable
 
@@ -243,132 +440,19 @@ class ScriptsScreen(CockpitScreenBase):
             self.app.call_from_thread(self.app.notify, f"{verb}ed {len(ids)} script(s)")
         self.app.call_from_thread(self._refresh_table)
 
-    # ------------------------------------------------------------------ add / edit / remove form
-
-    def _set_form_error(self, text: str) -> None:
-        self.query_one("#form-error", Static).update(text)
-
-    def _set_status(self, text: str) -> None:
-        self.query_one("#status-message", Static).update(text)
-
-    def _show_form(self) -> None:
-        self.query_one("#edit-form").display = True
-
-    def _hide_form(self) -> None:
-        self.query_one("#edit-form").display = False
-        self._set_form_error("")
-
-    def _open_form_for_add(self) -> None:
-        self._editing_id = None
-        self.query_one("#form-title", Static).update("Add script")
-        self.query_one("#f-id", Input).value = ""
-        self.query_one("#f-path", Input).value = ""
-        self.query_one("#f-working-dir", Input).value = ""
-        self.query_one("#f-python", Input).value = ""
-        self.query_one("#f-args", TextArea).text = ""
-        self.query_one("#f-restart-policy", Select).value = "on-failure"
-        self.query_one("#f-enabled", Switch).value = False
-        self._set_form_error("")
-        self._show_form()
-
-    def _open_form_for_edit(self) -> None:
-        if self._cursor_script_id is None:
-            self._set_status("select a script row first")
-            return
-        script = self._script_by_id(self._cursor_script_id)
-        if script is None:
-            self._set_status("selected script is no longer configured — refresh and try again")
-            return
-        self._editing_id = script["id"]
-        self.query_one("#form-title", Static).update(f"Edit script — {script['id']}")
-        self.query_one("#f-id", Input).value = script["id"]
-        self.query_one("#f-path", Input).value = script["path"]
-        self.query_one("#f-working-dir", Input).value = script.get("working_dir", "")
-        self.query_one("#f-python", Input).value = script.get("python", "")
-        self.query_one("#f-args", TextArea).text = "\n".join(script.get("args", []))
-        self.query_one("#f-restart-policy", Select).value = script.get("restart_policy", "on-failure")
-        self.query_one("#f-enabled", Switch).value = bool(script.get("enabled", False))
-        self._set_form_error("")
-        self._show_form()
-
-    def _build_script_from_form(self) -> tuple[dict | None, str | None]:
-        script_id = self.query_one("#f-id", Input).value.strip()
-        path = self.query_one("#f-path", Input).value.strip()
-        if not script_id:
-            return None, "id is required"
-        if not path:
-            return None, "path is required"
-        working_dir = self.query_one("#f-working-dir", Input).value.strip()
-        python = self.query_one("#f-python", Input).value.strip()
-        args = [line.strip() for line in self.query_one("#f-args", TextArea).text.splitlines() if line.strip()]
-        restart_policy = self.query_one("#f-restart-policy", Select).value
-        enabled = self.query_one("#f-enabled", Switch).value
-
-        script: dict[str, Any] = {"id": script_id, "path": path, "restart_policy": restart_policy, "enabled": enabled}
-        if working_dir:
-            script["working_dir"] = working_dir
-        if python:
-            script["python"] = python
-        if args:
-            script["args"] = args
-        return script, None
-
-    def _validate_candidate(self, candidate: dict) -> tuple[bool, str, dict | None]:
-        try:
-            validated = schema.validate_scripts_dict(candidate, source="scripts.yaml")
-            return True, "", validated
-        except schema.ValidationError as e:
-            return False, str(e), None
-
-    def _write_scripts_yaml(self, data: dict) -> None:
-        target = self.repo_root / "scripts.yaml"
-        target.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
-
-    def _after_write(self, action_past_tense: str) -> None:
-        self.cockpit_app.reload_scripts()
-        self.scripts = self.cockpit_app.scripts
-        self._refresh_table()
-        self._set_status(f"{action_past_tense} — scripts.yaml written")
+    # ------------------------------------------------------------------ remove
 
     @work
-    async def _confirm_and_save(self) -> None:
-        script, error = self._build_script_from_form()
-        if error:
-            self._set_form_error(error)
-            return
-
-        others = [s for s in self.scripts.get("scripts", []) if s["id"] != self._editing_id] if self._editing_id else list(self.scripts.get("scripts", []))
-        if any(s["id"] == script["id"] for s in others):
-            self._set_form_error(f"duplicate script id {script['id']!r}")
-            return
-        candidate = {"scripts": others + [script]}
-
-        ok, err, validated = self._validate_candidate(candidate)
-        if not ok:
-            self._set_form_error(err)
-            return
-
-        verb = "Save changes to" if self._editing_id else "Add"
-        confirmed = await self.app.push_screen_wait(
-            ConfirmModal(f"{verb} script {script['id']!r} in scripts.yaml?", confirm_label="Save", danger=True)
-        )
-        if not confirmed:
-            return
-
-        self._write_scripts_yaml(validated)
-        self._after_write(f"saved script {script['id']!r}")
-        self._hide_form()
-
-    @work
-    async def _confirm_and_remove(self) -> None:
-        script_id = self._cursor_script_id
-        if script_id is None:
+    async def _confirm_and_remove_selected(self) -> None:
+        ids_to_remove = sorted(self._selected_ids) if self._selected_ids else ([self._cursor_script_id] if self._cursor_script_id else [])
+        if not ids_to_remove:
             self._set_status("select a script row first")
             return
+
         confirmed = await self.app.push_screen_wait(
             ConfirmModal(
-                f"Remove script {script_id!r} from scripts.yaml? Its systemd unit is left in place "
-                "(stop it first if it's running) — only the registration is removed.",
+                f"Remove {len(ids_to_remove)} script(s) from scripts.yaml?\n{', '.join(ids_to_remove)}\n"
+                "Systemd unit(s) are left in place (stop first if running).",
                 confirm_label="Remove",
                 danger=True,
             )
@@ -376,12 +460,20 @@ class ScriptsScreen(CockpitScreenBase):
         if not confirmed:
             return
 
-        new_list = [s for s in self.scripts.get("scripts", []) if s["id"] != script_id]
+        remove_set = set(ids_to_remove)
+        new_list = [s for s in self.scripts.get("scripts", []) if s["id"] not in remove_set]
         candidate = {"scripts": new_list}
-        ok, err, validated = self._validate_candidate(candidate)
-        if not ok:
-            self._set_status(f"remove blocked by validation: {err}")
+        try:
+            validated = schema.validate_scripts_dict(candidate, source="scripts.yaml")
+        except schema.ValidationError as e:
+            self._set_status(f"remove blocked by validation: {e}")
             return
 
-        self._write_scripts_yaml(validated)
-        self._after_write(f"removed script {script_id!r}")
+        target = self.repo_root / "scripts.yaml"
+        target.write_text(yaml.safe_dump(validated, sort_keys=False), encoding="utf-8")
+        self.cockpit_app.reload_scripts()
+        self.scripts = self.cockpit_app.scripts
+        self._selected_ids -= remove_set
+        self._refresh_table()
+        self._set_status(f"removed {len(ids_to_remove)} script(s) — scripts.yaml written")
+        self.app.notify(f"removed {len(ids_to_remove)} script(s)")

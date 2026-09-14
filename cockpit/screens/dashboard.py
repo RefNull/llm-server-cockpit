@@ -6,6 +6,8 @@ stack right now".
 """
 from __future__ import annotations
 
+import shutil
+import subprocess
 import time
 from pathlib import Path
 
@@ -14,11 +16,11 @@ from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import ProgressBar, Static
 
+from cockpit import update_check
 from cockpit.widgets import CockpitScreenBase
 from provision.common import Runner
 from provision.steps import build as build_step
-from provision.steps import docker, drivers, hf, metrics, swap, wol
-from provision.steps import scripts as scripts_step
+from provision.steps import docker, drivers, metrics, swap, tailscale, wol
 
 
 def _fmt_gb(num_bytes: float) -> str:
@@ -32,7 +34,6 @@ def _fmt_mb(num_mb: float) -> str:
 class DashboardScreen(CockpitScreenBase):
     """Mounted as the app's default tab by cockpit/app.py — not a Textual Screen."""
 
-    # .panel / .panel-title / .subtitle come from cockpit/widgets.py's SHARED_CSS.
     DEFAULT_CSS = """
     DashboardScreen {
         height: 1fr;
@@ -44,7 +45,7 @@ class DashboardScreen(CockpitScreenBase):
         width: 1fr;
         height: auto;
     }
-    /* DESIGN.md §2/§3.5: side-by-side only above the 110-cell breakpoint. The layout switch
+    /* DESIGN.md §2/§3.5: side-by-side only above the 120-cell breakpoint. The layout switch
        itself is SHARED_CSS's .columns-responsive rule; these two only fix up the gutter, which
        is a right margin between columns when they sit beside each other and a bottom margin
        between stacked panels when they don't. */
@@ -55,37 +56,22 @@ class DashboardScreen(CockpitScreenBase):
         margin-right: 0;
         margin-bottom: 1;
     }
-    DashboardScreen .panel Static {
+    DashboardScreen .res-row {
+        margin-bottom: 0;
+    }
+    DashboardScreen .res-row Static {
+        margin: 0;
+    }
+    DashboardScreen .hardware-meta {
         margin-top: 1;
-    }
-    DashboardScreen #dashboard-resources {
-        /* Deliberately not classes="panel" — .panel Static's blanket margin-top:1 (meant for
-           the other status panels' single text blob) has higher CSS specificity than a plain
-           class selector and was silently overriding this panel's own gauge spacing, stacking
-           an extra margin-top onto every gauge row on top of .gauge's own. */
-        height: auto;
-        padding: 0 1;
-        margin-bottom: 1;
-    }
-    DashboardScreen .gauge {
-        height: auto;
-        margin-top: 1;
-    }
-    DashboardScreen .gauge-header {
-        height: auto;
-    }
-    DashboardScreen .gauge-label {
-        text-style: bold;
-        color: $accent;
-        width: auto;
-        margin-right: 2;
-    }
-    DashboardScreen .gauge-value {
         color: $text-muted;
-        width: auto;
     }
-    DashboardScreen .gauge ProgressBar {
-        width: 100%;
+    DashboardScreen .section-title {
+        margin-top: 1;
+        margin-bottom: 0;
+    }
+    DashboardScreen .service-line {
+        margin-top: 0;
     }
     """
 
@@ -107,10 +93,6 @@ class DashboardScreen(CockpitScreenBase):
         self.cockpit_app = app_ref
         self.scripts = getattr(app_ref, "scripts", {"scripts": []})
         self.backends = self._compute_backends()
-        # nvidia/intel only — amd has no metrics.py query implemented yet (out of scope).
-        self._gpu_slots = [
-            g for g in self.host_profile.get("gpus", []) if g.get("vendor") in ("nvidia", "intel")
-        ]
 
     def _compute_backends(self) -> list[str]:
         seen: list[str] = []
@@ -120,62 +102,50 @@ class DashboardScreen(CockpitScreenBase):
                     seen.append(backend)
         return seen
 
-    def _gauge(self, label: str, bar_id: str, text_id: str) -> ComposeResult:
-        """One static snapshot row: LABEL + value text above a full-width bar — no history, no
-        sparkline. Values are refreshed only by _refresh_all (on mount and on manual/global
-        refresh), never on a timer: continuously polling nvidia-smi/xpu-smi every second was
-        observed to keep an Intel Arc GPU pinned in an active power state, ramping its fans to
-        100% within moments of opening the app."""
-        with Vertical(classes="gauge"):
-            with Horizontal(classes="gauge-header"):
-                yield Static(label, classes="gauge-label")
-                yield Static("", id=text_id, classes="gauge-value")
-            # show_percentage=False: the gauge-value Static above already spells out the number
-            # (with units, where relevant) — the bar's own built-in readout would just repeat it.
-            yield ProgressBar(total=100, show_eta=False, show_percentage=False, id=bar_id)
-
     def compose(self) -> ComposeResult:
         with VerticalScroll():
-            yield Static("At-a-glance status across the LLM stack.", classes="subtitle")
-            with Vertical(id="dashboard-resources"):
-                yield Static("Resources", classes="panel-title")
-                yield from self._gauge("CPU", "res-cpu-bar", "res-cpu-text")
-                yield from self._gauge("MEM", "res-mem-bar", "res-mem-text")
-                yield from self._gauge("DISK", "res-disk-bar", "res-disk-text")
-                for slot_idx, gpu in enumerate(self._gpu_slots):
-                    label = f"GPU {slot_idx} ({gpu.get('id', slot_idx)})"
-                    if gpu["vendor"] == "nvidia":
-                        yield from self._gauge(
-                            f"{label} UTIL", f"res-gpu-{slot_idx}-util-bar", f"res-gpu-{slot_idx}-util-text"
-                        )
-                    yield from self._gauge(
-                        f"{label} MEM", f"res-gpu-{slot_idx}-mem-bar", f"res-gpu-{slot_idx}-mem-text"
-                    )
-                    if gpu["vendor"] == "intel":
-                        yield Static("", id=f"res-gpu-{slot_idx}-info-text", classes="status-text")
             with Horizontal(id="dashboard-columns", classes="columns-responsive"):
-                with Vertical(id="dashboard-left"):
-                    with Vertical(classes="panel"):
-                        yield Static("LLM Backends", classes="panel-title")
-                        yield Static("", id="db-backends")
-                    with Vertical(classes="panel"):
-                        yield Static("Models & llama-swap", classes="panel-title")
-                        yield Static("", id="db-models")
-                    with Vertical(classes="panel"):
-                        yield Static("Containers", classes="panel-title")
-                        yield Static("", id="db-containers")
-                with Vertical(id="dashboard-right"):
-                    with Vertical(classes="panel"):
-                        yield Static("HF Downloads", classes="panel-title")
-                        yield Static("", id="db-downloads")
-                    with Vertical(classes="panel"):
-                        yield Static("Hardware & Networking", classes="panel-title")
-                        yield Static("", id="db-hardware")
-                    with Vertical(classes="panel"):
-                        yield Static("Scripts", classes="panel-title")
-                        yield Static("", id="db-scripts")
+                with Vertical(id="dashboard-left", classes="panel"):
+                    yield Static("Hardware & Resources", classes="panel-title")
+                    with Horizontal(classes="res-row"):
+                        yield Static("CPU", classes="res-label")
+                        yield ProgressBar(total=100, show_bar=True, show_percentage=False, show_eta=False, id="res-cpu-bar")
+                        yield Static("", id="res-cpu-text", classes="res-val")
+                    with Horizontal(classes="res-row"):
+                        yield Static("RAM", classes="res-label")
+                        yield ProgressBar(total=100, show_bar=True, show_percentage=False, show_eta=False, id="res-mem-bar")
+                        yield Static("", id="res-mem-text", classes="res-val")
+                    with Horizontal(classes="res-row"):
+                        yield Static("DISK", classes="res-label")
+                        yield ProgressBar(total=100, show_bar=True, show_percentage=False, show_eta=False, id="res-disk-bar")
+                        yield Static("", id="res-disk-text", classes="res-val")
+                    with Horizontal(classes="res-row"):
+                        yield Static("GPU", classes="res-label")
+                        yield ProgressBar(total=100, show_bar=True, show_percentage=False, show_eta=False, id="res-gpu-bar")
+                        yield Static("", id="res-gpu-text", classes="res-val")
+                    with Horizontal(classes="res-row"):
+                        yield Static("VRAM", classes="res-label")
+                        yield ProgressBar(total=100, show_bar=True, show_percentage=False, show_eta=False, id="res-vram-bar")
+                        yield Static("", id="res-vram-text", classes="res-val")
+                    yield Static("", id="db-hardware", classes="hardware-meta")
+
+                with Vertical(id="dashboard-right", classes="panel"):
+                    yield Static("Stack & Services", classes="panel-title")
+
+                    yield Static("LLM Services", classes="section-title")
+                    yield Static("", id="db-llm-services", classes="service-line")
+
+                    yield Static("System Services", classes="section-title")
+                    yield Static("", id="db-system-services", classes="service-line")
+
+                    yield Static("Docker Containers", classes="section-title")
+                    yield Static("", id="db-docker-containers", classes="service-line")
+
+                    yield Static("Upstream Updates", classes="section-title")
+                    yield Static("", id="db-upstream-updates", classes="service-line")
 
     def on_mount(self) -> None:
+        super().on_mount()
         self._refresh_all()
 
     def on_refresh_requested(self) -> None:
@@ -186,32 +156,20 @@ class DashboardScreen(CockpitScreenBase):
 
     @work(thread=True)
     def _refresh_all(self) -> None:
-        """One worker computes every panel's text and the Resources gauges (each of these
-        shells out — build_step is a fast fs read, but swap/wol/docker/scripts/nvidia-smi/
-        xpu-smi status all run subprocesses with real timeouts) — off the main thread like
-        every other status check in this app, then one call_from_thread applies them all so
-        the panels update together.
-
-        This is the ONLY place GPU/CPU/disk are read — on mount and on the global manual
-        refresh (the `r` binding), never on a timer. An earlier version polled them every
-        second in the background; that kept an Intel Arc GPU's sysman telemetry active
-        continuously and was observed to ramp its fans to 100% within moments of opening the
-        app. A one-shot snapshot on demand carries none of that risk."""
-        # DESIGN.md §6: no success toast — this is a passive status read that runs on mount
-        # and on the global refresh, and every panel already renders its own outcome inline.
-        # A *failure* has nowhere else to go, though: these all run in a worker thread, where
-        # an uncaught exception just kills the thread and leaves the panels blank forever.
+        """One worker computes every panel's text and the telemetry metrics off the main thread.
+        Passive background check: toasts on error only per DESIGN.md §6.
+        """
         try:
+            metrics_data = self._compute_metrics()
             texts = {
-                "db-backends": self._compute_backends_text(),
-                "db-models": self._compute_models_text(),
-                "db-containers": self._compute_containers_text(),
-                "db-downloads": self._compute_downloads_text(),
-                "db-hardware": self._compute_hardware_text(),
-                "db-scripts": self._compute_scripts_text(),
+                "db-hardware": self._compute_hardware_text(metrics_data.get("gpus", [])),
+                "db-llm-services": self._compute_llm_services_text(),
+                "db-system-services": self._compute_system_services_text(),
+                "db-docker-containers": self._compute_containers_text(),
+                "db-upstream-updates": self._compute_upstream_updates_text(),
             }
+            self.app.call_from_thread(self._apply_metrics, metrics_data)
             self.app.call_from_thread(self._apply_texts, texts)
-            self.app.call_from_thread(self._apply_resources, self._compute_resources())
         except Exception as e:
             self.app.call_from_thread(
                 self.app.notify, f"dashboard refresh failed: {e}", severity="error"
@@ -223,214 +181,282 @@ class DashboardScreen(CockpitScreenBase):
         for widget_id, text in texts.items():
             self.query_one(f"#{widget_id}", Static).update(text)
 
-    # ------------------------------------------------------------------ Resources gauges (one-shot snapshot)
+    # ------------------------------------------------------------------ Telemetry metrics
 
-    def _compute_resources(self) -> dict:
-        # CPU% needs two readings to derive a delta; a short blocking sleep here is fine since
-        # this whole method already runs off the main thread in a worker.
-        t0 = metrics.read_cpu_times()
-        time.sleep(0.2)
-        cpu_pct = metrics.cpu_percent_from_delta(t0, metrics.read_cpu_times())
-        mem = metrics.read_mem()
-        disk_path = self.host_profile.get("paths", {}).get("models_dir")
-        disk = metrics.read_disk(disk_path) if disk_path else None
-        gpus = metrics.read_gpus()
+    def _compute_metrics(self) -> dict:
+        try:
+            t0 = metrics.read_cpu_times()
+            time.sleep(0.1)
+            cpu_pct = metrics.cpu_percent_from_delta(t0, metrics.read_cpu_times())
+        except Exception:
+            cpu_pct = 0.0
+
+        try:
+            mem = metrics.read_mem()
+        except Exception:
+            mem = {"used_bytes": 0, "total_bytes": 0, "percent": 0.0}
+
+        try:
+            disk_path = self.host_profile.get("paths", {}).get("models_dir")
+            disk = metrics.read_disk(disk_path) if disk_path else None
+        except Exception:
+            disk = None
+
+        try:
+            gpus = metrics.read_gpus()
+        except Exception:
+            gpus = []
+
         return {"cpu_pct": cpu_pct, "mem": mem, "disk": disk, "gpus": gpus}
 
-    def _apply_resources(self, resources: dict) -> None:
+    def _apply_metrics(self, data: dict) -> None:
         if not self.is_mounted:
             return
-        cpu_pct = resources["cpu_pct"]
-        self.query_one("#res-cpu-bar", ProgressBar).update(progress=cpu_pct)
-        self.query_one("#res-cpu-text", Static).update(f"{cpu_pct:.0f}%")
 
-        mem = resources["mem"]
-        self.query_one("#res-mem-bar", ProgressBar).update(progress=mem["percent"])
-        self.query_one("#res-mem-text", Static).update(
-            f"{_fmt_gb(mem['used_bytes'])} / {_fmt_gb(mem['total_bytes'])} ({mem['percent']:.0f}%)"
-        )
+        # CPU
+        cpu_pct = data.get("cpu_pct", 0.0)
+        cpu_bar = self.query_one("#res-cpu-bar", ProgressBar)
+        cpu_bar.progress = cpu_pct
+        self.query_one("#res-cpu-text", Static).update(f"{cpu_pct:.1f}%")
 
-        disk = resources["disk"]
+        # RAM
+        mem = data.get("mem", {"percent": 0.0, "used_bytes": 0, "total_bytes": 0})
+        mem_pct = mem.get("percent", 0.0)
+        mem_bar = self.query_one("#res-mem-bar", ProgressBar)
+        mem_bar.progress = mem_pct
+        if mem.get("total_bytes"):
+            self.query_one("#res-mem-text", Static).update(
+                f"{_fmt_gb(mem['used_bytes'])} / {_fmt_gb(mem['total_bytes'])}"
+            )
+        else:
+            self.query_one("#res-mem-text", Static).update("n/a")
+
+        # DISK
+        disk = data.get("disk")
         disk_bar = self.query_one("#res-disk-bar", ProgressBar)
         disk_text = self.query_one("#res-disk-text", Static)
         if disk is None:
-            disk_bar.update(progress=0)
+            disk_bar.progress = 0
             disk_text.update("models_dir not configured")
-        elif not disk["exists"]:
-            disk_bar.update(progress=0)
+        elif not disk.get("exists"):
+            disk_bar.progress = 0
             disk_text.update("models_dir not found")
         else:
-            disk_bar.update(progress=disk["percent"])
-            disk_text.update(f"{_fmt_gb(disk['used_bytes'])} / {_fmt_gb(disk['total_bytes'])} ({disk['percent']:.0f}%)")
+            disk_bar.progress = disk.get("percent", 0.0)
+            disk_text.update(
+                f"{_fmt_gb(disk['used_bytes'])} / {_fmt_gb(disk['total_bytes'])}"
+            )
 
-        self._apply_gpus(resources["gpus"])
+        # GPU Util & VRAM
+        gpus = data.get("gpus", [])
+        gpu_bar = self.query_one("#res-gpu-bar", ProgressBar)
+        gpu_text = self.query_one("#res-gpu-text", Static)
+        vram_bar = self.query_one("#res-vram-bar", ProgressBar)
+        vram_text = self.query_one("#res-vram-text", Static)
 
-    def _apply_gpus(self, live_gpus: list[dict]) -> None:
-        """Declared host_profile GPU slots are fixed at compose time (Textual widgets can't be
-        created on the fly for hardware only discovered at runtime); live GPUs are matched back
-        to slots by vendor + ordinal position — the closest thing to an identifier a hosts/*.yaml
-        gpu entry and an nvidia-smi/xpu-smi device index share."""
-        by_vendor: dict[str, list[dict]] = {}
-        for gpu in live_gpus:
-            by_vendor.setdefault(gpu["vendor"], []).append(gpu)
-        vendor_seen: dict[str, int] = {}
-        for slot_idx, slot in enumerate(self._gpu_slots):
-            vendor = slot["vendor"]
-            ordinal = vendor_seen.get(vendor, 0)
-            vendor_seen[vendor] = ordinal + 1
-            live = by_vendor.get(vendor, [])
-            gpu = live[ordinal] if ordinal < len(live) else None
-            if vendor == "nvidia":
-                self._apply_nvidia_gpu(slot_idx, gpu)
-            else:
-                self._apply_intel_gpu(slot_idx, gpu)
-
-    def _apply_nvidia_gpu(self, slot_idx: int, gpu: dict | None) -> None:
-        util_bar = self.query_one(f"#res-gpu-{slot_idx}-util-bar", ProgressBar)
-        util_text = self.query_one(f"#res-gpu-{slot_idx}-util-text", Static)
-        mem_bar = self.query_one(f"#res-gpu-{slot_idx}-mem-bar", ProgressBar)
-        mem_text = self.query_one(f"#res-gpu-{slot_idx}-mem-text", Static)
-        if gpu is None:
-            util_bar.update(progress=0)
-            util_text.update("not detected")
-            mem_bar.update(progress=0)
-            mem_text.update("not detected")
-            return
-        util = gpu["utilization_pct"] or 0.0
-        util_bar.update(progress=util)
-        power = f" ({gpu['power_w']:.0f} W)" if gpu["power_w"] is not None else ""
-        util_text.update(f"{util:.0f}%{power}")
-
-        mem_total = gpu["memory_total_mb"] or 0.0
-        mem_pct = (100.0 * gpu["memory_used_mb"] / mem_total) if mem_total else 0.0
-        mem_bar.update(progress=mem_pct)
-        mem_text.update(f"{_fmt_mb(gpu['memory_used_mb'])} / {_fmt_mb(gpu['memory_total_mb'])} ({mem_pct:.0f}%)")
-
-    def _apply_intel_gpu(self, slot_idx: int, gpu: dict | None) -> None:
-        mem_bar = self.query_one(f"#res-gpu-{slot_idx}-mem-bar", ProgressBar)
-        mem_text = self.query_one(f"#res-gpu-{slot_idx}-mem-text", Static)
-        info_text = self.query_one(f"#res-gpu-{slot_idx}-info-text", Static)
-        if gpu is None:
-            mem_bar.update(progress=0)
-            mem_text.update("not detected")
-            info_text.update("xpu-smi unavailable or no matching device")
-            return
-        if gpu["memory_total_mb"]:
-            mem_pct = 100.0 * gpu["memory_used_mb"] / gpu["memory_total_mb"]
-            mem_bar.update(progress=mem_pct)
-            mem_text.update(f"{_fmt_mb(gpu['memory_used_mb'])} / {_fmt_mb(gpu['memory_total_mb'])} ({mem_pct:.0f}%)")
+        if not gpus:
+            gpu_bar.progress = 0
+            gpu_text.update("not detected")
+            vram_bar.progress = 0
+            vram_text.update("not detected")
         else:
-            mem_bar.update(progress=0)
-            mem_text.update("n/a")
-        # utilization_pct is always None here — xpu-smi 2.1.0's utilization telemetry doesn't
-        # report real numbers yet (see provision/steps/metrics.py's module docstring).
-        power = f"{gpu['power_w']:.0f} W" if gpu["power_w"] is not None else "power n/a"
-        freq = f"{gpu['frequency_mhz']:.0f} MHz" if gpu["frequency_mhz"] is not None else "freq n/a"
-        info_text.update(f"utilization n/a (xpu-smi) — {power}, {freq}")
-
-    # ------------------------------------------------------------------ panels (pure computation, off main thread)
-
-    def _compute_backends_text(self) -> str:
-        """Current installed state per backend — deliberately not an upstream-version check
-        (that stays a manual action on the Backends tab); this answers "what's running now"."""
-        if not self.backends:
-            return "no GPU backends declared in host profile"
-        lines: list[str] = []
-        for backend in self.backends:
-            builds = build_step.list_builds(self.host_profile, backend)
-            current = next((b for b in builds if b.get("current")), None)
-            if current is None:
-                lines.append(f"{backend}: not built yet")
+            primary = gpus[0]
+            util = primary.get("utilization_pct")
+            if util is not None:
+                gpu_bar.progress = util
+                power = f" ({primary['power_w']:.0f}W)" if primary.get("power_w") is not None else ""
+                gpu_text.update(f"{util:.0f}%{power}")
             else:
-                ref = (current.get("ref") or "")[:10]
-                sane = "ok" if current.get("sane") else "NOT SANE"
-                lines.append(f"{backend}: {ref} ({sane})")
+                gpu_bar.progress = 0
+                gpu_text.update("n/a (xpu-smi)" if primary.get("vendor") == "intel" else "n/a")
+
+            mem_used = sum(g.get("memory_used_mb") or 0.0 for g in gpus)
+            mem_total = sum(g.get("memory_total_mb") or 0.0 for g in gpus)
+            if mem_total > 0:
+                vram_pct = 100.0 * mem_used / mem_total
+                vram_bar.progress = vram_pct
+                vram_text.update(f"{_fmt_mb(mem_used)} / {_fmt_mb(mem_total)}")
+            else:
+                vram_bar.progress = 0
+                vram_text.update("n/a")
+
+    # ------------------------------------------------------------------ Panel text computation
+
+    def _compute_hardware_text(self, live_gpus: list[dict]) -> str:
+        lines: list[str] = []
+        if live_gpus:
+            names = [
+                g.get("name") or f"{g.get('vendor', 'GPU').upper()} {g.get('index', i)}"
+                for i, g in enumerate(live_gpus)
+            ]
+            lines.append(f"GPU: {', '.join(names)}")
+        else:
+            cfg_count = len(self.host_profile.get("gpus", []))
+            lines.append(f"GPU: {cfg_count} configured in profile" if cfg_count else "GPU: none configured")
+
+        try:
+            lock_data = drivers.read_lockfile_status(self.host_profile, self.repo_root)
+            lines.append(
+                "Drivers: not checked"
+                if lock_data is None
+                else f"Drivers: locked ({lock_data.get('generated_at', 'ok')})"
+            )
+        except Exception:
+            lines.append("Drivers: status unavailable")
+
+        try:
+            wol_st = wol.status(self.host_profile)
+            persist = "on" if wol_st.get("unit_enabled") else "off"
+            flags = wol_st.get("wake_flags") or "none"
+            lines.append(f"Wake-on-LAN: {flags} flags · persist {persist}")
+        except Exception:
+            lines.append("Wake-on-LAN: status unavailable")
+
         return "\n".join(lines)
 
-    def _compute_models_text(self) -> str:
-        counts: dict[str, int] = {}
-        for model in self.models.get("models", []):
-            engine = model.get("engine", "unknown")
-            counts[engine] = counts.get(engine, 0) + 1
-        count_line = ", ".join(f"{n} {engine}" for engine, n in sorted(counts.items())) or "no models configured"
+    def _compute_llm_services_text(self) -> str:
+        lines: list[str] = []
         try:
             swap_status = swap.status(self.host_profile)
+            if swap_status.get("unit_active"):
+                ver = f" ({swap_status['installed_version']})" if swap_status.get("installed_version") else ""
+                lines.append(f"[$success]✔[/] llama-swap: running{ver}")
+            else:
+                lines.append("[$error]✖[/] llama-swap: stopped")
+        except FileNotFoundError:
+            lines.append("[$text-muted]●[/] llama-swap: systemd not available")
         except Exception as e:
-            return f"{count_line}\nllama-swap: error checking status ({e})"
-        swap_line = (
-            f"llama-swap: {'running' if swap_status['unit_active'] else 'stopped'} "
-            f"({'enabled' if swap_status['unit_enabled'] else 'disabled'} on boot)"
-        )
-        if swap_status["installed_version"]:
-            swap_line += f" — {swap_status['installed_version']}"
-        return f"{count_line}\n{swap_line}"
+            lines.append(f"[$warning]●[/] llama-swap: error ({e})")
+
+        iface = self.host_profile.get("network", {}).get("vpn", {}).get("interface", "unknown")
+        port = self.host_profile.get("network", {}).get("gateway", {}).get("port", 8090)
+        try:
+            ip = swap.resolve_vpn_ip(iface)
+            lines.append(f"Endpoint: {ip}:{port}" if ip else f"Endpoint: {iface}:{port}")
+        except Exception:
+            lines.append(f"Endpoint: {iface}:{port}")
+
+        active_backends: list[str] = []
+        for backend in self.backends:
+            try:
+                builds = build_step.list_builds(self.host_profile, backend)
+                current = next((b for b in builds if b.get("current")), None)
+                if current:
+                    ref = (current.get("ref") or "")[:10]
+                    active_backends.append(f"{backend} ({ref})")
+            except Exception:
+                pass
+        if active_backends:
+            lines.append(f"Active backend: {', '.join(active_backends)}")
+        else:
+            lines.append("Active backend: none built")
+
+        return "\n".join(lines)
+
+    def _compute_system_services_text(self) -> str:
+        lines: list[str] = []
+        try:
+            ts_status = tailscale.status(self.host_profile)
+            if not ts_status.get("installed"):
+                lines.append("[$warning]●[/] tailscaled: not installed")
+            elif ts_status.get("logged_in"):
+                ip_str = f" ({ts_status['ip']})" if ts_status.get("ip") else ""
+                lines.append(f"[$success]✔[/] tailscaled: connected{ip_str}")
+            else:
+                state = ts_status.get("backend_state") or "stopped"
+                lines.append(f"[$warning]●[/] tailscaled: {state}")
+        except Exception as e:
+            lines.append(f"[$warning]●[/] tailscaled: error ({e})")
+
+        # TLP / Power profile
+        tlp_active = False
+        if shutil.which("tlp") is not None:
+            try:
+                res = subprocess.run(
+                    ["systemctl", "is-active", "tlp"],
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                )
+                tlp_active = res.returncode == 0 and res.stdout.strip() == "active"
+            except Exception:
+                pass
+
+        profile_str = None
+        if shutil.which("powerprofilesctl") is not None:
+            try:
+                res = subprocess.run(
+                    ["powerprofilesctl", "get"],
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                )
+                if res.returncode == 0 and res.stdout.strip():
+                    profile_str = res.stdout.strip()
+            except Exception:
+                pass
+        if not profile_str:
+            p = Path("/sys/firmware/acpi/platform_profile")
+            if p.exists():
+                try:
+                    profile_str = p.read_text().strip()
+                except Exception:
+                    pass
+
+        if tlp_active and profile_str:
+            lines.append(f"[$success]✔[/] tlp: active · power: {profile_str}")
+        elif tlp_active:
+            lines.append("[$success]✔[/] tlp: active")
+        elif profile_str:
+            lines.append(f"[$success]✔[/] power profile: {profile_str}")
+        elif shutil.which("tlp") is not None:
+            lines.append("[$warning]●[/] tlp: inactive")
+        else:
+            lines.append("[$text-muted]●[/] tlp/power: not managed")
+
+        return "\n".join(lines)
 
     def _compute_containers_text(self) -> str:
         try:
             containers = docker.list_containers()
         except RuntimeError as e:
-            return f"not available: {e}"
+            return f"[$warning]●[/] Docker: {e}"
+        except Exception as e:
+            return f"[$warning]●[/] Docker: error ({e})"
+
         if not containers:
-            return "no containers found"
+            return "[$text-muted]●[/] Docker: no containers found"
+
+        total = len(containers)
         running = sum(1 for c in containers if c.get("state") == "running")
         unhealthy = [c["name"] for c in containers if "unhealthy" in (c.get("status") or "").lower()]
-        text = f"{running}/{len(containers)} running"
+
         if unhealthy:
-            text += f"\nunhealthy: {', '.join(unhealthy)}"
-        return text
-
-    def _compute_downloads_text(self) -> str:
-        downloaded = missing = placeholder = 0
-        for model in self.models.get("models", []):
-            if model.get("engine") != "llama-cpp":
-                continue
-            status = hf.model_status(model, self.host_profile)
-            if status == "downloaded":
-                downloaded += 1
-            elif status == "missing":
-                missing += 1
-            elif status == "placeholder":
-                placeholder += 1
-        total = downloaded + missing + placeholder
-        if total == 0:
-            return "no llama-cpp models configured"
-        return f"{downloaded}/{total} downloaded, {missing} missing, {placeholder} placeholder"
-
-    def _compute_hardware_text(self) -> str:
-        gpu_count = len(self.host_profile.get("gpus", []))
-        lines = [f"{gpu_count} GPU(s) configured"]
-
-        try:
-            lock_data = drivers.read_lockfile_status(self.host_profile, self.repo_root)
-        except Exception as e:
-            lines.append(f"driver lockfile: error reading ({e})")
+            return f"[$error]✖[/] {running}/{total} containers running ({len(unhealthy)} unhealthy: {', '.join(unhealthy)})"
+        elif running == total:
+            return f"[$success]✔[/] {total}/{total} containers healthy"
         else:
-            lines.append(
-                "driver lockfile: not checked yet" if lock_data is None
-                else f"driver lockfile: last checked {lock_data.get('generated_at', 'unknown')}"
-            )
+            stopped = total - running
+            return f"[$warning]●[/] {running}/{total} containers running ({stopped} stopped)"
 
+    def _compute_upstream_updates_text(self) -> str:
         try:
-            wol_status = wol.status(self.host_profile)
-        except Exception as e:
-            lines.append(f"Wake-on-LAN: error checking ({e})")
-        else:
-            lines.append(
-                f"Wake-on-LAN: {wol_status['wake_flags'] or 'unknown'} flags, "
-                f"persistence {'enabled' if wol_status['unit_enabled'] else 'disabled'}"
-            )
-        return "\n".join(lines)
+            cpp_res = update_check.check_llama_cpp(self.manifest)
+            swap_res = update_check.check_llama_swap(self.manifest)
 
-    def _compute_scripts_text(self) -> str:
-        registered = self.scripts.get("scripts", [])
-        if not registered:
-            return "no scripts registered"
-        running = 0
-        for script in registered:
-            try:
-                st = scripts_step.status(script["id"])
-                if st["unit_active"]:
-                    running += 1
-            except Exception:
-                continue
-        return f"{running}/{len(registered)} running"
+            updates: list[str] = []
+            if cpp_res.get("ok") and cpp_res.get("update_available"):
+                latest_sha = (cpp_res.get("latest") or "")[:7]
+                updates.append(f"llama.cpp {latest_sha}")
+            if swap_res.get("ok") and swap_res.get("update_available"):
+                latest_ver = swap_res.get("latest") or ""
+                updates.append(f"llama-swap {latest_ver}")
+
+            if updates:
+                return f"[$warning]★[/] Update available: {', '.join(updates)}"
+            elif cpp_res.get("ok") and swap_res.get("ok"):
+                return "[$success]✔[/] All components up to date"
+            else:
+                return "[$text-muted]●[/] Upstream check offline"
+        except Exception:
+            return "[$text-muted]●[/] Upstream check offline"

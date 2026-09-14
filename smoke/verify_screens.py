@@ -29,13 +29,15 @@ async def verify_geometry_and_export_screenshots() -> None:
     ]
 
     screens = [
-        ("dashboard", "dashboard", None),
-        ("builds", "llm", "backends"),
-        ("containers", "containers", None),
-        ("scripts", "scripts", None),
-        ("deploy", "llm", "models"),
-        ("downloads", "llm", "hf-downloads"),
-        ("settings", "settings", None),
+        ("dashboard", "dashboard", None, None),
+        ("builds", "llm", "backends", None),
+        ("containers", "containers", None, None),
+        ("scripts", "scripts", None, None),
+        ("deploy", "llm", "models", None),
+        ("downloads", "llm", "hf-downloads", None),
+        ("settings", "settings", None, "settings-tab-host"),
+        ("settings_gpus", "settings", None, "settings-tab-gpus"),
+        ("settings_services", "settings", None, "settings-tab-services"),
     ]
 
     for size, expected_class, expected_layout in resolutions:
@@ -47,6 +49,16 @@ async def verify_geometry_and_export_screenshots() -> None:
             classes = set(app.screen.classes)
             print(f"Screen classes: {classes}")
             assert expected_class in classes, f"Expected {expected_class} in {classes}"
+            assert app.screen.show_vertical_scrollbar is False, f"Phantom scrollbar detected at {w}x{h}"
+
+            banner_art = app.query_one("#banner-art")
+            banner_compact = app.query_one("#banner-compact")
+            if expected_class == "-narrow":
+                assert banner_art.styles.display == "none", "Expected banner-art to be hidden at 80x24"
+                assert banner_compact.styles.display == "block", "Expected banner-compact to be visible at 80x24"
+            else:
+                assert banner_art.styles.display == "block", "Expected banner-art to be visible at 120x30"
+                assert banner_compact.styles.display == "none", "Expected banner-compact to be hidden at 120x30"
 
             dashboard_cols = app.query_one("#dashboard-columns")
             actual_layout = str(dashboard_cols.styles.layout).strip("<>")
@@ -56,11 +68,14 @@ async def verify_geometry_and_export_screenshots() -> None:
             root_tc = app.query(TabbedContent).first()
             llm_tc = app.query(TabbedContent)[1]
 
-            for name, root_pane, sub_pane in screens:
-                print(f"Navigating to {name} (root: {root_pane}, sub: {sub_pane})...")
+            for name, root_pane, sub_pane, settings_pane in screens:
+                print(f"Navigating to {name} (root: {root_pane}, sub: {sub_pane}, settings: {settings_pane})...")
                 root_tc.active = root_pane
                 if sub_pane:
                     llm_tc.active = sub_pane
+                if settings_pane:
+                    settings_tc = app.query_one("#settings-tabs", TabbedContent)
+                    settings_tc.active = settings_pane
                 await pilot.pause(0.2)
 
                 svg = app.export_screenshot()

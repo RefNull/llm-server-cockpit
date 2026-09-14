@@ -6,17 +6,17 @@ the ConfirmModal gate in front of every mutating call.
 from __future__ import annotations
 
 import logging
-
 from pathlib import Path
 
 from rich.text import Text
 from textual import work
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Label, RichLog, Static
 
 from cockpit import update_check
-from cockpit.widgets import CockpitScreenBase, SingleClickDataTable, selection_marker
+from cockpit.widgets import CockpitDataTable, CockpitScreenBase, SingleClickDataTable, selection_marker
 from provision.common import Runner
 from provision.steps import build as build_step
 
@@ -48,13 +48,91 @@ class _BuildLogHandler(logging.Handler):
             pass  # app shutting down or no longer running in a thread context — drop it
 
 
+class BuildHistoryModal(ModalScreen[None]):
+    """Modal displaying recent build history entries."""
+
+    BINDINGS = [("escape", "dismiss_modal", "Close")]
+
+    DEFAULT_CSS = """
+    BuildHistoryModal {
+        align: center middle;
+    }
+    #history-dialog {
+        width: 90%;
+        height: 80%;
+        border: thick $background 80%;
+        background: $surface;
+        padding: 1 2;
+    }
+    #history-header {
+        height: auto;
+        margin-bottom: 1;
+    }
+    #history-title {
+        width: 1fr;
+        text-style: bold;
+    }
+    #history-table {
+        height: 1fr;
+        margin-bottom: 1;
+    }
+    """
+
+    def __init__(self, host_profile: dict, backends: list[str]) -> None:
+        super().__init__()
+        self.host_profile = host_profile
+        self.backends = backends
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="history-dialog"):
+            with Horizontal(id="history-header"):
+                yield Static("Recent Build History", id="history-title")
+                yield Button("×", id="history-close", classes="close-button", variant="error")
+            table = CockpitDataTable(id="history-table", zebra_stripes=True, fixed_columns=1)
+            table.cursor_type = "row"
+            yield table
+            with Horizontal(classes="action-row-secondary"):
+                yield Button("Close", id="btn-history-close-bottom", classes="thin-button")
+
+    def on_mount(self) -> None:
+        table = self.query_one("#history-table", CockpitDataTable)
+        table.add_column("Backend", width=12)
+        table.add_column("Timestamp (UTC)", width=22)
+        table.add_column("Outcome", width=16)
+        table.add_column("Detail", width=40)
+
+        all_history: list[tuple[str, dict]] = []
+        for backend in self.backends:
+            history = build_step.read_build_history(self.host_profile, backend, limit=10)
+            for h in history:
+                all_history.append((backend, h))
+        all_history.sort(key=lambda item: item[1].get("timestamp") or "", reverse=True)
+
+        for backend, h in all_history[:20]:
+            detail = h.get("detail") or ""
+            first_line = detail.splitlines()[0] if detail else ""
+            ts = (h.get("timestamp") or "")[:19].replace("T", " ")
+            outcome = h.get("outcome", "")
+            style = (
+                "green" if outcome == "smoke_pass"
+                else "bold red" if outcome in ("smoke_failed", "build_failed")
+                else ""
+            )
+            table.add_row(Text(backend), Text(ts), Text(outcome, style=style), Text(first_line))
+
+    def action_dismiss_modal(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id in ("history-close", "btn-history-close-bottom"):
+            self.dismiss(None)
+
+
 class BuildsScreen(CockpitScreenBase):
     """The 'Installs' tab. One panel per backend the host's GPUs actually use (cuda, vulkan,
     etc. per hosts/<hostname>.yaml), plus one upstream-version-check panel.
     """
 
-    # .panel / .panel-title / .button-row come from cockpit/widgets.py's SHARED_CSS
-    # (CockpitApp.CSS) — only this screen's own rules live here.
     DEFAULT_CSS = """
     BuildsScreen {
         height: 1fr;
@@ -67,9 +145,7 @@ class BuildsScreen(CockpitScreenBase):
     }
     BuildsScreen #build-status {
         text-style: italic;
-        margin-bottom: 1;
-    }
-    BuildsScreen #selected-build {
+        margin-top: 1;
         margin-bottom: 1;
     }
     """
@@ -96,9 +172,6 @@ class BuildsScreen(CockpitScreenBase):
         self._selected_ref: str | None = None
         self._builds_cache: dict[str, list[dict]] = {backend: [] for backend in self.backends}
         self._build_in_progress = False
-        # Ticked backends in the tick-able table below — same convention as the Downloads tab
-        # (see cockpit/widgets.py's selection_marker()/SingleClickDataTable): plain DataTable +
-        # a "[ ]"/"[x]" text marker, rebuilt on every toggle rather than mutated in place.
         self._selected_backends: set[str] = set()
         self._llama_cpp_check: dict | None = None
         self._llama_swap_check: dict | None = None
@@ -121,23 +194,13 @@ class BuildsScreen(CockpitScreenBase):
 
     def compose(self) -> ComposeResult:
         with VerticalScroll():
-            yield Static("Manage llama.cpp builds, versions, and rollback controls.", classes="subtitle")
-
             with Vertical(id="update-panel", classes="panel"):
-                yield Label("Components", classes="panel-title")
-                ref = self.manifest.get("llama_cpp", {}).get("ref", "")
-                yield Static(f"pinned llama.cpp ref: {self._short(ref)}", id="pinned-ref")
-                yield Label("Tick a llama.cpp backend, then Update selected — llama-swap is informational here (updated from the Deploy tab):")
-                # fixed_columns=2: column 0 is the tick marker, so pinning the identifier
-                # ("Component") during horizontal scroll takes both (DESIGN.md §4.2).
+                yield Static("Components", classes="section-title")
                 backends_table = SingleClickDataTable(
                     id="backends-table", zebra_stripes=True, classes="data-table", fixed_columns=2
                 )
                 backends_table.cursor_type = "row"
                 yield backends_table
-                with Horizontal(classes="button-row"):
-                    yield Button("Check for updates", id="check-updates-btn", classes="thin-button")
-                    yield Button("Update selected", id="update-selected-btn", variant="primary", classes="thin-button")
 
             if not self.backends:
                 yield Static(
@@ -148,15 +211,18 @@ class BuildsScreen(CockpitScreenBase):
                 )
             else:
                 with Vertical(id="builds-panel", classes="panel"):
-                    with Horizontal(classes="button-row"):
-                        yield Button("Roll back to selected", id="rollback-btn", variant="error", classes="thin-button")
+                    yield Static("Retained Builds", classes="section-title")
+                    builds_table = SingleClickDataTable(id="builds-table", classes="data-table", fixed_columns=1)
+                    builds_table.cursor_type = "row"
+                    yield builds_table
 
-                    yield Label("Retained builds (click a row to select it for rollback):")
-                    yield SingleClickDataTable(id="builds-table", classes="data-table", fixed_columns=1)
-                    yield Static("selected for rollback: (none — click a row above)", id="selected-build")
+            with Horizontal(classes="action-row-primary"):
+                yield Button("Update selected", id="btn-update-selected", variant="primary", classes="thin-button")
+                yield Button("Rollback", id="btn-rollback", variant="warning", classes="thin-button")
 
-                    yield Label("Recent build history:")
-                    yield SingleClickDataTable(id="history-table", classes="data-table", fixed_columns=1)
+            with Horizontal(classes="action-row-secondary"):
+                yield Button("Build History", id="btn-build-history", classes="thin-button")
+                yield Button("Check for Updates", id="btn-check-updates", classes="thin-button")
 
             yield Static("", id="build-status")
             yield RichLog(id="build-log", highlight=False, markup=False, max_lines=400)
@@ -167,7 +233,7 @@ class BuildsScreen(CockpitScreenBase):
         backends_table.zebra_stripes = True
         backends_table.add_column("", width=3)
         backends_table.add_column("Component", width=22)
-        backends_table.add_column("Pinned", width=12)
+        backends_table.add_column("Pinned", width=8)
         backends_table.add_column("Update", width=34)
 
         if self.backends:
@@ -179,14 +245,7 @@ class BuildsScreen(CockpitScreenBase):
             builds_table.add_column("Status", width=12)
             builds_table.add_column("Integrity", width=12)
 
-            history_table = self.query_one("#history-table", SingleClickDataTable)
-            history_table.zebra_stripes = True
-            history_table.add_column("Backend", width=12)
-            history_table.add_column("Timestamp (UTC)", width=22)
-            history_table.add_column("Outcome", width=16)
-            history_table.add_column("Detail", width=40)
-
-        self._refresh_builds_and_history()
+        self._refresh_builds()
         self._refresh_backends_table()
         # Initial check on mount so the panel isn't blank; the button below is for
         # re-checking on demand afterwards — refresh (the 'r' binding) never re-hits it.
@@ -194,19 +253,14 @@ class BuildsScreen(CockpitScreenBase):
 
     def on_refresh_requested(self) -> None:
         """Called by the app's global 'r' binding. Re-reads local build state only — never
-        re-triggers the network update check (that stays a manual action, see point 2)."""
-        self._refresh_builds_and_history()
+        re-triggers the network update check."""
+        self._refresh_builds()
 
     # ------------------------------------------------------------------ rendering
 
-    def _refresh_builds_and_history(self) -> None:
+    def _refresh_builds(self) -> None:
         if not self.backends:
             return
-        ref = self.manifest.get("llama_cpp", {}).get("ref", "")
-        if self.query("#pinned-ref"):
-            pinned_widget = self.query_one("#pinned-ref", Static)
-            pinned_widget.update(f"pinned llama.cpp ref: {self._short(ref)}")
-            pinned_widget.tooltip = ref
 
         table = self.query_one("#builds-table", DataTable)
         table.clear()
@@ -229,46 +283,26 @@ class BuildsScreen(CockpitScreenBase):
             if not any(b.get("ref") == self._selected_ref for b in backend_builds):
                 self._selected_backend = None
                 self._selected_ref = None
-        self._update_selected_label()
-
-        all_history: list[tuple[str, dict]] = []
-        for backend in self.backends:
-            history = build_step.read_build_history(self.host_profile, backend, limit=5)
-            for h in history:
-                all_history.append((backend, h))
-        all_history.sort(key=lambda item: item[1].get("timestamp") or "", reverse=True)
-
-        htable = self.query_one("#history-table", DataTable)
-        htable.clear()
-        for backend, h in all_history[:10]:
-            detail = h.get("detail") or ""
-            first_line = detail.splitlines()[0] if detail else ""
-            ts = (h.get("timestamp") or "")[:19].replace("T", " ")
-            outcome = h.get("outcome", "")
-            style = (
-                "green" if outcome == "smoke_pass"
-                else "bold red" if outcome in ("smoke_failed", "build_failed")
-                else ""
-            )
-            htable.add_row(Text(backend), Text(ts), Text(outcome, style=style), Text(first_line))
 
     def _refresh_backends_table(self) -> None:
         table = self.query_one("#backends-table", DataTable)
         table.clear()
         cpp_ref = self.manifest.get("llama_cpp", {}).get("ref", "")
         for backend in self.backends:
+            pinned_cell = Text("[★]", style="bold green") if cpp_ref else Text("[-]", style="dim")
             table.add_row(
                 selection_marker(backend in self._selected_backends),
                 Text(f"llama.cpp ({backend})"),
-                Text(self._short(cpp_ref)),
+                pinned_cell,
                 self._format_update_cell(self._llama_cpp_check, shorten=True),
                 key=backend,
             )
         swap_version = self.manifest.get("llama_swap", {}).get("version", "")
+        swap_pinned = Text("[★]", style="bold green") if swap_version else Text("[-]", style="dim")
         table.add_row(
             Text("—", style="dim"),
             Text("llama-swap"),
-            Text(swap_version),
+            swap_pinned,
             self._format_update_cell(self._llama_swap_check, shorten=False),
             key="llama-swap",
         )
@@ -283,17 +317,6 @@ class BuildsScreen(CockpitScreenBase):
         latest = self._short(result["latest"]) if shorten else result["latest"]
         return Text(f"update available (latest {latest})", style="bold yellow")
 
-    def _update_selected_label(self) -> None:
-        if not self.query("#selected-build"):
-            return
-        label = self.query_one("#selected-build", Static)
-        if self._selected_backend and self._selected_ref:
-            label.update(
-                f"selected for rollback: [{self._selected_backend}] {self._short(self._selected_ref)} (full: {self._selected_ref})"
-            )
-        else:
-            label.update("selected for rollback: (none — click a row above)")
-
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
         if event.data_table.id != "builds-table":
             return
@@ -305,7 +328,6 @@ class BuildsScreen(CockpitScreenBase):
             backend, _, ref = key_str.partition(":")
             self._selected_backend = backend
             self._selected_ref = ref
-        self._update_selected_label()
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         if event.data_table.id == "backends-table":
@@ -329,18 +351,19 @@ class BuildsScreen(CockpitScreenBase):
             backend, _, ref = key_str.partition(":")
             self._selected_backend = backend
             self._selected_ref = ref
-            self._update_selected_label()
 
     # ------------------------------------------------------------------ button dispatch
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
         button_id = event.button.id or ""
-        if button_id == "check-updates-btn":
+        if button_id == "btn-check-updates":
             self._run_update_check()
-        elif button_id == "update-selected-btn":
+        elif button_id == "btn-update-selected":
             await self._handle_update_selected_press()
-        elif button_id == "rollback-btn":
+        elif button_id == "btn-rollback":
             await self._handle_rollback_press()
+        elif button_id == "btn-build-history":
+            self.app.push_screen(BuildHistoryModal(self.host_profile, self.backends))
 
     async def _handle_update_selected_press(self) -> None:
         if self._build_in_progress:
@@ -411,16 +434,16 @@ class BuildsScreen(CockpitScreenBase):
             provision_logger.setLevel(prior_level)
             self.app.call_from_thread(self._selected_backends.clear)
             self.app.call_from_thread(self._set_building, False)
-            self.app.call_from_thread(self._refresh_builds_and_history)
+            self.app.call_from_thread(self._refresh_builds)
             self.app.call_from_thread(self._refresh_backends_table)
 
     def _set_building(self, active: bool) -> None:
         self._build_in_progress = active
         self.query_one("#build-status", Static).update("building... (see log below)" if active else "")
-        update_btn = self.query("#update-selected-btn")
+        update_btn = self.query("#btn-update-selected")
         if update_btn:
             update_btn.first(Button).disabled = active
-        rollback_btn = self.query("#rollback-btn")
+        rollback_btn = self.query("#btn-rollback")
         if rollback_btn:
             rollback_btn.first(Button).disabled = active
         if active:
@@ -446,15 +469,12 @@ class BuildsScreen(CockpitScreenBase):
 
         msg = f"{backend}: current now points at {self._short(target_ref)}"
         self.app.call_from_thread(self.app.notify, msg)
-        self.app.call_from_thread(self._refresh_builds_and_history)
+        self.app.call_from_thread(self._refresh_builds)
 
     # ------------------------------------------------------------------ upstream version check (network, off main thread)
 
     @work(thread=True)
     def _run_update_check(self, *, notify_result: bool = True) -> None:
-        # DESIGN.md §6: a network check the operator can navigate away from reports its outcome
-        # as a toast, not only in the table cell they may no longer be looking at. The one
-        # exception is the automatic check on mount (notify_result=False) — nobody triggered it.
         self.app.call_from_thread(self._set_checking_status, True)
         try:
             result_cpp = update_check.check_llama_cpp(self.manifest)
@@ -478,7 +498,7 @@ class BuildsScreen(CockpitScreenBase):
     def _set_checking_status(self, checking: bool) -> None:
         if not self.is_mounted:
             return
-        btn = self.query("#check-updates-btn")
+        btn = self.query("#btn-check-updates")
         if btn:
             btn.first(Button).disabled = checking
         if checking:

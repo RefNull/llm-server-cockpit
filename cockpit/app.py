@@ -48,19 +48,6 @@ class CockpitHeader(Vertical):
         align: center middle;
         margin: 0 2 1 2;
     }
-    CockpitHeader #banner-art {
-        color: #f5a623;
-        content-align: center middle;
-        text-align: center;
-        width: 100%;
-        overflow-x: hidden;
-    }
-    CockpitHeader #banner-meta {
-        content-align: center middle;
-        text-align: center;
-        width: 100%;
-        color: $text-muted;
-    }
     """
 
     def __init__(self, host_name: str) -> None:
@@ -69,8 +56,9 @@ class CockpitHeader(Vertical):
 
     def compose(self) -> ComposeResult:
         yield Static(ASCII_BANNER, id="banner-art")
+        yield Static("[bold #f5a623]LLM-SERVER-COCKPIT[/]", id="banner-compact")
         yield Static(
-            f"[bold #f5a623]Local LLM server cockpit · v{__version__}[/]  [dim]·[/]  [dim]Host:[/] [bold #e5a93c]{self.host_name}[/]",
+            f"[bold #f5a623]v{__version__}[/] [dim]·[/] [dim]Host:[/] [bold #e5a93c]{self.host_name}[/]",
             id="banner-meta",
         )
 
@@ -102,7 +90,35 @@ class CockpitApp(App):
     CSS = (
         SHARED_CSS
         + """
+    Screen.-narrow #banner-art {
+        display: none;
+    }
+    Screen.-narrow #banner-compact {
+        display: block;
+        text-align: center;
+        margin-bottom: 0;
+    }
+    Screen.-wide #banner-art {
+        display: block;
+        content-align: center middle;
+        text-align: center;
+        width: 100%;
+        color: #f5a623;
+    }
+    Screen.-wide #banner-compact {
+        display: none;
+    }
+    #banner-meta {
+        content-align: center middle;
+        text-align: center;
+        width: 100%;
+        color: $text-muted;
+    }
+    Screen {
+        overflow: hidden;
+    }
     TabbedContent {
+        height: 1fr;
         margin: 0 2;
     }
     """
@@ -115,9 +131,9 @@ class CockpitApp(App):
     ]
 
     # DESIGN.md §2. Textual stamps exactly one of these classes onto the active Screen on every
-    # resize (width < 110 -> Screen.-narrow, >= 110 -> Screen.-wide); the reflow itself lives in
+    # resize (width < 120 -> Screen.-narrow, >= 120 -> Screen.-wide); the reflow itself lives in
     # SHARED_CSS / screen DEFAULT_CSS, so no screen implements on_resize geometry by hand.
-    HORIZONTAL_BREAKPOINTS: ClassVar[list[tuple[int, str]]] = [(0, "-narrow"), (110, "-wide")]
+    HORIZONTAL_BREAKPOINTS: ClassVar[list[tuple[int, str]]] = [(0, "-narrow"), (120, "-wide")]
 
     def __init__(self, host: str | None = None) -> None:
         super().__init__()

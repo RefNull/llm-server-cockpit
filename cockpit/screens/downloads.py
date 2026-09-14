@@ -4,64 +4,102 @@ buttons that call the same hf.py functions the CLI uses.
 """
 from __future__ import annotations
 
+import os
+import re
 import shutil
 from pathlib import Path
 from typing import Any
 
+import yaml
+from rich.text import Text
 from textual import work
 from textual.app import ComposeResult
-from textual.containers import Horizontal, VerticalScroll
-from textual.widgets import Button, DataTable, Label, Static
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.screen import ModalScreen
+from textual.widgets import Button, DataTable, Input, Label, Static
 
+from cockpit.widgets import CockpitScreenBase, SingleClickDataTable, selection_marker
+from provision import schema
 from provision.common import Runner
 from provision.steps import hf
 
-from cockpit.widgets import CockpitScreenBase, ConfirmModal, SingleClickDataTable, selection_marker
-
 STATUS_ICONS = {
-    "downloaded": "✅ downloaded",   # ✅
-    "missing": "⬜ missing",         # ⬜
-    "placeholder": "⚠️  PLACEHOLDER — edit models.yaml",  # ⚠️
+    "downloaded": "✅ downloaded",
+    "missing": "⬜ missing",
+    "placeholder": "⚠️  PLACEHOLDER — edit models.yaml",
 }
 
 
-class DownloadsScreen(CockpitScreenBase):
-    """Not a Textual Screen — mounted inside a TabPane by cockpit/app.py.
+class HFTokenModal(ModalScreen[str | None]):
+    """Lightweight modal to enter a Hugging Face token on-demand."""
 
-    Judgment call: per-model download buttons are DISABLED (not just left to fail) for
-    "downloaded" and "placeholder" status, matching the project's stated bias toward making
-    a bad action structurally impossible to express rather than catching it after the fact.
-    The "Download all" button stays enabled regardless — hf.run() already has its own
-    skip-placeholder-and-report logic, so there's nothing to pre-empt there.
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    DEFAULT_CSS = """
+    HFTokenModal {
+        align: center middle;
+    }
+    #hf-token-dialog {
+        width: 60;
+        height: auto;
+        border: thick $background 80%;
+        background: $surface;
+        padding: 1 2;
+    }
+    #hf-token-title {
+        text-style: bold;
+        margin-bottom: 1;
+    }
+    #hf-token-msg {
+        color: $text-muted;
+        margin-bottom: 1;
+    }
+    #hf-token-input {
+        margin-bottom: 1;
+    }
     """
 
-    # .button-row / .status-text come from cockpit/widgets.py's SHARED_CSS (CockpitApp.CSS).
-    # Root content is wrapped in a VerticalScroll (see compose()); the table gets a bounded
-    # max-height rather than 1fr, which doesn't have a well-defined meaning inside a
-    # content-sized scroll container (matches builds.py's DataTable convention).
+    def __init__(self, token_env: str) -> None:
+        super().__init__()
+        self.token_env = token_env
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="hf-token-dialog"):
+            yield Static("Hugging Face Authentication", id="hf-token-title")
+            yield Static(
+                f"Export {self.token_env} or enter your token below for this session:",
+                id="hf-token-msg",
+            )
+            yield Input(placeholder="hf_...", password=True, id="hf-token-input")
+            with Horizontal(classes="button-row"):
+                yield Button("Continue", id="btn-token-continue", variant="primary", classes="thin-button")
+                yield Button("Cancel", id="btn-token-cancel", classes="thin-button")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-token-continue":
+            val = self.query_one("#hf-token-input", Input).value.strip()
+            self.dismiss(val if val else None)
+        elif event.button.id == "btn-token-cancel":
+            self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class DownloadsScreen(CockpitScreenBase):
+    """Not a Textual Screen — mounted inside a TabPane by cockpit/app.py."""
+
     DEFAULT_CSS = """
     DownloadsScreen {
         height: 1fr;
         padding: 0;
     }
-    #auth-banner {
-        padding: 1 2;
-        margin-bottom: 1;
-    }
-    #auth-banner.ok {
-        background: $success 20%;
-        color: $success;
-    }
-    #auth-banner.bad {
-        background: $error 20%;
-        color: $error;
-    }
     #disk-usage {
-        margin: 1 0;
+        margin-top: 1;
+        color: $text-muted;
     }
-    #empty-models-notice {
-        margin: 1 0;
-        text-style: italic;
+    #download-status {
+        margin-top: 1;
     }
     """
 
@@ -83,22 +121,18 @@ class DownloadsScreen(CockpitScreenBase):
         self.cockpit_app = app_ref
         # id -> model dict, for the llama-cpp models currently shown in the table.
         self._downloadable: dict[str, dict[str, Any]] = {}
-        # Ticked model ids — tick-able table convention ported from kyuz0/ai-toolbox-cockpit:
-        # plain DataTable + a "[ ]"/"[x]" text marker in column 0, not a Checkbox widget. See
-        # cockpit/widgets.py's selection_marker()/SingleClickDataTable.
         self._selected: set[str] = set()
         self._downloading = False
 
     def compose(self) -> ComposeResult:
         with VerticalScroll():
-            yield Static("Hugging Face model weights download and cache inventory", classes="subtitle")
-            yield Static("", id="auth-banner")
-            yield Static("", id="disk-usage")
-            yield Static(
-                "No llama-cpp models configured in models.yaml. Add models under the Deploy tab first.",
-                id="empty-models-notice",
-                classes="status-text",
-            )
+            with Horizontal(classes="inline-row"):
+                yield Input(
+                    placeholder="Hugging Face repo/model or GGUF filename...",
+                    id="adhoc-model-input",
+                )
+                yield Button("Download", id="adhoc-download-btn", variant="primary", classes="thin-button")
+
             # fixed_columns=2: column 0 is the tick marker, so keeping the model ID visible
             # while repo_id/quant_file/status scroll horizontally takes both (DESIGN.md §4.2).
             table = SingleClickDataTable(
@@ -106,10 +140,14 @@ class DownloadsScreen(CockpitScreenBase):
             )
             table.cursor_type = "row"
             yield table
-            with Horizontal(classes="button-row"):
-                yield Button("Download selected", id="download-selected", variant="primary", classes="thin-button")
-                yield Button("Download all", id="download-all", variant="primary", classes="thin-button")
-            yield Label("", id="download-status", classes="status-text")
+
+            with Horizontal(classes="action-row-primary"):
+                yield Button("Download selected", id="btn-download-selected", variant="primary", classes="thin-button")
+                yield Button("Download all", id="btn-download-all", variant="error", classes="thin-button")
+
+            with Horizontal(classes="action-row-secondary"):
+                yield Static("", id="disk-usage")
+                yield Label("", id="download-status", classes="status-text")
 
     def on_mount(self) -> None:
         table = self.query_one("#model-table", SingleClickDataTable)
@@ -118,29 +156,12 @@ class DownloadsScreen(CockpitScreenBase):
         table.add_column("Repo ID", width=36)
         table.add_column("Quant File", width=26)
         table.add_column("Status", width=32)
-        self._refresh_auth_banner()
         self._refresh_table()
         self._refresh_disk_usage()
 
     # ------------------------------------------------------------------
     # Rendering
     # ------------------------------------------------------------------
-
-    def _refresh_auth_banner(self) -> None:
-        banner = self.query_one("#auth-banner", Static)
-        token_env = self.host_profile["hf"]["token_env"]
-        if hf.auth_configured(self.host_profile):
-            banner.remove_class("bad")
-            banner.add_class("ok")
-            banner.update(f"HF auth OK — {token_env} is set.")
-        else:
-            banner.remove_class("ok")
-            banner.add_class("bad")
-            banner.update(
-                f"HF auth NOT configured — export {token_env} with a Hugging Face token "
-                "before downloading anything here (login happens inside 'Download all'; "
-                "a per-model download will fail without it too)."
-            )
 
     def _refresh_table(self) -> None:
         table = self.query_one("#model-table", SingleClickDataTable)
@@ -161,18 +182,19 @@ class DownloadsScreen(CockpitScreenBase):
                 STATUS_ICONS.get(status, status),
                 key=model["id"],
             )
-        # A model that disappeared from models.yaml (or changed engine) can't stay ticked.
         self._selected &= self._downloadable.keys()
 
+        btn_selected = self.query("#btn-download-selected")
+        btn_all = self.query("#btn-download-all")
+
         if not self._downloadable:
-            self.query_one("#model-table").display = False
-            self.query_one("#empty-models-notice").display = True
-            self.query_one("#download-selected", Button).disabled = True
-            self.query_one("#download-all", Button).disabled = True
+            if btn_selected:
+                btn_selected.first(Button).disabled = True
+            if btn_all:
+                btn_all.first(Button).disabled = True
         else:
-            self.query_one("#model-table").display = True
-            self.query_one("#empty-models-notice").display = False
-            self.query_one("#download-all", Button).disabled = self._downloading
+            if btn_all:
+                btn_all.first(Button).disabled = self._downloading
             self._sync_button_state()
 
     def _refresh_disk_usage(self) -> None:
@@ -193,7 +215,10 @@ class DownloadsScreen(CockpitScreenBase):
     def _sync_button_state(self) -> None:
         """Enable 'Download selected' only when at least one ticked model is still
         downloadable ('missing') and no download is already running."""
-        button = self.query_one("#download-selected", Button)
+        btn = self.query("#btn-download-selected")
+        if not btn:
+            return
+        button = btn.first(Button)
         if self._downloading:
             button.disabled = True
             return
@@ -221,21 +246,149 @@ class DownloadsScreen(CockpitScreenBase):
 
     def on_refresh_requested(self) -> None:
         self.models = getattr(self.cockpit_app, "models", self.models)
-        self._refresh_auth_banner()
         self._refresh_table()
         self._refresh_disk_usage()
 
     # ------------------------------------------------------------------
-    # Button handling
+    # Auth on-demand helper
     # ------------------------------------------------------------------
 
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "download-selected":
-            self._on_download_selected()
-        elif event.button.id == "download-all":
-            self._on_download_all()
+    async def _ensure_hf_auth(self) -> bool:
+        token_env = self.host_profile.get("hf", {}).get("token_env", "HF_TOKEN")
+        if not os.environ.get(token_env):
+            token = await self.app.push_screen_wait(HFTokenModal(token_env))
+            if not token:
+                self.notify("Hugging Face token required to download weights", severity="warning")
+                return False
+            os.environ[token_env] = token
+        return True
 
-    def _on_download_selected(self) -> None:
+    # ------------------------------------------------------------------
+    # Button handling & download actions
+    # ------------------------------------------------------------------
+
+    async def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-download-selected":
+            await self._on_download_selected()
+        elif event.button.id == "btn-download-all":
+            await self._on_download_all()
+        elif event.button.id == "adhoc-download-btn":
+            await self._on_adhoc_download()
+
+    async def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "adhoc-model-input":
+            await self._on_adhoc_download()
+
+    @staticmethod
+    def _parse_adhoc_input(raw: str) -> tuple[str, str] | None:
+        raw = raw.strip()
+        if raw.startswith("https://huggingface.co/"):
+            raw = raw.removeprefix("https://huggingface.co/").strip()
+        elif raw.startswith("hf.co/"):
+            raw = raw.removeprefix("hf.co/").strip()
+        for branch in ("/blob/main/", "/resolve/main/", "/blob/master/", "/resolve/master/"):
+            if branch in raw:
+                raw = raw.replace(branch, "/")
+        if ":" in raw:
+            repo_id, _, quant_file = raw.partition(":")
+            repo_id, quant_file = repo_id.strip(), quant_file.strip()
+            if repo_id and quant_file:
+                return repo_id, quant_file
+        if " " in raw:
+            repo_id, quant_file = raw.split(None, 1)
+            repo_id, quant_file = repo_id.strip(), quant_file.strip()
+            if repo_id and quant_file:
+                return repo_id, quant_file
+        parts = [p.strip() for p in raw.split("/") if p.strip()]
+        if len(parts) >= 3 and parts[-1].endswith(".gguf"):
+            return "/".join(parts[:-1]), parts[-1]
+        if len(parts) == 2 and parts[1].endswith(".gguf"):
+            return parts[0], parts[1]
+        return None
+
+    @work
+    async def _on_adhoc_download(self) -> None:
+        raw = self.query_one("#adhoc-model-input", Input).value.strip()
+        if not raw:
+            self.notify("Enter a Hugging Face repo and model file", severity="warning")
+            return
+        parsed = self._parse_adhoc_input(raw)
+        if not parsed:
+            self.notify(
+                "Could not parse input. Provide repo and filename (e.g. 'repo/model/file.gguf' or 'repo:file.gguf')",
+                severity="error",
+            )
+            return
+        repo_id, quant_file = parsed
+
+        if not await self._ensure_hf_auth():
+            return
+
+        confirmed = await self.confirm(
+            f"Download {quant_file} from {repo_id} and register in models.yaml?",
+            confirm_label="Download",
+            danger=True,
+        )
+        if not confirmed:
+            return
+
+        # Check if already present in models
+        existing = next(
+            (
+                m for m in self.models.get("models", [])
+                if m.get("engine") == "llama-cpp" and m.get("quant_file") == quant_file
+            ),
+            None,
+        )
+        if existing:
+            target_model = existing
+        else:
+            stem = Path(quant_file).stem
+            clean_id = re.sub(r"[^a-zA-Z0-9_\.\-]", "-", stem).lower().strip("-") or "model"
+            candidate_id = clean_id
+            existing_ids = {m.get("id") for m in self.models.get("models", [])}
+            counter = 2
+            while candidate_id in existing_ids:
+                candidate_id = f"{clean_id}-{counter}"
+                counter += 1
+
+            gpus = self.host_profile.get("gpus", [])
+            gpu_id = gpus[0]["id"] if gpus else "gpu-0"
+            backend = gpus[0]["backends"][0] if gpus and gpus[0].get("backends") else "cuda"
+
+            target_model = {
+                "id": candidate_id,
+                "engine": "llama-cpp",
+                "repo_id": repo_id,
+                "quant_file": quant_file,
+                "bind": {"gpu": gpu_id, "backend": backend},
+                "ttl": 300,
+            }
+
+            models_list = list(self.models.get("models", []))
+            models_list.append(target_model)
+            candidate_data = {"models": models_list}
+            try:
+                validated = schema.validate_models_dict(
+                    candidate_data, self.host_profile, self.manifest, source="models.yaml"
+                )
+                models_yaml_path = self.repo_root / "models.yaml"
+                models_yaml_path.write_text(yaml.safe_dump(validated, sort_keys=False), encoding="utf-8")
+                if hasattr(self.cockpit_app, "reload_models"):
+                    self.cockpit_app.reload_models()
+                    self.models = self.cockpit_app.models
+                else:
+                    self.models = candidate_data
+            except Exception as e:
+                self.notify(f"Failed to register model in models.yaml: {e}", severity="error")
+                return
+
+        self.query_one("#adhoc-model-input", Input).value = ""
+        self._refresh_table()
+        self._run_download_batch([target_model])
+
+    @work
+    async def _on_download_selected(self) -> None:
         pending = [
             self._downloadable[model_id]
             for model_id in sorted(self._selected)
@@ -243,24 +396,34 @@ class DownloadsScreen(CockpitScreenBase):
             and hf.model_status(self._downloadable[model_id], self.host_profile) == "missing"
         ]
         if not pending:
-            # Button should already be disabled in this case; belt-and-braces guard.
             return
-        self._confirm_and_download_selected(pending)
-
-    @work
-    async def _confirm_and_download_selected(self, models: list[dict[str, Any]]) -> None:
-        names = ", ".join(m["id"] for m in models)
-        confirmed = await self.app.push_screen_wait(
-            ConfirmModal(
-                f"Download {len(models)} selected model(s)?\n{names}\n"
-                "This can take a while and uses bandwidth.",
-                confirm_label="Download",
-                danger=True,
-            )
+        if not await self._ensure_hf_auth():
+            return
+        names = ", ".join(m["id"] for m in pending)
+        confirmed = await self.confirm(
+            f"Download {len(pending)} selected model(s)?\n{names}\n"
+            "This can take a while and uses bandwidth.",
+            confirm_label="Download",
+            danger=True,
         )
         if not confirmed:
             return
-        self._run_download_batch(models)
+        self._run_download_batch(pending)
+
+    @work
+    async def _on_download_all(self) -> None:
+        if not await self._ensure_hf_auth():
+            return
+        confirmed = await self.confirm(
+            "Download ALL non-placeholder models?\n"
+            "This provisions/updates the hf venv, logs in, and downloads every model "
+            "not marked as a placeholder. Can take a long time and uses significant bandwidth.",
+            confirm_label="Download all",
+            danger=True,
+        )
+        if not confirmed:
+            return
+        self._run_download_all()
 
     @work(thread=True)
     def _run_download_batch(self, models: list[dict[str, Any]]) -> None:
@@ -268,17 +431,18 @@ class DownloadsScreen(CockpitScreenBase):
         status_label = self.query_one("#download-status", Label)
         failures: list[str] = []
         try:
+            venv_path = Path(self.host_profile["paths"]["state_dir"]) / "venv-hf"
+            hf._ensure_venv(venv_path, self.runner)
+            hf._ensure_hub_pinned(venv_path, self.manifest["huggingface_hub"]["version"], self.runner)
+            models_dir = self.host_profile["paths"]["models_dir"]
+            self.runner.mkdir(models_dir)
+
             for model in models:
                 model_id = model["id"]
                 self.app.call_from_thread(status_label.update, f"Downloading {model_id}...")
                 try:
                     hf.download_model(model, self.host_profile, self.runner)
-                except BaseException as exc:  # noqa: BLE001 — surface any failure instead of a dead thread
-                    # download_model() itself doesn't call sys.exit() (only run() does — see
-                    # hf.py), but it shells out via Runner.run(check=True), so a bad
-                    # repo_id/network failure raises CalledProcessError/OSError. Catch broadly
-                    # anyway: better an ugly message in the UI than a silently dead worker
-                    # thread, and keep going with the rest of the batch.
+                except BaseException as exc:  # noqa: BLE001
                     failures.append(model_id)
                     self.app.call_from_thread(
                         self.app.notify, f"{model_id}: download failed — {exc}", severity="error"
@@ -296,24 +460,6 @@ class DownloadsScreen(CockpitScreenBase):
             self.app.call_from_thread(self._refresh_disk_usage)
             self.app.call_from_thread(self._set_downloading, False)
 
-    def _on_download_all(self) -> None:
-        self._confirm_and_download_all()
-
-    @work
-    async def _confirm_and_download_all(self) -> None:
-        confirmed = await self.app.push_screen_wait(
-            ConfirmModal(
-                "Download ALL non-placeholder models?\n"
-                "This provisions/updates the hf venv, logs in, and downloads every model "
-                "not marked as a placeholder. Can take a long time and uses significant bandwidth.",
-                confirm_label="Download all",
-                danger=True,
-            )
-        )
-        if not confirmed:
-            return
-        self._run_download_all()
-
     @work(thread=True)
     def _run_download_all(self) -> None:
         self.app.call_from_thread(self._set_downloading, True)
@@ -322,14 +468,6 @@ class DownloadsScreen(CockpitScreenBase):
         try:
             hf.run(self.host_profile, self.manifest, self.models, self.runner, self.repo_root)
         except BaseException as exc:  # noqa: BLE001
-            # hf.run() calls sys.exit(...) both for a missing HF token and for any models
-            # left with placeholder repo_ids after attempting the rest. sys.exit() raises
-            # SystemExit, which is a BaseException, not Exception — and because this runs in
-            # a @work(thread=True) worker, an uncaught SystemExit here would just kill this
-            # background thread silently; it will NOT propagate up and terminate the TUI the
-            # way it would in a single-threaded CLI run. Catch BaseException broadly (sys.exit
-            # is the designed failure signal for this step) and surface exc's message in the
-            # UI instead of letting it vanish.
             message = str(exc) or repr(exc)
             self.app.call_from_thread(status_label.update, f"Download-all stopped: {message}")
             self.app.call_from_thread(self.app.notify, f"Download-all stopped: {message}", severity="error")
@@ -339,12 +477,16 @@ class DownloadsScreen(CockpitScreenBase):
             return
         self.app.call_from_thread(status_label.update, "Download-all complete.")
         self.app.call_from_thread(self.app.notify, "Download-all complete")
-        self.app.call_from_thread(self._refresh_auth_banner)
         self.app.call_from_thread(self._refresh_table)
         self.app.call_from_thread(self._refresh_disk_usage)
         self.app.call_from_thread(self._set_downloading, False)
 
     def _set_downloading(self, active: bool) -> None:
         self._downloading = active
-        self.query_one("#download-all", Button).disabled = active or not self._downloadable
+        all_btn = self.query("#btn-download-all")
+        if all_btn:
+            all_btn.first(Button).disabled = active or not self._downloadable
+        adhoc_btn = self.query("#adhoc-download-btn")
+        if adhoc_btn:
+            adhoc_btn.first(Button).disabled = active
         self._sync_button_state()
