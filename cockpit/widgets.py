@@ -18,8 +18,8 @@ not lettered, because §8's *screen* archetypes own A/B/C and "archetype B" mean
 table-driven screen and an in-table cell was a collision waiting to be misread:
   action-row — `Button(..., classes="thin-button")`, h1/min-width 10/no border. The only
                general-purpose button. Colour via `variant=` only.
-  in-table   — not a Button: `action_cell("Update")` -> rich Text in its own DataTable
-               column, click-dispatched (wired up in Phase 2).
+  in-table   — not a Button: a `TableAction` declared on a SingleClickDataTable, rendered as
+               `[ Update ]` rich Text in its own column and dispatched on a single click.
   inline     — a bare `Button(...)` inside `classes="inline-row"`, h3 so it lines up with
                the `Input` beside it. Styled distinctly on purpose.
 
@@ -33,12 +33,16 @@ from __future__ import annotations
 
 import re
 import subprocess
+from dataclasses import dataclass
 from importlib import import_module
 from pathlib import Path
+from typing import Callable
 from rich.text import Text, TextType
+from textual import work
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.coordinate import Coordinate
+from textual.message import Message
 from textual.screen import ModalScreen
 from textual.theme import Theme
 from textual.widget import Widget
@@ -302,8 +306,71 @@ def action_cell(label: str, *, destructive: bool = False) -> Text:
     Column width contract: `len(longest label in the column) + 4` (two brackets, two spaces).
     Destructive actions (Remove, Delete) take the theme's error colour rather than a
     differently-shaped label, so "this one is dangerous" reads at a glance down the column.
+
+    Screens don't normally call this directly — declare a `TableAction` and let
+    `SingleClickDataTable.add_action_column` own rendering, width and dispatch.
     """
     return Text(f"[ {label} ]", style=f"bold {AMBER_THEME.error}" if destructive else "")
+
+
+@dataclass(frozen=True)
+class TableAction:
+    """One per-row action column on a SingleClickDataTable (DESIGN.md §9, in-table archetype).
+
+    Declared once next to the table's other columns; rendering, column width, click dispatch
+    and confirmation all follow from the declaration rather than being re-done per screen.
+
+    id          the action name handed back to `CockpitScreenBase.handle_table_action`, and
+                also the DataTable column key (one column per action, so they coincide).
+    label       the text inside the brackets: `[ Update ]`.
+    destructive removes/deletes: $error-styled cell, and confirmed before it fires.
+    confirm     prompt for a non-destructive action that still changes host state (a service
+                restart). `{row}` is substituted with the row key. Destructive actions get a
+                default prompt and don't need this.
+    available   predicate on the row key: when it returns False the cell renders blank and
+                clicking it does nothing. This is how "Update" appears only on rows that
+                actually have an update. None = always available.
+    """
+
+    id: str
+    label: str
+    destructive: bool = False
+    confirm: str | None = None
+    available: Callable[[str], bool] | None = None
+
+    @property
+    def column_width(self) -> int:
+        """`action_cell`'s width contract: the label plus two brackets and two spaces."""
+        return len(self.label) + 4
+
+    def cell(self, row_key: str) -> Text:
+        if self.available is not None and not self.available(row_key):
+            return Text("")
+        return action_cell(self.label, destructive=self.destructive)
+
+    def confirm_message(self, row_key: str) -> str | None:
+        """None = fire immediately. Anything else goes through CockpitScreenBase.confirm()."""
+        if self.confirm is not None:
+            return self.confirm.format(row=row_key)
+        if self.destructive:
+            return f"{self.label} {row_key}?"
+        return None
+
+
+class TableActionInvoked(Message):
+    """Posted by SingleClickDataTable when an action cell is clicked. Bubbles to the enclosing
+    CockpitScreenBase, which handles confirmation and then calls `handle_table_action` — a
+    screen should not handle this message itself or it bypasses the confirm step."""
+
+    def __init__(self, table: DataTable, action: TableAction, row_key: str) -> None:
+        super().__init__()
+        self.table = table
+        self.action = action
+        self.row_key = row_key
+
+    @property
+    def control(self) -> DataTable:
+        return self.table
 
 
 class CockpitDataTable(DataTable):
@@ -341,11 +408,64 @@ class CockpitDataTable(DataTable):
 class SingleClickDataTable(CockpitDataTable):
     """A DataTable that selects a row on the first click instead of Textual's default, which
     requires the cursor to already be on a row before a click there counts as a selection (i.e.
-    two clicks to select an unvisited row). A tick-able table (Installs backends, Downloads
-    models) needs one click per row to toggle it, so this mirrors DataTable._on_click but always
-    posts the selection message instead of only when the click matches the existing cursor."""
+    two clicks to select an unvisited row). A tick-able table (Backends, Downloads models,
+    Scripts) needs one click per row to toggle it, so this mirrors DataTable._on_click but always
+    posts the selection message instead of only when the click matches the existing cursor.
+
+    It also hosts the per-row action columns (DESIGN.md §9, in-table archetype). Declare them
+    *after* every data column — `action_cells()` returns them in declaration order, to be
+    splatted onto the end of each `add_row` call:
+
+        table.add_column("ID", width=20)
+        table.add_action_column(TableAction("update", "Update", available=self._has_update))
+        table.add_action_column(TableAction("remove", "Remove", destructive=True))
+        ...
+        table.add_row(row_id, *table.action_cells(row_id), key=row_id)
+
+    A click on an action cell posts TableActionInvoked, which CockpitScreenBase turns into a
+    (confirmed, if the action asks for it) call to the screen's `handle_table_action`. It never
+    moves the cursor and never posts RowSelected, so an action column and a tick-box column
+    coexist on the same table without fighting.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # Insertion-ordered: this is also the left-to-right order of the action columns.
+        self._actions: dict[str, TableAction] = {}
+
+    def add_action_column(self, action: TableAction) -> ColumnKey:
+        """Add `action` as its own column. Width comes from the label (DESIGN.md §4 satisfied
+        without the caller restating it) and the column key is the action id."""
+        if action.id in self._actions:
+            raise ValueError(f"action id {action.id!r} is already a column on this table")
+        self._actions[action.id] = action
+        return super().add_column("", width=action.column_width, key=action.id)
+
+    def action_cells(self, row_key: str) -> list[Text]:
+        """This row's action cells, in declared order — splat onto the end of add_row()."""
+        return [action.cell(row_key) for action in self._actions.values()]
+
+    def refresh_action_cells(self, row_key: str) -> None:
+        """Re-evaluate one row's action cells in place after its state changed (e.g. an update
+        was applied, so the Update cell should now be blank). `update_cell` per cell rather than
+        clear() + re-add_row(): a rebuild resets the cursor and scroll position."""
+        for action in self._actions.values():
+            self.update_cell(row_key, action.id, action.cell(row_key))
+
+    def _action_at_column(self, column_index: int) -> TableAction | None:
+        if not self._actions or not 0 <= column_index < len(self.columns):
+            return None
+        return self._actions.get(self.ordered_columns[column_index].key.value)
 
     async def _on_click(self, event) -> None:
+        # prevent_default() first, unconditionally: Textual dispatches an event to *every*
+        # handler down the MRO, so without it DataTable._on_click also runs after this one.
+        # That was the tick-box bug — this override moves the cursor to the clicked cell, which
+        # makes the base handler's `new_coordinate == self.cursor_coordinate` test true, so it
+        # posted a second RowSelected and the screen toggled the row straight back off.
+        # event.stop() does not cover this: it stops bubbling to the parent, not MRO dispatch.
+        # Branches below that want the base behaviour call super() explicitly.
+        event.prevent_default()
         self._set_hover_cursor(True)
         meta = event.style.meta
         if "row" not in meta or "column" not in meta:
@@ -356,6 +476,14 @@ class SingleClickDataTable(CockpitDataTable):
         is_row_label_click = self.show_row_labels and column_index == -1
         if is_header_click or is_row_label_click or not self.show_cursor or self.cursor_type == "none":
             await super()._on_click(event)
+            return
+        action = self._action_at_column(column_index)
+        if action is not None:
+            row_key, _ = self.coordinate_to_cell_key(Coordinate(row_index, column_index))
+            key = row_key.value
+            if key is not None and (action.available is None or action.available(key)):
+                self.post_message(TableActionInvoked(self, action, key))
+            event.stop()
             return
         self.cursor_coordinate = Coordinate(row_index, column_index)
         self._post_selected_message()
@@ -479,6 +607,10 @@ class CockpitScreenBase(Widget):
        argument: "this restarts a service / changes host state / is irreversible" is what a
        call site knows, and the $error styling follows from it rather than being re-decided
        per call site.
+    3. Per-row table actions land in `handle_table_action` already confirmed. A screen declares
+       `TableAction`s on its table and implements one `handle_table_action`; it never handles
+       TableActionInvoked itself, which is what keeps "destructive actions ask first" a
+       property of the declaration rather than of each call site remembering to await confirm().
     """
 
     def on_mount(self) -> None:
@@ -517,6 +649,26 @@ class CockpitScreenBase(Widget):
             await self.app.push_screen_wait(
                 ConfirmModal(message, confirm_label=confirm_label, danger=mutates_system or danger)
             )
+        )
+
+    @work
+    async def _on_table_action_invoked(self, event: TableActionInvoked) -> None:
+        """Confirmation gate for every per-row table action. @work because push_screen_wait
+        needs a worker context; the message pump is not blocked while the modal is up."""
+        event.stop()
+        message = event.action.confirm_message(event.row_key)
+        if message is not None and not await self.confirm(
+            message, confirm_label=event.action.label, mutates_system=True
+        ):
+            return
+        await self.handle_table_action(event.action.id, event.row_key, event.table)
+
+    async def handle_table_action(self, action_id: str, row_key: str, table: DataTable) -> None:
+        """Run a per-row action already confirmed by `_on_table_action_invoked`. Implement this
+        on any screen that declares a TableAction; `action_id` is the TableAction's id and
+        `row_key` the clicked row's key."""
+        raise NotImplementedError(
+            f"{type(self).__name__} declares a TableAction but implements no handle_table_action()"
         )
 
 
@@ -600,7 +752,133 @@ def _self_check() -> None:
     assert action_cell("Update").plain == "[ Update ]"
     assert AMBER_THEME.error in str(action_cell("Remove", destructive=True).style)
 
+    # TableAction's own contracts, no App needed.
+    assert TableAction("u", "Update").column_width == len("[ Update ]")
+    assert TableAction("u", "Update").confirm_message("row-1") is None
+    assert TableAction("d", "Delete", destructive=True).confirm_message("row-1") == "Delete row-1?"
+    assert (
+        TableAction("r", "Restart", confirm="Restart {row} now?").confirm_message("svc")
+        == "Restart svc now?"
+    )
+    assert TableAction("u", "Update", available=lambda k: k == "yes").cell("no").plain == ""
+
+    import asyncio
+
+    asyncio.run(_driven_click_check())
+
     print("cockpit.widgets self-check OK")
+
+
+async def _driven_click_check() -> None:
+    """The half of the self-check that needs a real running app and real mouse clicks.
+
+    Three properties, all of them things that regress silently because nothing raises when
+    they break — the table just quietly does the wrong thing:
+      a) clicking an action cell dispatches that action for that row, and only there;
+      b) a destructive action does not run until the operator confirms;
+      c) a tick-box click toggles the row ON and the state survives a table rebuild.
+    (c) is the item-2h regression test: DataTable click handling used to fire RowSelected twice
+    per click (see SingleClickDataTable._on_click), so every toggle immediately undid itself.
+    """
+    from textual.app import App
+    from textual.widgets import DataTable
+
+    fired: list[tuple[str, str]] = []
+
+    class _Screen(CockpitScreenBase):
+        def compose(self) -> ComposeResult:
+            with VerticalScroll():
+                table = SingleClickDataTable(id="t")
+                table.cursor_type = "row"
+                yield table
+
+        def on_mount(self) -> None:
+            super().on_mount()
+            table = self.query_one("#t", SingleClickDataTable)
+            table.add_column("", width=3)
+            table.add_column("ID", width=10)
+            table.add_action_column(TableAction("update", "Update", available=lambda k: k != "c"))
+            table.add_action_column(TableAction("remove", "Remove", destructive=True))
+            self.ticked: set[str] = set()
+            self.rebuild()
+
+        def rebuild(self) -> None:
+            table = self.query_one("#t", SingleClickDataTable)
+            table.clear()
+            for key in ("a", "b", "c"):
+                table.add_row(
+                    selection_marker(key in self.ticked), key, *table.action_cells(key), key=key
+                )
+
+        def on_refresh_requested(self) -> None:
+            self.rebuild()
+
+        def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+            self.ticked.symmetric_difference_update({event.row_key.value})
+            self.rebuild()
+
+        async def handle_table_action(self, action_id: str, row_key: str, table: DataTable) -> None:
+            fired.append((action_id, row_key))
+
+    class _App(App):
+        CSS = SHARED_CSS
+        SPACE_TOKENS = {"space-normal": "1", "space-section": "2", "space-edge": "3"}
+
+        def get_css_variables(self) -> dict[str, str]:
+            return {**super().get_css_variables(), **self.SPACE_TOKENS}
+
+        def compose(self) -> ComposeResult:
+            yield _Screen()
+
+    app = _App()
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        screen = app.query_one(_Screen)
+        table = app.query_one("#t", SingleClickDataTable)
+
+        async def click(row: int, column: int) -> None:
+            region = table._get_cell_region(Coordinate(row, column))
+            await pilot.click(table, offset=(region.x + 1, region.y))
+            await pilot.pause()
+
+        # (c) tick-box: one click ticks row 1, and the rebuild it triggers doesn't untick it.
+        await click(1, 0)
+        assert screen.ticked == {"b"}, f"tick-box toggle lost: {screen.ticked}"
+        screen.on_refresh_requested()
+        await pilot.pause()
+        assert screen.ticked == {"b"}, f"tick state did not survive a rebuild: {screen.ticked}"
+        assert table.get_cell_at(Coordinate(1, 0)).plain == "[x]"
+        await click(1, 0)
+        assert screen.ticked == set(), f"second click did not untick: {screen.ticked}"
+
+        # (a) action dispatch: right action, right row, and no row toggle from an action click.
+        await click(0, 2)
+        assert fired == [("update", "a")], f"action dispatch wrong: {fired}"
+        assert screen.ticked == set(), "an action click must not toggle the row"
+        # ...and an unavailable cell is inert (row "c" has no Update).
+        await click(2, 2)
+        assert fired == [("update", "a")], f"unavailable action fired: {fired}"
+
+        # (b) destructive action: nothing happens until the ConfirmModal is answered.
+        fired.clear()
+        await click(0, 3)
+        await pilot.pause()
+        assert isinstance(app.screen, ConfirmModal), "a destructive action must ask first"
+        assert app.screen.danger is True, "a destructive action must use the §5 danger tier"
+        await pilot.press("escape")
+        await pilot.pause()
+        assert fired == [], f"a cancelled destructive action must not run: {fired}"
+
+        await click(0, 3)
+        await pilot.pause()
+        assert isinstance(app.screen, ConfirmModal)
+        await pilot.click("#confirm-yes")
+        await pilot.pause()
+        assert fired == [("remove", "a")], f"confirmed destructive action did not run: {fired}"
+
+        # In-place refresh of one row's action cells, no rebuild.
+        table.refresh_action_cells("a")
+        assert table.get_cell_at(Coordinate(0, 2)).plain == "[ Update ]"
 
 
 if __name__ == "__main__":

@@ -292,7 +292,9 @@ The only general-purpose button. Every button outside a table and outside an `.i
 ### The in-table action cell
 A per-row action, rendered as a **table cell in its own column**, e.g. `[ Update ]`.
 
-- **Mechanism**: `cockpit.widgets.action_cell(label, destructive=False)` → `rich.text.Text`. Click dispatch comes from the cell's style meta (see `SingleClickDataTable`).
+- **Mechanism**: declare a `cockpit.widgets.TableAction` on a `SingleClickDataTable` via `add_action_column(...)`; splat `table.action_cells(row_key)` onto the end of each `add_row`. Rendering (`action_cell` → `rich.text.Text`), column width, single-click dispatch (from the cell's style meta) and confirmation all follow from the declaration. A click arrives at the screen as `handle_table_action(action_id, row_key, table)`, already confirmed. Never handle `TableActionInvoked` on a screen — that bypasses the confirm step.
+- **Action columns go last**, after every data column, in declaration order. A row's action cells are refreshed in place with `table.refresh_action_cells(row_key)`; do not `clear()` + rebuild to repaint one cell.
+- **Conditional actions**: `TableAction(..., available=predicate)` — the cell renders blank and is inert on rows where the predicate is False (e.g. "Update" only where an update exists).
 - **This is not a `Button` and cannot be.** A Textual `Widget` has no `__rich_console__`, so `DataTable` — whose cells are `list[RenderableType]` rendered through `console.render_lines` — raises `NotRenderableError` on one. Nothing may ever be mounted into a `DataTable` cell.
 - **Rendering contract**: `[ Label ]`, one space inside each bracket. Column width is `len(longest label in that column) + 4`.
 - **Returns `Text`, never `str`.** The app console has markup enabled, so a raw `"[ Update ]"` is parsed as a Rich tag and renders as the empty string.
