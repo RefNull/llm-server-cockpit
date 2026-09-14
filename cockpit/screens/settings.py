@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from rich.text import Text
 from textual import work
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
@@ -139,6 +140,11 @@ class SettingsScreen(CockpitScreenBase):
         # the schema requires gpus: minItems 1, so this always starts with one blank entry
         # matching the previous single-GPU default (id=gpu0/vendor=nvidia/backends=cuda).
         self._pending_gpus: list[dict[str, Any]] = [{"id": "gpu0", "vendor": "nvidia", "backends": ["cuda"]}]
+        # Driver Status used to be a standalone text dump below the GPU table; it's now a
+        # per-row column (item 8b), so the check result is kept per-gpu-id here and applied by
+        # re-rendering the table rather than updating a separate Static.
+        self._driver_status_by_gpu: dict[str, str] = {}
+        self._driver_status_default = "not checked yet"
 
     # -- layout ---------------------------------------------------------------
 
@@ -225,8 +231,9 @@ class SettingsScreen(CockpitScreenBase):
                             yield Input(id="f-hostname", classes="form-field")
                         with Horizontal(classes="form-row"):
                             yield Static("VPN Interface", classes="form-label")
-                            yield Input(id="f-vpn-interface", placeholder="e.g. tailscale0, wg0", classes="form-field")
-                            yield Button("ip a", id="btn-ip-a", classes="thin-button")
+                            with Horizontal(classes="inline-row"):
+                                yield Input(id="f-vpn-interface", placeholder="e.g. tailscale0, wg0")
+                                yield Button("ip a", id="btn-ip-a")  # inline archetype (DESIGN.md §9): bare Button inside .inline-row
                         with Horizontal(classes="form-row"):
                             yield Static("VPN Resolution", classes="form-label")
                             yield Static("", id="vpn-resolve-preview", classes="form-field")
@@ -239,9 +246,6 @@ class SettingsScreen(CockpitScreenBase):
                         with Horizontal(classes="form-row"):
                             yield Static("Builds to Keep", classes="form-label")
                             yield Input(id="f-retain", classes="form-field")
-                        with Horizontal(classes="form-row"):
-                            yield Static("HF Token Env Var", classes="form-label")
-                            yield Input(id="f-token-env", classes="form-field")
 
                     with Vertical(classes="panel"):
                         yield Static("Storage Paths", classes="panel-title")
@@ -265,13 +269,46 @@ class SettingsScreen(CockpitScreenBase):
                 with VerticalScroll():
                     with Vertical(classes="panel"):
                         yield Static("Configured Accelerators", classes="panel-title")
+                        # Driver Status used to be a text dump below this table; it's now the
+                        # table's own last column (item 8b) — one row already is one GPU, so a
+                        # separate text block repeated the same identifiers instead of adding
+                        # information.
                         yield CockpitDataTable(id="gpu-table", zebra_stripes=True, classes="data-table", fixed_columns=1)
-                        with Horizontal(classes="form-row"):
-                            yield Static("Driver Status", classes="form-label")
-                            yield Static("not checked yet", id="drivers-status", classes="form-field status-text")
+                    # Reuses the first-run wizard's own add-GPU form (below) rather than a
+                    # second implementation — see _save_gpu_form's host_profile-is-None branch.
+                    with Vertical(id="gpu-add-form", classes="panel"):
+                        yield Static("Add GPU", classes="panel-title")
+                        yield Label("GPU ID")
+                        yield Input(id="gpu-add-id", placeholder="e.g. gpu2")
+                        yield Label("Vendor")
+                        yield Select(_GPU_VENDOR_OPTIONS, id="gpu-add-vendor", allow_blank=False, value="nvidia")
+                        yield Label("Backends (comma-separated: cuda, rocm, vulkan, sycl)")
+                        yield Input(id="gpu-add-backends", placeholder="cuda")
+                        yield Static("", id="gpu-add-error", classes="error-text")
+                        with Horizontal(classes="action-row-primary"):
+                            yield Button("Save GPU", id="btn-gpu-save", classes="thin-button", variant="primary")
+                            yield Button("Cancel", id="btn-gpu-cancel", classes="thin-button")
                     with Horizontal(classes="action-row-primary"):
+                        yield Button("Add GPU", id="btn-add-gpu", classes="thin-button")
                         yield Button("Check Drivers", id="btn-check-drivers", classes="thin-button")
                         yield Button("List PCIe Devices", id="btn-lspci", classes="thin-button")
+
+            with TabPane("Connectors", id="settings-tab-connectors"):
+                with VerticalScroll():
+                    yield Static(
+                        "Third-party integrations — a catch-all separate from the core host "
+                        "profile, extended here as more connectors are added.",
+                        classes="subtitle",
+                    )
+                    with Vertical(classes="panel"):
+                        yield Static("Hugging Face", classes="panel-title")
+                        with Horizontal(classes="form-row"):
+                            yield Static("HF Token Env Var", classes="form-label")
+                            yield Input(id="f-token-env", classes="form-field")
+                    yield Static("", id="connectors-error", classes="error-text")
+                    with Horizontal(classes="action-row-primary"):
+                        yield Button("Save Connectors", id="btn-save-connectors", variant="primary", classes="thin-button")
+                    yield Static("", id="connectors-status", classes="status-text")
 
             with TabPane("System Services", id="settings-tab-services"):
                 with VerticalScroll():
@@ -325,10 +362,11 @@ class SettingsScreen(CockpitScreenBase):
         table.add_column("GPU ID", width=16)
         table.add_column("Vendor", width=16)
         table.add_column("Backends", width=30)
+        table.add_column("Driver Status", width=40)
+        self.query_one("#gpu-add-form").display = False
 
         if self.host_profile is None:
             self._populate_wizard_gpu_table()
-            self.query_one("#gpu-add-form").display = False
         else:
             self._render_gpu_list()
             self._populate_service_form()
@@ -379,19 +417,31 @@ class SettingsScreen(CockpitScreenBase):
         table = self.query_one("#gpu-table", CockpitDataTable)
         table.clear()
         for gpu in self._pending_gpus:
-            table.add_row(gpu["id"], gpu["vendor"], ", ".join(gpu["backends"]), key=gpu["id"])
+            table.add_row(
+                Text(gpu["id"]), Text(gpu["vendor"]), Text(", ".join(gpu["backends"])), Text("—"), key=gpu["id"]
+            )
 
     def _render_gpu_list(self) -> None:
         table = self.query_one("#gpu-table", CockpitDataTable)
         table.clear()
         if self.host_profile and "gpus" in self.host_profile:
             for gpu in self.host_profile["gpus"]:
-                table.add_row(gpu["id"], gpu["vendor"], ", ".join(gpu.get("backends", [])))
+                status = self._driver_status_by_gpu.get(gpu["id"], self._driver_status_default)
+                table.add_row(
+                    Text(gpu["id"]),
+                    Text(gpu["vendor"]),
+                    Text(", ".join(gpu.get("backends", []))),
+                    Text(status),
+                    key=gpu["id"],
+                )
 
     def _show_add_gpu_form(self) -> None:
         form = self.query_one("#gpu-add-form")
         form.display = True
-        next_id = f"gpu{len(self._pending_gpus)}"
+        existing_count = (
+            len(self._pending_gpus) if self.host_profile is None else len(self.host_profile.get("gpus", []))
+        )
+        next_id = f"gpu{existing_count}"
         self.query_one("#gpu-add-id", Input).value = next_id
         self.query_one("#gpu-add-vendor", Select).value = "nvidia"
         self.query_one("#gpu-add-backends", Input).value = "cuda"
@@ -402,33 +452,74 @@ class SettingsScreen(CockpitScreenBase):
         self.query_one("#gpu-add-form").display = False
         self.query_one("#gpu-add-error", Static).update("")
 
-    def _save_gpu_form(self) -> None:
+    def _validate_gpu_form(self, existing_ids: set[str]) -> tuple[dict[str, Any] | None, str | None]:
         gpu_id = self.query_one("#gpu-add-id", Input).value.strip()
         vendor = self.query_one("#gpu-add-vendor", Select).value
         backends_raw = self.query_one("#gpu-add-backends", Input).value.strip()
 
         if not gpu_id:
-            self.query_one("#gpu-add-error", Static).update("GPU ID is required")
-            return
-        if any(g["id"] == gpu_id for g in self._pending_gpus):
-            self.query_one("#gpu-add-error", Static).update(f"GPU ID '{gpu_id}' already exists")
-            return
+            return None, "GPU ID is required"
+        if gpu_id in existing_ids:
+            return None, f"GPU ID '{gpu_id}' already exists"
         if vendor is Select.BLANK or not vendor:
-            self.query_one("#gpu-add-error", Static).update("Vendor is required")
-            return
+            return None, "Vendor is required"
         backends = [b.strip() for b in backends_raw.split(",") if b.strip()]
         if not backends:
-            self.query_one("#gpu-add-error", Static).update("At least one backend is required (e.g. cuda)")
-            return
+            return None, "At least one backend is required (e.g. cuda)"
         for b in backends:
             if b not in ("cuda", "rocm", "vulkan", "sycl"):
-                self.query_one("#gpu-add-error", Static).update(f"Unknown backend '{b}' (must be cuda, rocm, vulkan, or sycl)")
-                return
+                return None, f"Unknown backend '{b}' (must be cuda, rocm, vulkan, or sycl)"
+        return {"id": gpu_id, "vendor": str(vendor), "backends": backends}, None
 
-        self._pending_gpus.append({"id": gpu_id, "vendor": str(vendor), "backends": backends})
-        self._populate_wizard_gpu_table()
+    def _save_gpu_form(self) -> None:
+        # First-run wizard (host_profile is None): held in memory only, folded into the
+        # candidate profile at Step 3. Normal mode: a GPU appended to an already-deployed host
+        # is a persisted, mutating write (DESIGN.md §5 declarative-write idiom) — routed to
+        # _confirm_and_add_gpu, which is the only branch that differs; the form itself (and its
+        # validation) is the same one the wizard already had.
+        if self.host_profile is None:
+            existing_ids = {g["id"] for g in self._pending_gpus}
+            new_gpu, err = self._validate_gpu_form(existing_ids)
+            if err:
+                self.query_one("#gpu-add-error", Static).update(err)
+                return
+            self._pending_gpus.append(new_gpu)
+            self._populate_wizard_gpu_table()
+            self._hide_add_gpu_form()
+            self.query_one("#step-hardware-error", Static).update("")
+        else:
+            existing_ids = {g["id"] for g in self.host_profile.get("gpus", [])}
+            new_gpu, err = self._validate_gpu_form(existing_ids)
+            if err:
+                self.query_one("#gpu-add-error", Static).update(err)
+                return
+            self._confirm_and_add_gpu(new_gpu)
+
+    @work
+    async def _confirm_and_add_gpu(self, new_gpu: dict[str, Any]) -> None:
+        candidate = copy.deepcopy(self.host_profile)
+        candidate["gpus"] = list(candidate.get("gpus", [])) + [new_gpu]
+        try:
+            schema.validate_host_profile_dict(candidate)
+        except schema.ValidationError as e:
+            self.query_one("#gpu-add-error", Static).update(f"validation failed: {e}")
+            return
+
+        message = f"Add GPU {new_gpu['id']!r} to hosts/{candidate['hostname']}.yaml?"
+        confirmed = await self.app.push_screen_wait(ConfirmModal(message, confirm_label="Add", danger=True))
+        if not confirmed:
+            return
+
+        content = yaml.safe_dump(candidate, sort_keys=False)
+        target_path = self._host_profile_path()
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        target_path.write_text(content, encoding="utf-8")
+
+        self.host_profile = candidate
+        self._render_gpu_list()
         self._hide_add_gpu_form()
-        self.query_one("#step-hardware-error", Static).update("")
+        self._set_profile_status(f"GPU {new_gpu['id']!r} added — hosts/{candidate['hostname']}.yaml written")
+        self.notify(f"GPU {new_gpu['id']!r} added")
 
     def _remove_selected_gpu(self) -> None:
         if len(self._pending_gpus) <= 1:
@@ -654,12 +745,15 @@ class SettingsScreen(CockpitScreenBase):
         self.app.push_screen(InfoModal("Network interfaces (ip a)", run_shell_capture("ip a")))
 
     def _set_profile_error(self, text: str) -> None:
-        if self.query("#profile-error"):
-            self.query_one("#profile-error", Static).update(text)
+        # Saving from the Connectors tab (item 7) mutates the same host-profile candidate the
+        # Host Profile tab does, via the same _confirm_and_save_profile — so feedback shows on
+        # whichever tab's own status line the operator is actually looking at.
+        for widget in self.query("#profile-error, #connectors-error"):
+            widget.update(text)
 
     def _set_profile_status(self, text: str) -> None:
-        if self.query("#profile-status"):
-            self.query_one("#profile-status", Static).update(text)
+        for widget in self.query("#profile-status, #connectors-status"):
+            widget.update(text)
 
     def _set_service_error(self, text: str) -> None:
         self.query_one("#service-error", Static).update(text)
@@ -952,24 +1046,31 @@ class SettingsScreen(CockpitScreenBase):
     # -- driver-drift status + check --------------------------------------------------
 
     def _refresh_drivers_status(self) -> None:
+        """Was a standalone text dump below the GPU table; now feeds the table's own Driver
+        Status column (item 8b) — self._driver_status_by_gpu keyed by gpu_id, applied by
+        re-rendering the table rather than updating a separate widget."""
         if self.host_profile is None:
             return
-        widget = self.query_one("#drivers-status", Static)
         try:
             data = drivers.read_lockfile_status(self.host_profile, self.repo_root)
         except Exception as e:
-            widget.update(f"failed to read lockfile: {e}")
+            self._driver_status_by_gpu = {}
+            self._driver_status_default = f"failed to read lockfile: {e}"
+            self._render_gpu_list()
             return
         if data is None:
-            widget.update("not checked yet (no lockfile at hosts/<hostname>.lock.yaml)")
+            self._driver_status_by_gpu = {}
+            self._driver_status_default = "not checked yet"
+            self._render_gpu_list()
             return
-        lines = [f"generated_at: {data.get('generated_at', 'unknown')}"]
+        self._driver_status_default = f"not in lockfile (generated {data.get('generated_at', 'unknown')})"
+        by_gpu: dict[str, str] = {}
         for gpu_id, facts in (data.get("gpus") or {}).items():
             facts = dict(facts)
-            vendor = facts.pop("vendor", "")
-            fact_str = ", ".join(f"{k}={v}" for k, v in facts.items())
-            lines.append(f"  {gpu_id} ({vendor}): {fact_str}")
-        widget.update("\n".join(lines))
+            facts.pop("vendor", "")
+            by_gpu[gpu_id] = ", ".join(f"{k}={v}" for k, v in facts.items()) or "ok"
+        self._driver_status_by_gpu = by_gpu
+        self._render_gpu_list()
 
     @work
     async def _confirm_and_check_drivers(self) -> None:
@@ -980,7 +1081,8 @@ class SettingsScreen(CockpitScreenBase):
         confirmed = await self.app.push_screen_wait(ConfirmModal(message, confirm_label="Check"))
         if not confirmed:
             return
-        self.query_one("#drivers-status", Static).update("checking...")
+        self._driver_status_default = "checking..."
+        self._render_gpu_list()
         self._run_drivers_check()
 
     @work(thread=True)
@@ -1091,7 +1193,7 @@ class SettingsScreen(CockpitScreenBase):
             self._show_pcie_devices()
         elif bid == "btn-ip-a":
             self._show_ip_a()
-        elif bid == "btn-save-profile":
+        elif bid in ("btn-save-profile", "btn-save-connectors"):
             self._confirm_and_save_profile()
         elif bid == "btn-deploy-profile":
             self._confirm_and_deploy_profile()
