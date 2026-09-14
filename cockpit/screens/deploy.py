@@ -20,11 +20,11 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Input, Label, Select, Static, TextArea
 
 from cockpit.widgets import (
-    CockpitDataTable,
     CockpitScreenBase,
     ConfirmModal,
     InfoModal,
     SingleClickDataTable,
+    TableAction,
     selection_marker,
 )
 from provision import schema
@@ -516,6 +516,14 @@ class DeployScreen(CockpitScreenBase):
     DeployScreen {
         height: 1fr;
     }
+    /* Not a Button — a plain rule character marking off "Apply & Restart" (the consequential
+       action) from the rest of the row, without touching any Button's own geometry/margin
+       (DESIGN.md §9 forbids per-screen Button CSS overrides). */
+    DeployScreen .action-row-divider {
+        width: 3;
+        color: $text-muted;
+        text-align: center;
+    }
     """
 
     def __init__(
@@ -537,32 +545,34 @@ class DeployScreen(CockpitScreenBase):
 
     def compose(self) -> ComposeResult:
         with VerticalScroll():
-            table = CockpitDataTable(id="models-table", classes="data-table", fixed_columns=1)
+            table = SingleClickDataTable(id="models-table", classes="data-table", fixed_columns=1)
             yield table
             with Horizontal(classes="action-row-primary"):
                 yield Button("Apply & Restart Service", id="btn-apply", variant="primary", classes="thin-button")
+                yield Static("│", classes="action-row-divider")
                 yield Button("Add Model", id="btn-add-model", classes="thin-button")
-                yield Button("Edit", id="btn-edit-model", classes="thin-button")
-                yield Button("Delete", id="btn-delete-model", variant="error", classes="thin-button")
-            with Horizontal(classes="action-row-secondary"):
                 yield Button("Import from Llama-Swap", id="btn-import-toggle", classes="thin-button")
                 yield Button("Preview YAML", id="btn-preview-yaml", classes="thin-button")
             yield Static("", id="status-message", classes="status-text")
 
     def on_mount(self) -> None:
-        table = self.query_one("#models-table", CockpitDataTable)
+        table = self.query_one("#models-table", SingleClickDataTable)
         table.cursor_type = "row"
-        self._populate_table()
-
-    def _populate_table(self) -> None:
-        table = self.query_one("#models-table", CockpitDataTable)
-        table.clear(columns=True)
         table.add_column("ID", width=24)
         table.add_column("Engine", width=12)
         table.add_column("GPU", width=10)
         table.add_column("Backend", width=10)
         table.add_column("Group", width=12)
         table.add_column("TTL", width=8)
+        table.add_action_column(TableAction("edit", "Edit"))
+        table.add_action_column(
+            TableAction("delete", "Delete", destructive=True, confirm="Delete model {row} from models.yaml?")
+        )
+        self._populate_table()
+
+    def _populate_table(self) -> None:
+        table = self.query_one("#models-table", SingleClickDataTable)
+        table.clear()
         for m in self.models.get("models", []):
             if m["engine"] == "llama-cpp":
                 gpu = m.get("bind", {}).get("gpu", "")
@@ -576,19 +586,9 @@ class DeployScreen(CockpitScreenBase):
                 backend,
                 m.get("group", ""),
                 str(m.get("ttl", "")),
+                *table.action_cells(m["id"]),
                 key=m["id"],
             )
-
-    def _selected_model_id(self) -> str | None:
-        table = self.query_one("#models-table", CockpitDataTable)
-        if table.row_count == 0:
-            return None
-        try:
-            cell_key = table.coordinate_to_cell_key(table.cursor_coordinate)
-        except Exception:
-            return None
-        row_key = cell_key.row_key
-        return str(row_key.value) if row_key is not None and row_key.value is not None else None
 
     def on_refresh_requested(self) -> None:
         """Called by CockpitApp.action_refresh_all — pick up fresh models.yaml."""
@@ -617,12 +617,7 @@ class DeployScreen(CockpitScreenBase):
             self._populate_table()
             self._set_status("model added — models.yaml written")
 
-    @work
-    async def _on_edit_model(self) -> None:
-        model_id = self._selected_model_id()
-        if model_id is None:
-            self._set_status("select a model row first")
-            return
+    async def _edit_model(self, model_id: str) -> None:
         saved = await self.app.push_screen_wait(
             EditModelModal(
                 host_profile=self.host_profile,
@@ -638,17 +633,9 @@ class DeployScreen(CockpitScreenBase):
             self._populate_table()
             self._set_status(f"model {model_id!r} updated — models.yaml written")
 
-    @work
-    async def _delete_selected(self) -> None:
-        model_id = self._selected_model_id()
-        if model_id is None:
-            self._set_status("select a model row first")
-            return
-        message = f"Delete model {model_id!r} from models.yaml?"
-        confirmed = await self.app.push_screen_wait(ConfirmModal(message, confirm_label="Delete", danger=True))
-        if not confirmed:
-            return
-
+    async def _delete_model(self, model_id: str) -> None:
+        # Already confirmed: this is a TableAction(destructive=True), so CockpitScreenBase's
+        # _on_table_action_invoked has already run the ConfirmModal before calling here.
         new_list = [m for m in self.models.get("models", []) if m["id"] != model_id]
         candidate = {"models": new_list}
         try:
@@ -719,6 +706,14 @@ class DeployScreen(CockpitScreenBase):
         self.app.call_from_thread(self._set_status, msg)
         self.app.call_from_thread(self.app.notify, msg, severity="error")
 
+    # -- Per-row table actions --------------------------------------------------
+
+    async def handle_table_action(self, action_id: str, row_key: str, table) -> None:
+        if action_id == "edit":
+            await self._edit_model(row_key)
+        elif action_id == "delete":
+            await self._delete_model(row_key)
+
     # -- Button Dispatch -------------------------------------------------------
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -727,10 +722,6 @@ class DeployScreen(CockpitScreenBase):
             await self._confirm_and_apply()
         elif bid == "btn-add-model":
             await self._on_add_model()
-        elif bid == "btn-edit-model":
-            await self._on_edit_model()
-        elif bid == "btn-delete-model":
-            await self._delete_selected()
         elif bid == "btn-import-toggle":
             await self._on_import_toggle()
         elif bid == "btn-preview-yaml":
