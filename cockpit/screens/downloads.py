@@ -187,12 +187,19 @@ class DownloadsScreen(CockpitScreenBase):
 
     def on_mount(self) -> None:
         table = self.query_one("#model-table", SingleClickDataTable)
+        # Column budget (DESIGN.md §4): render width is content width + 2*cell_padding per
+        # column (Textual _data_table.py Column.get_render_width). At the old widths
+        # (3+22+32+22+10+12+12 content, 7 columns) the render width was 127 cells against a
+        # 115-cell usable viewport at 121x30 (121 - 2*$space-edge), pushing the "[ Download ]"
+        # action column off-screen. Repo ID and Status already truncated their content at the
+        # old widths, so the cut below comes from their slack, not from ID/Size/Date: new
+        # content sum is 89, render sum 89 + 2*7 = 103 <= 115.
         table.add_column("", width=3)
-        table.add_column("ID", width=22)
-        table.add_column("Repo ID", width=32)
-        table.add_column("Status", width=22)
+        table.add_column("ID", width=18)
+        table.add_column("Repo ID", width=20)
+        table.add_column("Status", width=16)
         table.add_column("Size", width=10)
-        table.add_column("Release Date", width=12)
+        table.add_column("Release Date", width=10)
         table.add_action_column(TableAction("download", "Download", confirm="Download {row}?", available=self._can_download))
         self._refresh_table()
         self._refresh_disk_usage()
@@ -258,13 +265,16 @@ class DownloadsScreen(CockpitScreenBase):
             size_label = _fmt_bytes(info["size"]) if info.get("size") else "—"
             date_label = (info.get("date") or "—")[:10]
             repo_display = "PLACEHOLDER — edit models.yaml" if status == "placeholder" else model["repo_id"]
+            # rich.text.Text, not raw str (DESIGN.md §4.6 / Phase 0a.6): the app console has
+            # markup=True, so an operator-chosen repo_id containing brackets would have that
+            # span silently eaten by Rich as a markup tag.
             table.add_row(
                 selection_marker(model["id"] in self._selected),
-                model["id"],
-                repo_display,
-                status_label,
-                size_label,
-                date_label,
+                Text(model["id"]),
+                Text(repo_display),
+                Text(status_label),
+                Text(size_label),
+                Text(date_label),
                 *table.action_cells(model["id"]),
                 key=model["id"],
             )

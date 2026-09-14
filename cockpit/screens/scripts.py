@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from rich.text import Text
 from textual import work
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
@@ -312,11 +313,15 @@ class ScriptsScreen(CockpitScreenBase):
             self._cursor_script_id = None
         for script, status_text in rows:
             sid = script["id"]
+            # rich.text.Text, not raw str (DESIGN.md §4.6 / Phase 0a.6): the app console has
+            # markup=True, so an operator-chosen script path, or a status string embedding an
+            # exception message, containing brackets would have that span silently eaten by
+            # Rich as a markup tag.
             table.add_row(
                 selection_marker(sid in self._selected_ids),
-                sid,
-                script["path"],
-                status_text,
+                Text(sid),
+                Text(script["path"]),
+                Text(status_text),
                 *table.action_cells(sid),
                 key=sid,
             )

@@ -307,6 +307,15 @@ A button that acts on the `Input` immediately to its left (e.g. "ip a" resolving
 - **Geometry**: `height: 3` on purpose, matching the `Input` beside it; `min-width: 10`.
 - **Colour**: `$secondary` background with explicitly matched `tall` borders, distinguishing it from an action-row page action that merely happens to be tall.
 
+### Action-row overflow at narrow widths
+An `.action-row-primary`/`.action-row-secondary` with enough buttons can extend past
+`screen.region.right` at the 80×24 floor while fitting comfortably at normal widths — the
+single-row layout is the QA 3c/5b fix and stays right at typical widths, so the fix is not to
+revert to always-wrapping.
+- **Mechanism**: `Screen.-narrow .action-row-primary, Screen.-narrow .action-row-secondary { layout: vertical; height: auto; }` in `SHARED_CSS` (`cockpit/widgets.py`) — the same `CockpitApp.HORIZONTAL_BREAKPOINTS` hook `.columns-responsive` already uses (§2). Under `-narrow` the row stacks one button per line, each still reachable; under `-wide` it is untouched and stays the single row.
+- **Scope**: applies to every `.action-row-*` in the app, not one screen at a time — any future screen with enough buttons in one row can hit this same overflow at 80 columns.
+- **Enforcement**: `smoke/verify_screens.py` asserts, at both 80×24 and 121×30 for every screen, that no mounted and enabled `Button` has `region.right > screen.region.right`.
+
 ### Not an archetype
 `.close-button` (the `×` glyph docked top-right of `InfoModal` / `BuildHistoryModal`) is a modal close affordance, not an action button: `width: 4; height: 1; border: none; dock: right`. It is exempt because it carries a glyph rather than a label, and it must not be used for anything else.
 

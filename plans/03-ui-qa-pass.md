@@ -479,3 +479,31 @@ while refactoring shared form code.
 
 **Report**: pass/fail per item, plus the System Services field audit from Phase 8 awaiting
 approval, plus any QA item that turned out to need a product decision rather than a fix.
+
+---
+
+## Phase 8 addendum: System Services field audit (QA item 9a)
+
+Required by Phase 8 but never written down — persisted here during the adversarial
+verification pass, 2026-09-14. Every field below was re-checked against the actual code
+(`cockpit/screens/settings.py`'s "System Services" `TabPane`, `provision/steps/swap.py`,
+`provision/steps/wol.py`) rather than transcribed from the original claim; the table matched
+on inspection, no corrections were needed.
+
+| Field | Reads/writes | Recommendation |
+|---|---|---|
+| `service.restart_policy` | `settings.py` form `#f-restart-policy` -> `swap.py:191` (`_install_unit`) -> generated `llama-swap.service` unit's `Restart=` | Keep — load-bearing |
+| `service.restart_sec` | `settings.py` form `#f-restart-sec` -> `swap.py:192` (`_install_unit`) -> unit's `RestartSec=` | Keep — load-bearing |
+| `service.scheduled_restart.enabled` / `.on_calendar` | `settings.py` form `#f-scheduled-restart-enabled` / `#f-scheduled-restart-calendar` -> `swap.py:275-281` (`sync_scheduled_restart`) -> installs/removes the `llama-swap-restart.service`+`.timer` pair | Keep — load-bearing |
+| `update_check.enabled` / `.on_calendar` | `settings.py` form `#f-update-check-enabled` / `#f-update-check-calendar` -> `swap.py:284-293` (`sync_update_check_timer`) -> installs/removes the `llm-server-cockpit-update-check.service`+`.timer` pair | Keep — load-bearing |
+| `network.wol.interface` / `.mac` | `settings.py` form `#f-wol-interface` / `#f-wol-mac` -> `wol.py:143-155` (`status`) and `wol.py`'s enable flow (`:163-174`) — MAC-match verification and the wake-flag persistence unit | Keep — load-bearing |
+| WOL Status / Tailscale Status | `settings.py` `#wol-status` / `#tailscale-status` — read-only display, populated by `_refresh_wol_status`/`_refresh_tailscale_status`, not written back to any config file | Keep — status readout, not a field |
+
+**Conclusion**: no field is purposeless; nothing is proposed for deletion.
+
+**Observation for the operator to decide on**: the System Services sub-tab is 55+ rows tall
+(two `.panel` groups, six form rows plus two status rows, then the action row), which pushes
+its action row to roughly y≈55 — off the first screen on anything but a tall terminal. If that
+reads as cluttered, the fix is grouping or progressive disclosure (e.g. collapsing "Host &
+Network Services" by default), not removing config. This pass does not redesign the screen —
+that's a call for the operator, not this remediation.

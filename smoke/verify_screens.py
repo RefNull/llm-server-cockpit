@@ -16,7 +16,26 @@ import bootstrap  # noqa: E402
 bootstrap.add_venv_site_packages(_REPO_ROOT)
 
 from cockpit.app import CockpitApp  # noqa: E402
-from textual.widgets import TabbedContent  # noqa: E402
+from textual.widgets import Button, TabbedContent  # noqa: E402
+
+
+def _assert_buttons_in_bounds(app: CockpitApp, context: str) -> None:
+    """Defect 3 (plans/03-ui-qa-pass.md remediation pass): a mounted, enabled Button must
+    never extend past the right edge of the screen viewport. This script used to only assert
+    against a phantom vertical scrollbar, which passed while action-row buttons ("Preview
+    YAML", "Remove selected", "Check / Enable Tailscale") sat off-screen at 80x24 with no
+    horizontal-scroll affordance to reach them. `is_on_screen` excludes buttons in an inactive
+    TabPane, so this only checks buttons the operator can actually see right now."""
+    right_edge = app.screen.region.right
+    for button in app.query(Button):
+        if button.disabled or not button.is_on_screen:
+            continue
+        region = button.region
+        assert region.right <= right_edge, (
+            f"[{context}] Button {button.label!r} (id={button.id!r}) extends past the "
+            f"screen's right edge: button.region.right={region.right} > "
+            f"screen.region.right={right_edge}"
+        )
 
 
 async def verify_geometry_and_export_screenshots() -> None:
@@ -77,6 +96,7 @@ async def verify_geometry_and_export_screenshots() -> None:
                     settings_tc = app.query_one("#settings-tabs", TabbedContent)
                     settings_tc.active = settings_pane
                 await pilot.pause(0.2)
+                _assert_buttons_in_bounds(app, f"{name} @ {w}x{h}")
 
                 svg = app.export_screenshot()
                 svg_path = out_dir / f"{name}_{w}x{h}.svg"

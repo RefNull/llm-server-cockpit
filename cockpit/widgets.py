@@ -213,6 +213,22 @@ Tab {
 .action-row-primary Button, .action-row-secondary Button {
     margin-right: $space-normal;
 }
+/* Action-row overflow at narrow widths (DESIGN.md §9). A single-row action row (the QA
+   3c/5b fix) can hold enough buttons that it extends past screen.region.right at the 80x24
+   floor even though it fits comfortably at normal widths ("Preview YAML" in deploy.py,
+   "Remove selected" in scripts.py, "Check / Enable Tailscale" in settings.py were all
+   unreachable there). Reuses the same Screen.-narrow/-wide hook as .columns-responsive
+   (DESIGN.md §2): under -narrow the row stacks one button per line instead of staying a
+   single row that runs off-screen; -wide is untouched, so normal-width screens keep the
+   single row the QA fix asked for. Applies to every .action-row-* everywhere, since any
+   future screen with enough buttons can hit this same overflow. */
+Screen.-narrow .action-row-primary, Screen.-narrow .action-row-secondary {
+    layout: vertical;
+    height: auto;
+}
+Screen.-narrow .action-row-primary Button, Screen.-narrow .action-row-secondary Button {
+    margin-bottom: $space-normal;
+}
 .form-row {
     height: auto;
     align-vertical: middle;
@@ -237,6 +253,24 @@ Screen.-narrow .columns-responsive {
 }
 Screen.-wide .columns-responsive {
     layout: horizontal;
+}
+/* Dashboard-left/right column gutter (Defect 4 cosmetic fix, plans/03-ui-qa-pass.md remediation
+   pass). This used to live in DashboardScreen.DEFAULT_CSS, which is silently the wrong place: a
+   widget's DEFAULT_CSS is SCOPED_CSS=True by default, and Textual's parser (css/parse.py) only
+   leaves a rule's selector alone when its FIRST token already names the scope type — otherwise
+   it prepends an implicit "DashboardScreen " ancestor requirement. A rule starting with
+   "Screen.-wide ..." got rewritten to require a DashboardScreen ancestor of a Screen, which can
+   never match (Screen is always the ancestor, never the descendant), so margin-right silently
+   stayed 0 at every width — confirmed live: #dashboard-left.styles.margin was Spacing(0,0,1,0)
+   at 121x30 with the rule still present in DEFAULT_CSS. SHARED_CSS is App.CSS, registered with
+   an empty scope, so the identical selector works here the same way .columns-responsive already
+   does above. */
+Screen.-wide DashboardScreen #dashboard-left {
+    margin-right: $space-normal;
+}
+Screen.-narrow DashboardScreen #dashboard-left {
+    margin-right: 0;
+    margin-bottom: $space-normal;
 }
 
 /* No resting highlight on an un-focused table (DESIGN.md §4.4). A freshly mounted DataTable

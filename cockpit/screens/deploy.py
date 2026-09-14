@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from rich.text import Text
 from textual import work
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
@@ -423,11 +424,14 @@ class ImportModelsModal(ModalScreen[bool]):
         table.clear()
         for model_id, model in self._import_candidates.items():
             cmd_preview = model.get("cmd", "")[:80] + ("…" if len(model.get("cmd", "")) > 80 else "")
+            # rich.text.Text, not raw str (DESIGN.md §4.6 / Phase 0a.6): the app console has
+            # markup=True, so an unmanaged engine's cmd line (very likely to contain brackets)
+            # would have that span silently eaten by Rich as a markup tag.
             table.add_row(
                 selection_marker(model_id in self._import_selected),
-                model_id,
-                model.get("engine", "unmanaged"),
-                cmd_preview,
+                Text(model_id),
+                Text(model.get("engine", "unmanaged")),
+                Text(cmd_preview),
                 key=model_id,
             )
 
@@ -579,13 +583,16 @@ class DeployScreen(CockpitScreenBase):
                 backend = m.get("bind", {}).get("backend", "")
             else:
                 gpu, backend = "", ""
+            # rich.text.Text, not raw str (DESIGN.md §4.6 / Phase 0a.6): the app console has
+            # markup=True, so an operator-chosen model id or repo_id containing brackets would
+            # have that span silently eaten by Rich as a markup tag.
             table.add_row(
-                m["id"],
-                m["engine"],
-                gpu,
-                backend,
-                m.get("group", ""),
-                str(m.get("ttl", "")),
+                Text(m["id"]),
+                Text(m["engine"]),
+                Text(gpu),
+                Text(backend),
+                Text(m.get("group", "")),
+                Text(str(m.get("ttl", ""))),
                 *table.action_cells(m["id"]),
                 key=m["id"],
             )

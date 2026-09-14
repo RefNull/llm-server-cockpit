@@ -46,16 +46,10 @@ class DashboardScreen(CockpitScreenBase):
         height: auto;
     }
     /* DESIGN.md §2/§3.5: side-by-side only above the 121-cell breakpoint. The layout switch
-       itself is SHARED_CSS's .columns-responsive rule; these two only fix up the gutter, which
-       is a right margin between columns when they sit beside each other and a bottom margin
-       between stacked panels when they don't. */
-    Screen.-wide DashboardScreen #dashboard-left {
-        margin-right: $space-normal;
-    }
-    Screen.-narrow DashboardScreen #dashboard-left {
-        margin-right: 0;
-        margin-bottom: $space-normal;
-    }
+       itself is SHARED_CSS's .columns-responsive rule; the #dashboard-left/#dashboard-right
+       gutter rule lives there too now, not here — a widget's DEFAULT_CSS is SCOPED_CSS=True by
+       default, which silently breaks a selector whose first token is an ancestor ("Screen...")
+       rather than the widget itself (see SHARED_CSS's comment on this exact rule). */
     DashboardScreen .res-row {
         margin-bottom: 0;
     }
@@ -134,7 +128,10 @@ class DashboardScreen(CockpitScreenBase):
         one-shot sample comes back — res-gpu-{i}-*-unavail rows exist for that and start hidden.
         """
         vendor = slot["vendor"]
-        yield Static(f"GPU {i}: {slot['id']} ({vendor})", classes="section-title")
+        # Title starts as the config id (the only thing known at compose time, before any
+        # reading exists) and is rewritten to the live device name once one is matched — see
+        # _apply_metrics. Needs an id here so that update can find it.
+        yield Static(f"GPU {i}: {slot['id']} ({vendor})", id=f"res-gpu-{i}-title", classes="section-title")
         if vendor == "amd":
             yield Static("no AMD telemetry", id=f"res-gpu-{i}-unavail", classes="gpu-unavailable")
             return
@@ -273,9 +270,17 @@ class DashboardScreen(CockpitScreenBase):
         # 0% bar for a stat that isn't real).
         live_gpus = data.get("gpus", [])
         for i, slot in enumerate(self._gpu_slots):
-            if slot["vendor"] == "amd":
-                continue  # static text only, composed once — nothing to update
             live = self._match_live_gpu(slot, live_gpus)
+            # Header shows the live device name when a reading was matched (Defect 4:
+            # previously always the opaque host-profile config id, e.g. "gpu0"), falling back
+            # to the config id when the GPU isn't detected. Intel has no real product name
+            # (metrics.py hardcodes f"Intel GPU {device_id}") — that hardcoded string is still
+            # a live reading, so it's used as-is; only an undetected GPU falls back to the id.
+            device_label = (live.get("name") if live else None) or slot["id"]
+            self.query_one(f"#res-gpu-{i}-title", Static).update(f"GPU {i}: {device_label} ({slot['vendor']})")
+
+            if slot["vendor"] == "amd":
+                continue  # static text only, composed once — nothing else to update
 
             if slot["vendor"] == "nvidia":
                 util_row = self.query_one(f"#res-gpu-{i}-util-row", Horizontal)
@@ -283,11 +288,11 @@ class DashboardScreen(CockpitScreenBase):
                 util = live.get("utilization_pct") if live else None
                 if live is None:
                     util_row.display = False
-                    util_unavail.update("not detected")
+                    util_unavail.update("Util: not detected")
                     util_unavail.display = True
                 elif util is None:
                     util_row.display = False
-                    util_unavail.update("n/a")
+                    util_unavail.update("Util: n/a")
                     util_unavail.display = True
                 else:
                     util_row.display = True
@@ -303,11 +308,11 @@ class DashboardScreen(CockpitScreenBase):
             mem_total = live.get("memory_total_mb") if live else None
             if live is None:
                 mem_row.display = False
-                mem_unavail.update("not detected")
+                mem_unavail.update("Mem: not detected")
                 mem_unavail.display = True
             elif not mem_total:
                 mem_row.display = False
-                mem_unavail.update("n/a")
+                mem_unavail.update("Mem: n/a")
                 mem_unavail.display = True
             else:
                 mem_row.display = True
