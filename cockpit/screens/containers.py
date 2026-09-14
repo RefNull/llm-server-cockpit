@@ -34,8 +34,8 @@ class ContainersScreen(CockpitScreenBase):
         height: 1fr;
     }
     #docker-banner {
-        padding: 1 2;
-        margin-bottom: 1;
+        padding: $space-normal $space-section;
+        margin-bottom: $space-normal;
         background: $error 20%;
         color: $error;
         display: none;
@@ -84,10 +84,10 @@ class ContainersScreen(CockpitScreenBase):
             table.cursor_type = "row"
             yield table
             with Horizontal(classes="action-row-primary"):
-                yield Button("Restart selected", id="btn-restart-selected", variant="warning")
-                yield Button("Restart all", id="btn-restart-all", variant="error")
+                yield Button("Restart selected", id="btn-restart-selected", variant="warning", classes="thin-button")
+                yield Button("Restart all", id="btn-restart-all", variant="error", classes="thin-button")
             with Horizontal(classes="action-row-secondary"):
-                yield Button("View Logs", id="btn-view-logs")
+                yield Button("View Logs", id="btn-view-logs", classes="thin-button")
             yield Label("", id="docker-status", classes="status-text")
 
     def on_mount(self) -> None:

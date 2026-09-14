@@ -44,18 +44,18 @@ class HFTokenModal(ModalScreen[str | None]):
         height: auto;
         border: thick $background 80%;
         background: $surface;
-        padding: 1 2;
+        padding: $space-normal $space-section;
     }
     #hf-token-title {
         text-style: bold;
-        margin-bottom: 1;
+        margin-bottom: $space-normal;
     }
     #hf-token-msg {
         color: $text-muted;
-        margin-bottom: 1;
+        margin-bottom: $space-normal;
     }
     #hf-token-input {
-        margin-bottom: 1;
+        margin-bottom: $space-normal;
     }
     """
 
@@ -71,7 +71,7 @@ class HFTokenModal(ModalScreen[str | None]):
                 id="hf-token-msg",
             )
             yield Input(placeholder="hf_...", password=True, id="hf-token-input")
-            with Horizontal(classes="button-row"):
+            with Horizontal(classes="action-row-primary"):
                 yield Button("Continue", id="btn-token-continue", variant="primary", classes="thin-button")
                 yield Button("Cancel", id="btn-token-cancel", classes="thin-button")
 
@@ -95,11 +95,11 @@ class DownloadsScreen(CockpitScreenBase):
         padding: 0;
     }
     #disk-usage {
-        margin-top: 1;
+        margin-top: $space-normal;
         color: $text-muted;
     }
     #download-status {
-        margin-top: 1;
+        margin-top: $space-normal;
     }
     """
 
@@ -131,7 +131,7 @@ class DownloadsScreen(CockpitScreenBase):
                     placeholder="Hugging Face repo/model or GGUF filename...",
                     id="adhoc-model-input",
                 )
-                yield Button("Download", id="adhoc-download-btn", variant="primary", classes="thin-button")
+                yield Button("Download", id="adhoc-download-btn", variant="primary")  # inline archetype (DESIGN.md §9): bare Button inside .inline-row
 
             # fixed_columns=2: column 0 is the tick marker, so keeping the model ID visible
             # while repo_id/quant_file/status scroll horizontally takes both (DESIGN.md §4.2).

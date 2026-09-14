@@ -41,18 +41,18 @@ class EditScriptModal(ModalScreen[bool]):
         height: 85%;
         border: thick $background 80%;
         background: $surface;
-        padding: 1 2;
+        padding: $space-normal $space-section;
     }
     #edit-script-title {
         text-style: bold;
         color: $accent;
-        margin-bottom: 1;
+        margin-bottom: $space-normal;
     }
     #edit-script-scroll {
         height: 1fr;
     }
     #edit-script-scroll Label {
-        margin-top: 1;
+        margin-top: $space-normal;
         color: $text-muted;
     }
     #f-script-args {
@@ -60,15 +60,15 @@ class EditScriptModal(ModalScreen[bool]):
     }
     #script-form-error {
         color: $error;
-        margin-top: 1;
+        margin-top: $space-normal;
     }
     .switch-row {
         height: auto;
         align-vertical: middle;
-        margin-top: 1;
+        margin-top: $space-normal;
     }
     .switch-row Label {
-        margin-left: 1;
+        margin-left: $space-normal;
     }
     """
 
@@ -144,7 +144,7 @@ class EditScriptModal(ModalScreen[bool]):
                     yield Switch(value=enabled_val, id="f-script-enabled")
                     yield Label("Enable on boot")
                 yield Static("", id="script-form-error", classes="error-text")
-            with Horizontal(classes="button-row"):
+            with Horizontal(classes="action-row-primary"):
                 yield Button("Save", id="btn-save", variant="primary", classes="thin-button")
                 yield Button("Cancel", id="btn-cancel", classes="thin-button")
 
@@ -258,13 +258,13 @@ class ScriptsScreen(CockpitScreenBase):
             table.cursor_type = "row"
             yield table
             with Horizontal(classes="action-row-primary"):
-                yield Button("Start selected", id="btn-start-selected", variant="primary")
-                yield Button("Stop selected", id="btn-stop-selected", variant="warning")
-                yield Button("Enable", id="btn-enable-selected")
-                yield Button("Disable", id="btn-disable-selected")
+                yield Button("Start selected", id="btn-start-selected", variant="primary", classes="thin-button")
+                yield Button("Stop selected", id="btn-stop-selected", variant="warning", classes="thin-button")
+                yield Button("Enable", id="btn-enable-selected", classes="thin-button")
+                yield Button("Disable", id="btn-disable-selected", classes="thin-button")
             with Horizontal(classes="action-row-secondary"):
-                yield Button("New Script", id="btn-new-script")
-                yield Button("Remove selected", id="btn-remove-selected", variant="error")
+                yield Button("New Script", id="btn-new-script", classes="thin-button")
+                yield Button("Remove selected", id="btn-remove-selected", variant="error", classes="thin-button")
             yield Static("", id="status-message", classes="status-text")
 
     def on_mount(self) -> None:

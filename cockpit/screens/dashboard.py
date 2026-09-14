@@ -45,16 +45,16 @@ class DashboardScreen(CockpitScreenBase):
         width: 1fr;
         height: auto;
     }
-    /* DESIGN.md §2/§3.5: side-by-side only above the 120-cell breakpoint. The layout switch
+    /* DESIGN.md §2/§3.5: side-by-side only above the 121-cell breakpoint. The layout switch
        itself is SHARED_CSS's .columns-responsive rule; these two only fix up the gutter, which
        is a right margin between columns when they sit beside each other and a bottom margin
        between stacked panels when they don't. */
     Screen.-wide DashboardScreen #dashboard-left {
-        margin-right: 1;
+        margin-right: $space-normal;
     }
     Screen.-narrow DashboardScreen #dashboard-left {
         margin-right: 0;
-        margin-bottom: 1;
+        margin-bottom: $space-normal;
     }
     DashboardScreen .res-row {
         margin-bottom: 0;
@@ -63,11 +63,11 @@ class DashboardScreen(CockpitScreenBase):
         margin: 0;
     }
     DashboardScreen .hardware-meta {
-        margin-top: 1;
+        margin-top: $space-normal;
         color: $text-muted;
     }
     DashboardScreen .section-title {
-        margin-top: 1;
+        margin-top: $space-normal;
         margin-bottom: 0;
     }
     DashboardScreen .service-line {

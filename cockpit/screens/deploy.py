@@ -48,12 +48,12 @@ class ConfigPasteModal(ModalScreen[str | None]):
         height: 80%;
         border: thick $background 80%;
         background: $surface;
-        padding: 1 2;
+        padding: $space-normal $space-section;
     }
     #paste-title {
         text-style: bold;
         color: $accent;
-        margin-bottom: 1;
+        margin-bottom: $space-normal;
     }
     #paste-text {
         height: 1fr;
@@ -64,7 +64,7 @@ class ConfigPasteModal(ModalScreen[str | None]):
         with Vertical(id="paste-dialog"):
             yield Static("Paste a llama-swap config.yaml below", id="paste-title")
             yield TextArea(id="paste-text")
-            with Horizontal(classes="button-row"):
+            with Horizontal(classes="action-row-primary"):
                 yield Button("Parse", id="btn-parse", variant="primary", classes="thin-button")
                 yield Button("Cancel", id="btn-paste-cancel", classes="thin-button")
 
@@ -95,18 +95,18 @@ class EditModelModal(ModalScreen[bool]):
         height: 85%;
         border: thick $background 80%;
         background: $surface;
-        padding: 1 2;
+        padding: $space-normal $space-section;
     }
     #edit-model-title {
         text-style: bold;
         color: $accent;
-        margin-bottom: 1;
+        margin-bottom: $space-normal;
     }
     #edit-model-scroll {
         height: 1fr;
     }
     #edit-model-scroll Label {
-        margin-top: 1;
+        margin-top: $space-normal;
         color: $text-muted;
     }
     #f-args, #f-cmd, #f-env {
@@ -114,7 +114,7 @@ class EditModelModal(ModalScreen[bool]):
     }
     #form-error {
         color: $error;
-        margin-top: 1;
+        margin-top: $space-normal;
     }
     """
 
@@ -188,7 +188,7 @@ class EditModelModal(ModalScreen[bool]):
 
                 yield Static("", id="form-error", classes="error-text")
 
-            with Horizontal(classes="button-row"):
+            with Horizontal(classes="action-row-primary"):
                 yield Button("Save", id="btn-save", variant="primary", classes="thin-button")
                 yield Button("Cancel", id="btn-cancel", classes="thin-button")
 
@@ -350,19 +350,19 @@ class ImportModelsModal(ModalScreen[bool]):
         height: 85%;
         border: thick $background 80%;
         background: $surface;
-        padding: 1 2;
+        padding: $space-normal $space-section;
     }
     #import-title {
         text-style: bold;
         color: $accent;
-        margin-bottom: 1;
+        margin-bottom: $space-normal;
     }
     #import-scroll {
         height: 1fr;
     }
     #import-error {
         color: $error;
-        margin-top: 1;
+        margin-top: $space-normal;
     }
     """
 
@@ -393,7 +393,7 @@ class ImportModelsModal(ModalScreen[bool]):
                 table.cursor_type = "row"
                 yield table
                 yield Static("", id="import-error", classes="error-text")
-            with Horizontal(classes="button-row"):
+            with Horizontal(classes="action-row-primary"):
                 yield Button("Import selected", id="btn-import-selected", variant="primary", classes="thin-button")
                 yield Button("Paste config.yaml", id="btn-import-paste", classes="thin-button")
                 yield Button("Cancel", id="btn-import-close", classes="thin-button")
@@ -540,13 +540,13 @@ class DeployScreen(CockpitScreenBase):
             table = CockpitDataTable(id="models-table", classes="data-table", fixed_columns=1)
             yield table
             with Horizontal(classes="action-row-primary"):
-                yield Button("Apply & Restart Service", id="btn-apply", variant="primary")
-                yield Button("Add Model", id="btn-add-model")
-                yield Button("Edit", id="btn-edit-model")
-                yield Button("Delete", id="btn-delete-model", variant="error")
+                yield Button("Apply & Restart Service", id="btn-apply", variant="primary", classes="thin-button")
+                yield Button("Add Model", id="btn-add-model", classes="thin-button")
+                yield Button("Edit", id="btn-edit-model", classes="thin-button")
+                yield Button("Delete", id="btn-delete-model", variant="error", classes="thin-button")
             with Horizontal(classes="action-row-secondary"):
-                yield Button("Import from Llama-Swap", id="btn-import-toggle")
-                yield Button("Preview YAML", id="btn-preview-yaml")
+                yield Button("Import from Llama-Swap", id="btn-import-toggle", classes="thin-button")
+                yield Button("Preview YAML", id="btn-preview-yaml", classes="thin-button")
             yield Static("", id="status-message", classes="status-text")
 
     def on_mount(self) -> None:

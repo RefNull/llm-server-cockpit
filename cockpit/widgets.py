@@ -8,13 +8,33 @@ Convention every screen follows: wrap the top-level compose() content in a Verti
 clipping when the terminal is shorter than the content — this was the actual bug the
 Settings tab hit before its scroll containers were made explicit and independently bounded.
 Group related fields inside `classes="panel"` boxes with a `classes="panel-title"` heading;
-use `classes="button-row"` for a horizontal row of action buttons, `classes="status-text"`
-for a muted status/result line, and `classes="error-text"` for inline validation errors —
-defined once below instead of redeclared per screen.
+use `classes="action-row-primary"` (or `-secondary` for subordinate actions) for a horizontal
+row of action buttons, `classes="status-text"` for a muted status/result line, and
+`classes="error-text"` for inline validation errors — defined once below instead of
+redeclared per screen.
+
+Buttons come in exactly three archetypes (DESIGN.md §9) and nothing else. They are named,
+not lettered, because §8's *screen* archetypes own A/B/C and "archetype B" meaning both a
+table-driven screen and an in-table cell was a collision waiting to be misread:
+  action-row — `Button(..., classes="thin-button")`, h1/min-width 10/no border. The only
+               general-purpose button. Colour via `variant=` only.
+  in-table   — not a Button: `action_cell("Update")` -> rich Text in its own DataTable
+               column, click-dispatched (wired up in Phase 2).
+  inline     — a bare `Button(...)` inside `classes="inline-row"`, h3 so it lines up with
+               the `Input` beside it. Styled distinctly on purpose.
+
+Spacing tokens ($space-normal / $space-section / $space-edge) are NOT declared in this
+stylesheet. Textual parses every CSS source against only the app's `get_css_variables()`,
+so a `$var: value` written here is invisible to any screen's `DEFAULT_CSS` and referencing
+it there raises UnresolvedVariableError at mount. They live in `CockpitApp.SPACE_TOKENS`
+(cockpit/app.py), which feeds `get_css_variables()` and therefore reaches every source.
 """
 from __future__ import annotations
 
+import re
 import subprocess
+from importlib import import_module
+from pathlib import Path
 from rich.text import Text, TextType
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
@@ -40,12 +60,6 @@ AMBER_THEME = Theme(
 )
 
 SHARED_CSS = """
-/* Spacing scale (DESIGN.md §1). Cell units, declared once and referenced below and from
-   screen-level DEFAULT_CSS so a spacing change happens here rather than in 7 files. */
-$space-tight: 1;
-$space-normal: 1;
-$space-section: 2;
-
 Header {
     background: #e5a93c;
     color: #000000;
@@ -74,7 +88,10 @@ Tab {
        of the scroll viewport instead of hugging its content, opening large dead gaps between
        panels (most visible once a panel holds little content, e.g. a short DataTable). */
     height: auto;
-    padding: 0 $space-normal;
+    /* No horizontal padding on purpose (DESIGN.md §2 "Side inset"). `.panel` paints no border
+       and no background, so side padding here was invisible indentation that put panelled
+       screens (Dashboard, Builds, Settings) one cell further in than bare-table screens
+       (Containers, Scripts, Deploy, Downloads). The single side inset is #main-tabs'. */
     margin-bottom: $space-normal;
 }
 .panel-title {
@@ -82,21 +99,28 @@ Tab {
 }
 .subtitle {
     color: $text-muted;
-    margin-bottom: 1;
+    margin-bottom: $space-normal;
     text-style: italic;
 }
 .section-title {
     text-style: bold;
     color: $accent;
-    margin-top: 1;
-    margin-bottom: 1;
+    margin-top: $space-normal;
+    margin-bottom: $space-normal;
 }
+/* The action-row button archetype (DESIGN.md §9) — the only general-purpose button in the
+   app. Textual's default Button is `height: auto` with `border-top/bottom: tall` and
+   `min-width: 16`, i.e.
+   3 cells tall and 16 wide; this flattens it to one row and lets a short label be short.
+   Textual's own `Button(compact=True)` was evaluated as the native mechanism and rejected:
+   it only drops the border (measured h1), and leaves `min-width: 16` and no right margin,
+   so "Edit" still reserves 16 cells. Colour stays the job of `variant=`. */
 .thin-button {
     height: 1;
     min-width: 10;
     border: none;
-    padding: 0 1;
-    margin-right: 1;
+    padding: 0 $space-normal;
+    margin-right: $space-normal;
 }
 .close-button {
     min-width: 4;
@@ -112,27 +136,32 @@ Tab {
 }
 .inline-row Input {
     width: 1fr;
-    margin-right: 1;
+    margin-right: $space-normal;
 }
+/* The inline button archetype (DESIGN.md §9) — deliberately 3 cells tall so it lines up
+   with the `Input` it sits beside, and coloured $secondary so it reads as "acts on this field", not
+   as a page-level action that happens to be fat. Borders are set explicitly to match the
+   background; Textual's default paints them from $surface, which looks broken on a tinted
+   button. */
 .inline-row Button {
     min-width: 10;
     height: 3;
+    background: $secondary;
+    color: $text-secondary;
+    border-top: tall $secondary-lighten-1;
+    border-bottom: tall $secondary-darken-2;
 }
-.button-row {
-    height: auto;
-    margin-top: $space-normal;
-    margin-bottom: $space-normal;
-}
-.button-row Button {
-    margin-right: $space-section;
+.inline-row Button:hover {
+    background: $secondary-lighten-1;
+    border-top: tall $secondary-lighten-2;
 }
 .status-text {
     color: $text-muted;
-    margin-top: $space-tight;
+    margin-top: $space-normal;
 }
 .error-text {
     color: $error;
-    margin-top: $space-tight;
+    margin-top: $space-normal;
 }
 .data-table {
     height: auto;
@@ -164,19 +193,26 @@ Tab {
 .action-row-primary {
     height: auto;
     align: left middle;
-    margin-top: 1;
+    margin-top: $space-normal;
     margin-bottom: 0;
 }
 .action-row-secondary {
     height: auto;
     align: left middle;
-    margin-top: 1;
+    margin-top: $space-normal;
     margin-bottom: 0;
+}
+/* One gap rule for every action row, replacing the single-screen
+   `SettingsScreen .action-row-primary Button { margin-right: 1 }` that used to be the only
+   place action-row buttons didn't abut. The action-row archetype carries its own
+   margin-right; this also catches anything that lands in an action row without it. */
+.action-row-primary Button, .action-row-secondary Button {
+    margin-right: $space-normal;
 }
 .form-row {
     height: auto;
     align-vertical: middle;
-    margin-bottom: 1;
+    margin-bottom: $space-normal;
 }
 .form-label {
     width: 24;
@@ -190,13 +226,47 @@ Tab {
 /* Responsive breakpoint hooks (DESIGN.md §2, §3.5). CockpitApp.HORIZONTAL_BREAKPOINTS makes
    Textual stamp exactly one of these classes onto the Screen on every resize; layout reflow
    is expressed here as CSS, never as an on_resize geometry calculation in a screen.
-   Any multi-column Horizontal that must collapse below 120 cells carries .columns-responsive. */
+   Any multi-column Horizontal that must collapse below 121 cells carries .columns-responsive. */
 Screen.-narrow .columns-responsive {
     layout: vertical;
     height: auto;
 }
 Screen.-wide .columns-responsive {
     layout: horizontal;
+}
+
+/* No resting highlight on an un-focused table (DESIGN.md §4.4). A freshly mounted DataTable
+   painted two overlapping bands before the operator had touched anything: the row-0 block
+   cursor (show_cursor defaults True and cursor_coordinate defaults (0,0)) and the amber
+   $secondary-muted band on every fixed column. Both read as "this row/column is selected"
+   when nothing is.
+
+   This is CSS only, never `show_cursor=False` — DataTable._on_click gates every selection
+   message on show_cursor, so turning it off silently kills all click handling and keyboard
+   navigation. Here the cursor still exists and still dispatches; it just paints nothing until
+   the table has focus, at which point the :focus rules below repaint it. `--fixed` is pinned
+   to $surface (DataTable's own background) so a pinned column reads as ordinary cells. */
+DataTable > .datatable--cursor {
+    background: transparent;
+    color: $foreground;
+    text-style: none;
+}
+DataTable > .datatable--fixed-cursor {
+    background: transparent;
+    color: $foreground;
+}
+DataTable > .datatable--fixed {
+    background: $surface;
+    color: $foreground;
+}
+DataTable:focus > .datatable--cursor {
+    background: $block-cursor-background;
+    color: $block-cursor-foreground;
+    text-style: $block-cursor-text-style;
+}
+DataTable:focus > .datatable--fixed-cursor {
+    background: $block-cursor-background;
+    color: $block-cursor-foreground;
 }
 """
 
@@ -218,6 +288,22 @@ def selection_marker(selected: bool) -> Text:
     toggled on DataTable.RowSelected, and the table is rebuilt (clear() + re-add_row()) so this
     marker always reflects current state rather than being independently mutated."""
     return Text("[x]" if selected else "[ ]", style="bold" if selected else "")
+
+
+def action_cell(label: str, *, destructive: bool = False) -> Text:
+    """The in-table button archetype (DESIGN.md §9): a per-row action rendered *as a table
+    cell*, in its own column, e.g. `[ Update ]`. Not a Button — a Textual Widget has no `__rich_console__`,
+    so `DataTable` cannot hold one; clicks are dispatched from the cell's style meta instead
+    (the mechanism SingleClickDataTable below already uses; wired to actions in Phase 2).
+
+    Returns `rich.text.Text`, never a `str`: the app console has markup enabled, so a raw
+    "[ Update ]" would be eaten as a Rich tag and render as the empty string.
+
+    Column width contract: `len(longest label in the column) + 4` (two brackets, two spaces).
+    Destructive actions (Remove, Delete) take the theme's error colour rather than a
+    differently-shaped label, so "this one is dangerous" reads at a glance down the column.
+    """
+    return Text(f"[ {label} ]", style=f"bold {AMBER_THEME.error}" if destructive else "")
 
 
 class CockpitDataTable(DataTable):
@@ -294,11 +380,11 @@ class InfoModal(ModalScreen[None]):
         height: 80%;
         border: thick $background 80%;
         background: $surface;
-        padding: 1 2;
+        padding: $space-normal $space-section;
     }
     #info-header {
         height: auto;
-        margin-bottom: 1;
+        margin-bottom: $space-normal;
     }
     #info-title {
         width: 1fr;
@@ -346,10 +432,10 @@ class ConfirmModal(ModalScreen[bool]):
         height: auto;
         border: thick $background 80%;
         background: $surface;
-        padding: 1 2;
+        padding: $space-normal $space-section;
     }
     #confirm-message {
-        margin-bottom: 1;
+        margin-bottom: $space-normal;
     }
     """
 
@@ -362,9 +448,14 @@ class ConfirmModal(ModalScreen[bool]):
     def compose(self) -> ComposeResult:
         with Vertical(id="confirm-dialog"):
             yield Static(self.message, id="confirm-message")
-            with Horizontal(classes="button-row"):
-                yield Button(self.confirm_label, variant="error" if self.danger else "primary", id="confirm-yes")
-                yield Button("Cancel", id="confirm-no")
+            with Horizontal(classes="action-row-primary"):
+                yield Button(
+                    self.confirm_label,
+                    variant="error" if self.danger else "primary",
+                    id="confirm-yes",
+                    classes="thin-button",
+                )
+                yield Button("Cancel", id="confirm-no", classes="thin-button")
 
     def action_cancel(self) -> None:
         self.dismiss(False)
@@ -458,6 +549,57 @@ def _self_check() -> None:
         pass
     else:
         raise AssertionError("a screen without on_refresh_requested() must not mount")
+
+    # Every $token SHARED_CSS references must be one CockpitApp actually declares. Textual
+    # resolves variables per CSS source against get_css_variables() only, so an undeclared
+    # one is not a typo that degrades — it raises UnresolvedVariableError at mount and the
+    # app won't start. Imported here (not at module scope) because app.py imports this module.
+    from cockpit.app import CockpitApp
+
+    referenced = set(re.findall(r"\$space-[a-z-]+", SHARED_CSS))
+    declared = {f"${name}" for name in CockpitApp.SPACE_TOKENS}
+    if not referenced <= declared:
+        raise AssertionError(f"SHARED_CSS references undeclared spacing tokens: {referenced - declared}")
+    if re.search(r"^\s*\$space-[a-z-]+\s*:", SHARED_CSS, re.M):
+        raise AssertionError("spacing tokens must live in CockpitApp.SPACE_TOKENS, not SHARED_CSS")
+    values = list(CockpitApp.SPACE_TOKENS.values())
+    if len(set(values)) != len(values):
+        raise AssertionError(f"DESIGN.md §1: spacing tokens must have distinct values, got {values}")
+
+    # DESIGN.md §1: no bare 1/2/3 as a margin/padding in any screen's DEFAULT_CSS. The old
+    # check only looked at SHARED_CSS, which is the one file that was already compliant — it
+    # could not see the ~22 hardcoded values that were sitting in cockpit/screens/*.py. This
+    # walks the real DEFAULT_CSS attributes (not the file text) so comments and docstrings
+    # can't trip it, and only inspects margin/padding: `height: 10` or `width: 1fr` is not
+    # spacing. `0` and `auto` stay literal — there is no token for "no gap".
+    offenders = []
+    for path in sorted((Path(__file__).parent / "screens").glob("*.py")):
+        module = import_module(f"cockpit.screens.{path.stem}")
+        for obj in vars(module).values():
+            # `obj.__module__` filter: a screen module imports Textual's own widgets into its
+            # namespace, and Input/Select/TextArea carry bare paddings of their own.
+            if not isinstance(obj, type) or obj.__module__ != module.__name__:
+                continue
+            if "DEFAULT_CSS" not in vars(obj):
+                continue
+            for prop, value in re.findall(
+                r"^\s*((?:margin|padding)(?:-top|-right|-bottom|-left)?)\s*:\s*([^;]+);",
+                vars(obj)["DEFAULT_CSS"],
+                re.M,
+            ):
+                bare = [p for p in value.split() if not p.startswith("$") and p not in ("0", "auto")]
+                if bare:
+                    offenders.append(f"{obj.__qualname__}: {prop}: {value.strip()}")
+    if offenders:
+        raise AssertionError(
+            "DESIGN.md §1: screen DEFAULT_CSS must use a $space-* token for margin/padding, "
+            f"not a bare value — {offenders}"
+        )
+
+    # The in-table archetype renders through rich Text, not str — a str would be eaten by console markup.
+    assert action_cell("Update").plain == "[ Update ]"
+    assert AMBER_THEME.error in str(action_cell("Remove", destructive=True).style)
+
     print("cockpit.widgets self-check OK")
 
 

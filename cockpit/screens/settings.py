@@ -83,41 +83,39 @@ class SettingsScreen(CockpitScreenBase):
     SettingsScreen #wizard-switcher {
         height: 1fr;
     }
+    /* No side padding: the first-run wizard sits at the same side inset as every normal-mode
+       screen, which is #main-tabs' $space-edge and nothing else (DESIGN.md §2). */
     SettingsScreen #step-identity, SettingsScreen #step-hardware, SettingsScreen #step-review {
         height: 1fr;
-        padding: 0 1;
     }
     SettingsScreen #settings-tabs {
         height: 1fr;
     }
     SettingsScreen Label {
-        margin-top: 1;
-    }
-    SettingsScreen .action-row-primary Button {
-        margin-right: 1;
+        margin-top: $space-normal;
     }
     SettingsScreen .hint {
         color: $text-muted;
-        margin-bottom: 1;
+        margin-bottom: $space-normal;
     }
     SettingsScreen #vpn-resolve-preview {
         color: $text-muted;
     }
     SettingsScreen .data-table {
-        margin-top: 1;
+        margin-top: $space-normal;
     }
     SettingsScreen #gpu-add-form {
         border: solid $accent;
-        padding: 1;
-        margin-top: 1;
-        margin-bottom: 1;
+        padding: $space-normal;
+        margin-top: $space-normal;
+        margin-bottom: $space-normal;
         height: auto;
     }
     SettingsScreen #review-yaml {
         height: 1fr;
         min-height: 14;
-        margin-top: 1;
-        margin-bottom: 1;
+        margin-top: $space-normal;
+        margin-bottom: $space-normal;
     }
     """
 
@@ -165,7 +163,7 @@ class SettingsScreen(CockpitScreenBase):
                 yield Label("Build output directory")
                 yield Input(id="f-prefix-root")
                 yield Static("", id="step-identity-error", classes="error-text")
-                with Horizontal(classes="button-row"):
+                with Horizontal(classes="action-row-primary"):
                     yield Button("Next: Hardware & Network →", id="btn-next-hardware", variant="primary", classes="thin-button")
 
             with VerticalScroll(id="step-hardware"):
@@ -174,7 +172,7 @@ class SettingsScreen(CockpitScreenBase):
                 yield Label("VPN interface (not an IP)")
                 with Horizontal(classes="inline-row"):
                     yield Input(id="f-vpn-interface", placeholder="e.g. tailscale0, wg0")
-                    yield Button("ip a", id="btn-ip-a", classes="thin-button")
+                    yield Button("ip a", id="btn-ip-a")  # inline archetype (DESIGN.md §9): bare Button inside .inline-row
                 yield Static("", id="vpn-resolve-preview")
                 yield Label("Gateway port")
                 yield Input(id="f-port")
@@ -183,7 +181,7 @@ class SettingsScreen(CockpitScreenBase):
 
                 yield Static("GPUs", classes="section-title")
                 yield CockpitDataTable(id="gpu-table", zebra_stripes=True, classes="data-table", fixed_columns=1)
-                with Horizontal(classes="button-row"):
+                with Horizontal(classes="action-row-primary"):
                     yield Button("Add GPU", id="btn-add-gpu", variant="primary", classes="thin-button")
                     yield Button("Remove Selected", id="btn-remove-gpu", variant="error", classes="thin-button")
                     yield Button("List PCIe devices", id="btn-lspci", classes="thin-button")
@@ -197,13 +195,13 @@ class SettingsScreen(CockpitScreenBase):
                     yield Label("Backends (comma-separated: cuda, rocm, vulkan, sycl)")
                     yield Input(id="gpu-add-backends", placeholder="cuda")
                     yield Static("", id="gpu-add-error", classes="error-text")
-                    with Horizontal(classes="button-row"):
+                    with Horizontal(classes="action-row-primary"):
                         yield Button("Save GPU", id="btn-gpu-save", classes="thin-button", variant="primary")
                         yield Button("Cancel", id="btn-gpu-cancel", classes="thin-button")
 
                 yield Static("", id="step-hardware-error", classes="error-text")
-                with Horizontal(classes="button-row"):
-                    yield Button("← Back: Host Identity", id="btn-back-identity")
+                with Horizontal(classes="action-row-primary"):
+                    yield Button("← Back: Host Identity", id="btn-back-identity", classes="thin-button")
                     yield Button("Next: Review & Deploy →", id="btn-next-review", variant="primary", classes="thin-button")
 
             with VerticalScroll(id="step-review"):
@@ -211,9 +209,9 @@ class SettingsScreen(CockpitScreenBase):
                 yield TextArea(id="review-yaml", language="yaml", read_only=True)
                 yield Static("", id="step-review-error", classes="error-text")
                 yield Static("", id="step-review-status", classes="status-text")
-                with Horizontal(classes="button-row"):
-                    yield Button("← Back: Hardware & Network", id="btn-back-hardware")
-                    yield Button("Preview YAML", id="btn-dummy-deploy")
+                with Horizontal(classes="action-row-primary"):
+                    yield Button("← Back: Hardware & Network", id="btn-back-hardware", classes="thin-button")
+                    yield Button("Preview YAML", id="btn-dummy-deploy", classes="thin-button")
                     yield Button("Deploy Host Profile", id="btn-real-deploy", variant="primary", classes="thin-button")
 
     def _compose_normal(self) -> ComposeResult:
@@ -259,8 +257,8 @@ class SettingsScreen(CockpitScreenBase):
 
                     yield Static("", id="profile-error", classes="error-text")
                     with Horizontal(classes="action-row-primary"):
-                        yield Button("Save Profile", id="btn-save-profile", variant="primary")
-                        yield Button("Deploy", id="btn-deploy-profile")
+                        yield Button("Save Profile", id="btn-save-profile", variant="primary", classes="thin-button")
+                        yield Button("Deploy", id="btn-deploy-profile", classes="thin-button")
                     yield Static("", id="profile-status", classes="status-text")
 
             with TabPane("GPU Topology", id="settings-tab-gpus"):
@@ -272,8 +270,8 @@ class SettingsScreen(CockpitScreenBase):
                             yield Static("Driver Status", classes="form-label")
                             yield Static("not checked yet", id="drivers-status", classes="form-field status-text")
                     with Horizontal(classes="action-row-primary"):
-                        yield Button("Check Drivers", id="btn-check-drivers")
-                        yield Button("List PCIe Devices", id="btn-lspci")
+                        yield Button("Check Drivers", id="btn-check-drivers", classes="thin-button")
+                        yield Button("List PCIe Devices", id="btn-lspci", classes="thin-button")
 
             with TabPane("System Services", id="settings-tab-services"):
                 with VerticalScroll():
@@ -315,9 +313,9 @@ class SettingsScreen(CockpitScreenBase):
 
                     yield Static("", id="service-error", classes="error-text")
                     with Horizontal(classes="action-row-primary"):
-                        yield Button("Apply Service Settings", id="btn-apply-service", variant="primary")
-                        yield Button("Check / Enable WOL", id="btn-check-wol", variant="warning")
-                        yield Button("Check / Enable Tailscale", id="btn-check-tailscale", variant="warning")
+                        yield Button("Apply Service Settings", id="btn-apply-service", variant="primary", classes="thin-button")
+                        yield Button("Check / Enable WOL", id="btn-check-wol", variant="warning", classes="thin-button")
+                        yield Button("Check / Enable Tailscale", id="btn-check-tailscale", variant="warning", classes="thin-button")
                     yield Static("", id="service-status", classes="status-text")
 
     def on_mount(self) -> None:

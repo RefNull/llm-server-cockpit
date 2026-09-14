@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Phase 4 verification script: mounts CockpitApp under Textual's Pilot test harness,
-validates layout reflow at 80x24 (-narrow) and 120x30 (-wide), navigates through all 7
+validates layout reflow at 80x24 (-narrow) and 121x30 (-wide), navigates through all 7
 screens, and exports SVG screenshots.
 """
 from __future__ import annotations
@@ -25,7 +25,7 @@ async def verify_geometry_and_export_screenshots() -> None:
 
     resolutions = [
         ((80, 24), "-narrow", "vertical"),
-        ((120, 30), "-wide", "horizontal"),
+        ((121, 30), "-wide", "horizontal"),
     ]
 
     screens = [
@@ -57,8 +57,8 @@ async def verify_geometry_and_export_screenshots() -> None:
                 assert banner_art.styles.display == "none", "Expected banner-art to be hidden at 80x24"
                 assert banner_compact.styles.display == "block", "Expected banner-compact to be visible at 80x24"
             else:
-                assert banner_art.styles.display == "block", "Expected banner-art to be visible at 120x30"
-                assert banner_compact.styles.display == "none", "Expected banner-compact to be hidden at 120x30"
+                assert banner_art.styles.display == "block", "Expected banner-art to be visible at 121x30"
+                assert banner_compact.styles.display == "none", "Expected banner-compact to be hidden at 121x30"
 
             dashboard_cols = app.query_one("#dashboard-columns")
             actual_layout = str(dashboard_cols.styles.layout).strip("<>")

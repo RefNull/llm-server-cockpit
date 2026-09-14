@@ -62,11 +62,11 @@ class BuildHistoryModal(ModalScreen[None]):
         height: 80%;
         border: thick $background 80%;
         background: $surface;
-        padding: 1 2;
+        padding: $space-normal $space-section;
     }
     #history-header {
         height: auto;
-        margin-bottom: 1;
+        margin-bottom: $space-normal;
     }
     #history-title {
         width: 1fr;
@@ -74,7 +74,7 @@ class BuildHistoryModal(ModalScreen[None]):
     }
     #history-table {
         height: 1fr;
-        margin-bottom: 1;
+        margin-bottom: $space-normal;
     }
     """
 
@@ -140,13 +140,13 @@ class BuildsScreen(CockpitScreenBase):
     BuildsScreen #build-log {
         height: 10;
         border: round $accent;
-        margin-top: 1;
+        margin-top: $space-normal;
         display: none;
     }
     BuildsScreen #build-status {
         text-style: italic;
-        margin-top: 1;
-        margin-bottom: 1;
+        margin-top: $space-normal;
+        margin-bottom: $space-normal;
     }
     """
 

@@ -46,7 +46,11 @@ class CockpitHeader(Vertical):
     CockpitHeader {
         height: auto;
         align: center middle;
-        margin: 0 2 1 2;
+        /* Side margin is the app's single side inset (DESIGN.md §2) — the header is not
+           inside #main-tabs, so it has to restate the value rather than inherit it. It used
+           to be a bare 2, which left the banner and the version/host line one cell left of
+           every screen's content once #main-tabs moved to 3. */
+        margin: 0 $space-edge $space-normal $space-edge;
     }
     """
 
@@ -82,9 +86,11 @@ class CockpitApp(App):
     action_refresh_all's DOM query below finds screens: Textual mounts every TabPane's content
     up front (no lazy-mount), so a query for a screen class matches regardless of nesting depth.
 
-    CSS = SHARED_CSS (cockpit/widgets.py): panel/button-row/status-text/error-text and the
-    scroll-container convention are defined once there and cascade to every screen — see that
-    file's module docstring for the convention every screen composes against.
+    CSS = SHARED_CSS (cockpit/widgets.py): panel/action-row/status-text/error-text, the three
+    button archetypes and the scroll-container convention are defined once there and cascade
+    to every screen — see that file's module docstring for the convention every screen
+    composes against. Spacing tokens are SPACE_TOKENS below, not SHARED_CSS (see the comment
+    there for why that distinction is load-bearing).
     """
 
     CSS = (
@@ -117,12 +123,39 @@ class CockpitApp(App):
     Screen {
         overflow: hidden;
     }
+    /* Type selector on purpose: both the outer tab bar and the nested ones (LLM, Settings)
+       must fill the viewport vertically. The side inset deliberately is NOT here — see
+       #main-tabs below. */
     TabbedContent {
         height: 1fr;
-        margin: 0 2;
+    }
+    /* The single side inset for the whole app (DESIGN.md §2). This used to be
+       `TabbedContent { margin: 0 2 }`, a type selector, so it applied again to the nested
+       TabbedContents inside the LLM and Settings tabs and pushed those screens 2 cells
+       further in than the flat ones. Scoped to the outer container, every screen sits at 3. */
+    #main-tabs {
+        margin: 0 $space-edge;
+    }
+    /* Textual's Tabs is `height: 2` docked top with no bottom margin, so content started on
+       the row immediately under the tab labels. Matches both levels: the selector is a child
+       combinator on the type, and TabbedContent.compose yields exactly one ContentSwitcher. */
+    TabbedContent > ContentSwitcher {
+        margin-top: $space-normal;
     }
     """
     )
+
+    # DESIGN.md §1 spacing scale, in cells. These live here rather than as `$name: value`
+    # lines in SHARED_CSS because Textual parses each CSS source (App.CSS and every widget's
+    # DEFAULT_CSS) against get_css_variables() alone — a variable declared inside App.CSS is
+    # invisible to a screen's DEFAULT_CSS, and referencing it there raises
+    # UnresolvedVariableError at mount. Routed through get_css_variables below, they resolve
+    # in every source. Values must stay distinct: $space-tight used to be a second name for 1.
+    SPACE_TOKENS: ClassVar[dict[str, str]] = {
+        "space-normal": "1",   # between consecutive rows/controls; the default gap
+        "space-section": "2",  # between distinct regions of a screen
+        "space-edge": "3",     # the app's side inset (#main-tabs and CockpitHeader)
+    }
 
     TITLE = "llm-server-cockpit"
     BINDINGS = [
@@ -131,9 +164,11 @@ class CockpitApp(App):
     ]
 
     # DESIGN.md §2. Textual stamps exactly one of these classes onto the active Screen on every
-    # resize (width < 120 -> Screen.-narrow, >= 120 -> Screen.-wide); the reflow itself lives in
+    # resize (width < 121 -> Screen.-narrow, >= 121 -> Screen.-wide); the reflow itself lives in
     # SHARED_CSS / screen DEFAULT_CSS, so no screen implements on_resize geometry by hand.
-    HORIZONTAL_BREAKPOINTS: ClassVar[list[tuple[int, str]]] = [(0, "-narrow"), (120, "-wide")]
+    # 121 = ASCII_BANNER's 115 columns + the $space-edge inset on both sides (3 + 3). It was
+    # 120 while CockpitHeader's side margin was 2; moving that margin to $space-edge moved this.
+    HORIZONTAL_BREAKPOINTS: ClassVar[list[tuple[int, str]]] = [(0, "-narrow"), (121, "-wide")]
 
     def __init__(self, host: str | None = None) -> None:
         super().__init__()
@@ -157,15 +192,18 @@ class CockpitApp(App):
             self.scripts = {"scripts": []}
         self.runner = Runner(dry_run=False)
 
+    def get_css_variables(self) -> dict[str, str]:
+        return {**super().get_css_variables(), **self.SPACE_TOKENS}
+
     def compose(self) -> ComposeResult:
         yield Header()
         yield CockpitHeader(self.host_name)
         if self.host_profile is None:
-            with TabbedContent(initial="settings"):
+            with TabbedContent(initial="settings", id="main-tabs"):
                 with TabPane("First setup", id="settings"):
                     yield SettingsScreen(self.host_profile, self.manifest, self.models, self.runner, self.repo_root, self)
         else:
-            with TabbedContent(initial="dashboard"):
+            with TabbedContent(initial="dashboard", id="main-tabs"):
                 with TabPane("Dashboard", id="dashboard"):
                     yield DashboardScreen(self.host_profile, self.manifest, self.models, self.runner, self.repo_root, self)
                 with TabPane("LLM", id="llm"):
