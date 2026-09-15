@@ -70,7 +70,9 @@ class DashboardScreen(CockpitScreenBase):
     /* Bar defaults to width: 32 (textual/widgets/_progress_bar.py) — 1fr makes it fill the
        row so PercentageStatus (width 5, right-aligned) sits immediately against its right
        edge instead of floating in the middle of the row (DESIGN.md — Phase 6's "values feel
-       disconnected from the bars" fix; composition per _progress_bar.py:293-302). */
+       disconnected from the bars" fix; composition per _progress_bar.py:293-302). Every row
+       now also carries a .res-val column, so "fills the row" means the same width on every
+       row and the percentages line up. */
     DashboardScreen .res-row Bar {
         width: 1fr;
     }
@@ -157,6 +159,10 @@ class DashboardScreen(CockpitScreenBase):
                     with Horizontal(classes="res-row"):
                         yield Static("CPU", classes="res-label")
                         yield ProgressBar(total=100, show_eta=False, id="res-cpu-bar")
+                        # No absolute reading exists for CPU, but the column does: without it
+                        # this bar ran 18 cells longer than RAM's and put its "%" somewhere
+                        # else entirely. See SHARED_CSS's .res-val.
+                        yield Static("", classes="res-val")
                     with Horizontal(classes="res-row"):
                         yield Static("RAM", classes="res-label")
                         yield ProgressBar(total=100, show_eta=False, id="res-mem-bar")

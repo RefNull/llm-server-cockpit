@@ -27,7 +27,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Input, Label, Static
 
-from cockpit.widgets import CockpitScreenBase, SingleClickDataTable, TableAction, selection_marker
+from cockpit.widgets import CockpitScreenBase, SingleClickDataTable, TableAction
 from provision import schema
 from provision.common import Runner
 from provision.steps import hf
@@ -157,7 +157,6 @@ class DownloadsScreen(CockpitScreenBase):
         self._downloadable: dict[str, dict[str, Any]] = {}
         # id -> {"status": str, "size": int|None, "date": str|None} from the last refresh.
         self._row_info: dict[str, dict[str, Any]] = {}
-        self._selected: set[str] = set()
         self._downloading = False
 
     def compose(self) -> ComposeResult:
@@ -169,17 +168,19 @@ class DownloadsScreen(CockpitScreenBase):
                 )
                 yield Button("Track", id="track-btn", variant="primary")  # inline archetype (DESIGN.md §9): bare Button inside .inline-row
 
-            # fixed_columns=2: column 0 is the tick marker, so keeping the model ID visible
-            # while Repo ID/Status/Size/Date scroll horizontally takes both (DESIGN.md §4.2).
-            table = SingleClickDataTable(
-                id="model-table", zebra_stripes=True, classes="data-table", fixed_columns=2
-            )
+            # No fixed_columns: a pinned column is painted from datatable--fixed, which
+            # REPLACES the row style (_data_table.py _render_line_in_row) rather than
+            # compositing with it, so it cut a flat band down column 0 through the zebra
+            # stripes. Every column here carries an explicit width that fits the 115-cell
+            # usable viewport, so nothing scrolls horizontally for it to pin.
+            table = SingleClickDataTable(id="model-table", zebra_stripes=True, classes="data-table")
             table.cursor_type = "row"
             yield table
 
             with Horizontal(classes="action-row-primary"):
-                yield Button("Download selected", id="btn-download-selected", variant="primary", classes="thin-button")
-                yield Button("Download all missing", id="btn-download-all", classes="thin-button")
+                # Per-model download is the in-table [ Download ] action column. This one is
+                # the genuine bulk case, not a second way to act on a selection.
+                yield Button("Download all missing", id="btn-download-all", variant="primary", classes="thin-button")
 
             with Horizontal(classes="action-row-secondary"):
                 yield Static("", id="disk-usage")
@@ -188,18 +189,15 @@ class DownloadsScreen(CockpitScreenBase):
     def on_mount(self) -> None:
         table = self.query_one("#model-table", SingleClickDataTable)
         # Column budget (DESIGN.md §4): render width is content width + 2*cell_padding per
-        # column (Textual _data_table.py Column.get_render_width). At the old widths
-        # (3+22+32+22+10+12+12 content, 7 columns) the render width was 127 cells against a
-        # 115-cell usable viewport at 121x30 (121 - 2*$space-edge), pushing the "[ Download ]"
-        # action column off-screen. Repo ID and Status already truncated their content at the
-        # old widths, so the cut below comes from their slack, not from ID/Size/Date: new
-        # content sum is 89, render sum 89 + 2*7 = 103 <= 115.
-        table.add_column("", width=3)
-        table.add_column("ID", width=18)
-        table.add_column("Repo ID", width=20)
-        table.add_column("Status", width=16)
+        # column (Textual _data_table.py Column.get_render_width) against a 115-cell usable
+        # viewport at 121x30 (121 - 2*$space-edge). Dropping the tick column returned its 3
+        # content cells + 2 padding to the data columns and put ID flush left. Content sum
+        # 88, render sum 88 + 2*6 = 100 <= 115.
+        table.add_column("ID", width=20)
+        table.add_column("Repo ID", width=26)
+        table.add_column("Status", width=20)
         table.add_column("Size", width=10)
-        table.add_column("Release Date", width=10)
+        table.add_column("Release Date", width=12)
         table.add_action_column(TableAction("download", "Download", confirm="Download {row}?", available=self._can_download))
         self._refresh_table()
         self._refresh_disk_usage()
@@ -257,7 +255,6 @@ class DownloadsScreen(CockpitScreenBase):
         table.clear()
         self._downloadable = {m["id"]: m for m in models}
         self._row_info = {m["id"]: info for m, info in rows}
-        self._selected &= self._downloadable.keys()
 
         for model, info in rows:
             status = info["status"]
@@ -269,7 +266,6 @@ class DownloadsScreen(CockpitScreenBase):
             # markup=True, so an operator-chosen repo_id containing brackets would have that
             # span silently eaten by Rich as a markup tag.
             table.add_row(
-                selection_marker(model["id"] in self._selected),
                 Text(model["id"]),
                 Text(repo_display),
                 Text(status_label),
@@ -297,36 +293,13 @@ class DownloadsScreen(CockpitScreenBase):
             widget.update(f"Disk usage: {total_gb:.1f} GiB in {models_dir}")
 
     def _sync_button_state(self) -> None:
-        """'Download selected'/'Download all missing' enable only when there's a ticked (resp.
-        any) model whose live status is 'ready for download' and no download is running."""
-        btn_selected = self.query("#btn-download-selected")
+        """'Download all missing' enables only when some model's live status is 'ready for
+        download' and no download is running."""
         btn_all = self.query("#btn-download-all")
-        if not self._downloadable:
-            if btn_selected:
-                btn_selected.first(Button).disabled = True
-            if btn_all:
-                btn_all.first(Button).disabled = True
+        if not btn_all:
             return
-        ready_ids = {mid for mid, info in self._row_info.items() if info["status"] == "ready for download"}
-        if btn_selected:
-            btn_selected.first(Button).disabled = self._downloading or not (self._selected & ready_ids)
-        if btn_all:
-            btn_all.first(Button).disabled = self._downloading or not ready_ids
-
-    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        if event.data_table.id != "model-table" or event.row_key is None or event.row_key.value is None:
-            return
-        model_id = event.row_key.value
-        if model_id not in self._downloadable:
-            return
-        if model_id in self._selected:
-            self._selected.discard(model_id)
-        else:
-            self._selected.add(model_id)
-        self._apply_rows(
-            list(self._downloadable.values()),
-            [(m, self._row_info[m["id"]]) for m in self._downloadable.values()],
-        )
+        ready = any(info["status"] == "ready for download" for info in self._row_info.values())
+        btn_all.first(Button).disabled = self._downloading or not ready
 
     # ------------------------------------------------------------------
     # Refresh entry point (called by app.py's action_refresh_all)
@@ -370,9 +343,7 @@ class DownloadsScreen(CockpitScreenBase):
     # ------------------------------------------------------------------
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "btn-download-selected":
-            await self._on_download_selected()
-        elif event.button.id == "btn-download-all":
+        if event.button.id == "btn-download-all":
             await self._on_download_all_missing()
         elif event.button.id == "track-btn":
             await self._on_track_model()
@@ -481,29 +452,6 @@ class DownloadsScreen(CockpitScreenBase):
         self._refresh_table()
 
     @work
-    async def _on_download_selected(self) -> None:
-        pending = [
-            self._downloadable[model_id]
-            for model_id in sorted(self._selected)
-            if model_id in self._downloadable
-            and self._row_info.get(model_id, {}).get("status") == "ready for download"
-        ]
-        if not pending:
-            return
-        if not await self._ensure_hf_auth():
-            return
-        names = ", ".join(m["id"] for m in pending)
-        confirmed = await self.confirm(
-            f"Download {len(pending)} selected model(s)?\n{names}\n"
-            "This can take a while and uses bandwidth.",
-            confirm_label="Download",
-            mutates_system=True,
-        )
-        if not confirmed:
-            return
-        self._run_download_batch(pending)
-
-    @work
     async def _on_download_all_missing(self) -> None:
         pending = [
             model
@@ -548,7 +496,6 @@ class DownloadsScreen(CockpitScreenBase):
                         self.app.notify, f"{model_id}: download failed — {exc}", severity="error"
                     )
                     continue
-                self.app.call_from_thread(self._selected.discard, model_id)
                 self.app.call_from_thread(self.app.notify, f"{model_id}: download complete")
         finally:
             if failures:

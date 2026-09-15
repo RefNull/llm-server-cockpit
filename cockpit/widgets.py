@@ -189,6 +189,28 @@ Tab {
     width: 1fr;
     height: 1;
 }
+/* The unfilled part of the track. Textual's Bar paints it `background: $surface` — the same
+   colour as the panel behind it — so a gauge at 12% read as a short amber smear floating in
+   empty space with no visible "out of what". A distinct track is what makes the proportion
+   legible at a glance (htop/btop/gotop all draw one). $error at 100% rather than Textual's
+   default $success: these are saturation gauges, not download progress — a full RAM bar is
+   not a success. */
+.res-row Bar > .bar--bar {
+    color: $primary;
+    background: $surface-lighten-2;
+}
+.res-row Bar > .bar--complete {
+    color: $error;
+    background: $surface-lighten-2;
+}
+.res-row PercentageStatus {
+    margin-left: $space-normal;
+}
+/* Fixed width, right-aligned, and present on EVERY .res-row even when that metric has no
+   absolute reading (CPU). The percentage sits at the ProgressBar's right edge, so a row
+   without this column let its bar run 18 cells further and put its "%" in a different screen
+   column than the row above it — the "bars of differing lengths" defect. Structural: the
+   empty Static is the column, not decoration. */
 .res-val {
     width: 18;
     text-align: right;
@@ -235,12 +257,17 @@ Screen.-narrow .action-row-primary Button, Screen.-narrow .action-row-secondary 
     margin-bottom: $space-normal;
 }
 .form-label {
-    width: 24;
+    width: 20;
     text-style: bold;
     color: $text-muted;
 }
+/* `max-width` caps a field that would otherwise stretch the full width of a single-column
+   panel. 20 + 40 = 60 cells per form row, so two panels fit side by side inside the 115-cell
+   usable width above the breakpoint (see .columns-responsive) — which is the point: the
+   Settings sub-tabs were a single tall column that had to be scrolled. */
 .form-field {
     width: 1fr;
+    max-width: 40;
 }
 
 /* Responsive breakpoint hooks (DESIGN.md §2, §3.5). CockpitApp.HORIZONTAL_BREAKPOINTS makes
@@ -265,12 +292,30 @@ Screen.-wide .columns-responsive {
    at 121x30 with the rule still present in DEFAULT_CSS. SHARED_CSS is App.CSS, registered with
    an empty scope, so the identical selector works here the same way .columns-responsive already
    does above. */
+/* A single cell of whitespace was not enough to tell the left column's content from the
+   right's — a long "Endpoint: ..." line in the right column read as a continuation of the
+   GPU row beside it. A rule plus $space-section either side gives 5 cells and an unambiguous
+   boundary, which is cheaper to read than more whitespace would be at any width that still
+   leaves room for the columns themselves. */
 Screen.-wide DashboardScreen #dashboard-left {
-    margin-right: $space-normal;
+    margin-right: $space-section;
+    padding-right: $space-section;
+    border-right: solid $surface-lighten-2;
 }
 Screen.-narrow DashboardScreen #dashboard-left {
     margin-right: 0;
-    margin-bottom: $space-normal;
+    padding-right: 0;
+    border-right: none;
+    margin-bottom: $space-section;
+}
+/* Same treatment for the Settings sub-tabs' paired panels — same reason, same rule shape, and
+   here too it has to live in SHARED_CSS rather than SettingsScreen.DEFAULT_CSS: a scoped
+   DEFAULT_CSS rule beginning with "Screen..." is rewritten to require a SettingsScreen
+   ancestor of a Screen, which never matches. */
+Screen.-wide SettingsScreen .settings-columns > .panel:first-of-type {
+    margin-right: $space-section;
+    padding-right: $space-section;
+    border-right: solid $surface-lighten-2;
 }
 
 /* No resting highlight on an un-focused table (DESIGN.md §4.4). A freshly mounted DataTable
@@ -284,6 +329,19 @@ Screen.-narrow DashboardScreen #dashboard-left {
    navigation. Here the cursor still exists and still dispatches; it just paints nothing until
    the table has focus, at which point the :focus rules below repaint it. `--fixed` is pinned
    to $surface (DataTable's own background) so a pinned column reads as ordinary cells. */
+/* Zebra phase (DESIGN.md §4.4, second half). Textual tints the EVEN rows (0, 2, 4...) and
+   leaves the odd ones at $surface. Combined with the transparent resting cursor below, that
+   desynced the stripes at the top of every table: the cursor rests on row 0, repaints it
+   $surface, and rows 0 and 1 then read as one double-height band with the alternation
+   starting one row late — "the first two lines are always highlighted". Swapping the phase so
+   the tint lands on the odd rows makes row 0's cursor repaint a no-op, and the stripes run
+   correctly from the first row. */
+DataTable > .datatable--even-row {
+    background: $surface;
+}
+DataTable > .datatable--odd-row {
+    background: $surface-darken-1 40%;
+}
 DataTable > .datatable--cursor {
     background: transparent;
     color: $foreground;
@@ -356,18 +414,26 @@ class TableAction:
 
     id          the action name handed back to `CockpitScreenBase.handle_table_action`, and
                 also the DataTable column key (one column per action, so they coincide).
-    label       the text inside the brackets: `[ Update ]`.
+    label       the text inside the brackets: `[ Update ]`. A callable of the row key instead
+                makes the column a *state toggle* — one column that reads `[ Start ]` on a
+                stopped row and `[ Stop ]` on a running one. Two static columns would reserve
+                both widths forever; the Scripts table only fits its six operations because
+                start/stop and enable/disable are one toggle column each. A callable label
+                must pass `width=`, since there is no single label to measure.
+    width       column width override. Default is `len(label) + 4` (`action_cell`'s contract).
     destructive removes/deletes: $error-styled cell, and confirmed before it fires.
     confirm     prompt for a non-destructive action that still changes host state (a service
-                restart). `{row}` is substituted with the row key. Destructive actions get a
-                default prompt and don't need this.
+                restart). `{row}` is substituted with the row key and `{action}` with this
+                row's resolved label. Destructive actions get a default prompt and don't need
+                this.
     available   predicate on the row key: when it returns False the cell renders blank and
                 clicking it does nothing. This is how "Update" appears only on rows that
                 actually have an update. None = always available.
     """
 
     id: str
-    label: str
+    label: str | Callable[[str], str]
+    width: int | None = None
     destructive: bool = False
     confirm: str | None = None
     available: Callable[[str], bool] | None = None
@@ -375,19 +441,30 @@ class TableAction:
     @property
     def column_width(self) -> int:
         """`action_cell`'s width contract: the label plus two brackets and two spaces."""
+        if self.width is not None:
+            return self.width
+        if callable(self.label):
+            raise ValueError(f"action {self.id!r}: a callable label must pass an explicit width=")
         return len(self.label) + 4
+
+    def resolve_label(self, row_key: str) -> str:
+        return self.label(row_key) if callable(self.label) else self.label
 
     def cell(self, row_key: str) -> Text:
         if self.available is not None and not self.available(row_key):
             return Text("")
-        return action_cell(self.label, destructive=self.destructive)
+        label = self.resolve_label(row_key)
+        if not label:
+            return Text("")
+        return action_cell(label, destructive=self.destructive)
 
     def confirm_message(self, row_key: str) -> str | None:
         """None = fire immediately. Anything else goes through CockpitScreenBase.confirm()."""
+        label = self.resolve_label(row_key)
         if self.confirm is not None:
-            return self.confirm.format(row=row_key)
+            return self.confirm.format(row=row_key, action=label)
         if self.destructive:
-            return f"{self.label} {row_key}?"
+            return f"{label} {row_key}?"
         return None
 
 
@@ -692,7 +769,7 @@ class CockpitScreenBase(Widget):
         event.stop()
         message = event.action.confirm_message(event.row_key)
         if message is not None and not await self.confirm(
-            message, confirm_label=event.action.label, mutates_system=True
+            message, confirm_label=event.action.resolve_label(event.row_key), mutates_system=True
         ):
             return
         await self.handle_table_action(event.action.id, event.row_key, event.table)

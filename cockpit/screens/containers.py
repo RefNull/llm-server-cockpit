@@ -78,10 +78,12 @@ class ContainersScreen(CockpitScreenBase):
     def compose(self) -> ComposeResult:
         with VerticalScroll():
             yield Static("", id="docker-banner")
-            # fixed_columns=1: Name is the identifier and the five columns together run well
-            # past 80 cells, so it stays pinned while Image/Status/Ports scroll (DESIGN.md §4.2).
+            # No fixed_columns (DESIGN.md §4.2): datatable--fixed REPLACES the row style
+            # rather than compositing with it, so pinning Name cut a flat band down column 0
+            # through the zebra stripes. Below 121 cells the row scrolls horizontally without
+            # a pinned identifier — the banding cost more than the pin was worth.
             table = SingleClickDataTable(
-                id="containers-table", zebra_stripes=True, classes="data-table", fixed_columns=1
+                id="containers-table", zebra_stripes=True, classes="data-table"
             )
             table.cursor_type = "row"
             yield table
@@ -92,11 +94,16 @@ class ContainersScreen(CockpitScreenBase):
 
     def on_mount(self) -> None:
         table = self.query_one("#containers-table", SingleClickDataTable)
-        table.add_column("Name", width=24)
-        table.add_column("Image", width=30)
-        table.add_column("Status", width=22)
-        table.add_column("Ports", width=24)
-        table.add_column("Compose", width=9)
+        # Column budget (DESIGN.md §4): content + 2 padding per column against the 115-cell
+        # usable viewport at 121x30. The old widths summed to 132 render cells, which put the
+        # "[ Restart ]" action column off-screen with no horizontal-scroll affordance to reach
+        # it — the same defect the Downloads budget comment records. 22+24+20+18+8+11 = 103,
+        # render 103 + 2*6 = 115.
+        table.add_column("Name", width=22)
+        table.add_column("Image", width=24)
+        table.add_column("Status", width=20)
+        table.add_column("Ports", width=18)
+        table.add_column("Compose", width=8)
         # Not destructive (that's $error-styled, reserved for Remove/Delete, DESIGN.md §9) —
         # restarting a container is tier 2 (mutates_system), confirmed, but reversible.
         table.add_action_column(TableAction("restart", "Restart", confirm="Restart {row}?"))

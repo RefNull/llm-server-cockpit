@@ -13,7 +13,7 @@ from textual import work
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Button, DataTable, Label, RichLog, Static
+from textual.widgets import Button, DataTable, RichLog, Static
 
 from cockpit import update_check
 from cockpit.widgets import (
@@ -101,7 +101,7 @@ class BuildHistoryModal(ModalScreen[None]):
             with Horizontal(id="history-header"):
                 yield Static("Recent Build History", id="history-title")
                 yield Button("×", id="history-close", classes="close-button", variant="error")
-            table = CockpitDataTable(id="history-table", zebra_stripes=True, fixed_columns=1)
+            table = CockpitDataTable(id="history-table", zebra_stripes=True)
             table.cursor_type = "row"
             yield table
             with Horizontal(classes="action-row-secondary"):
@@ -195,7 +195,7 @@ class RetainedBuildsModal(ModalScreen[None]):
             with Horizontal(id="retained-header"):
                 yield Static("Retained Builds", id="retained-title")
                 yield Button("×", id="retained-close", classes="close-button", variant="error")
-            table = SingleClickDataTable(id="retained-table", zebra_stripes=True, fixed_columns=1)
+            table = SingleClickDataTable(id="retained-table", zebra_stripes=True)
             table.cursor_type = "row"
             yield table
             with Horizontal(classes="action-row-secondary"):
@@ -269,7 +269,7 @@ class RetainedBuildsModal(ModalScreen[None]):
         message = event.action.confirm_message(event.row_key)
         if message is not None:
             confirmed = await self.app.push_screen_wait(
-                ConfirmModal(message, confirm_label=event.action.label, danger=True)
+                ConfirmModal(message, confirm_label=event.action.resolve_label(event.row_key), danger=True)
             )
             if not confirmed:
                 return
@@ -363,8 +363,13 @@ class BuildsScreen(CockpitScreenBase):
     def compose(self) -> ComposeResult:
         with VerticalScroll():
             with Vertical(id="update-panel", classes="panel"):
+                # No fixed_columns (DESIGN.md §4.2): datatable--fixed REPLACES the row
+                # style rather than compositing with it, so a pinned column cut a flat band
+                # down column 0 through the zebra stripes — the "first column is always
+                # highlighted" defect. Every column has an explicit width that fits, so
+                # nothing scrolls horizontally for it to pin.
                 backends_table = SingleClickDataTable(
-                    id="backends-table", zebra_stripes=True, classes="data-table", fixed_columns=1
+                    id="backends-table", zebra_stripes=True, classes="data-table"
                 )
                 backends_table.cursor_type = "row"
                 yield backends_table

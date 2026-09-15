@@ -389,7 +389,7 @@ class ImportModelsModal(ModalScreen[bool]):
             yield Static("Import Models from Llama-Swap", id="import-title")
             with VerticalScroll(id="import-scroll"):
                 table = SingleClickDataTable(
-                    id="import-table", zebra_stripes=True, classes="data-table", fixed_columns=2
+                    id="import-table", zebra_stripes=True, classes="data-table"
                 )
                 table.cursor_type = "row"
                 yield table
@@ -549,7 +549,7 @@ class DeployScreen(CockpitScreenBase):
 
     def compose(self) -> ComposeResult:
         with VerticalScroll():
-            table = SingleClickDataTable(id="models-table", classes="data-table", fixed_columns=1)
+            table = SingleClickDataTable(id="models-table", classes="data-table")
             yield table
             with Horizontal(classes="action-row-primary"):
                 yield Button("Apply & Restart Service", id="btn-apply", variant="primary", classes="thin-button")

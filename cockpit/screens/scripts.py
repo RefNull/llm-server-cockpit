@@ -20,7 +20,7 @@ from provision import schema
 from provision.common import Runner
 from provision.steps import scripts as scripts_step
 
-from cockpit.widgets import CockpitScreenBase, ConfirmModal, SingleClickDataTable, TableAction, selection_marker
+from cockpit.widgets import CockpitScreenBase, ConfirmModal, SingleClickDataTable, TableAction
 
 _RESTART_POLICY_OPTIONS = [("on-failure", "on-failure"), ("always", "always"), ("no", "no")]
 
@@ -246,33 +246,55 @@ class ScriptsScreen(CockpitScreenBase):
         self.repo_root = repo_root
         self.cockpit_app = app_ref
         self.scripts = getattr(app_ref, "scripts", {"scripts": []})
-        self._selected_ids: set[str] = set()
+        # id -> {"unit_active": bool, "unit_enabled": bool} from the last refresh. Drives the
+        # Run/Boot toggle columns' labels, so it must be written before action_cells() is
+        # called for a row (see _apply_rows).
+        self._status_by_id: dict[str, dict[str, bool]] = {}
         self._cursor_script_id: str | None = None
 
     def compose(self) -> ComposeResult:
         with VerticalScroll():
-            # fixed_columns=2: column 0 is the tick marker, so pinning the ID takes both while
-            # the absolute Path and Status columns scroll past 80 cells (DESIGN.md §4.2).
-            table = SingleClickDataTable(
-                id="scripts-table", zebra_stripes=True, classes="data-table", fixed_columns=2
-            )
+            # No fixed_columns: a pinned column is painted from datatable--fixed, which
+            # REPLACES the row style (_data_table.py _render_line_in_row) rather than
+            # compositing with it, so it cut a flat band down the pinned columns through the
+            # zebra stripes. The widths below fit the 115-cell usable viewport, so there is no
+            # horizontal scroll for it to pin against.
+            table = SingleClickDataTable(id="scripts-table", zebra_stripes=True, classes="data-table")
             table.cursor_type = "row"
             yield table
             with Horizontal(classes="action-row-primary"):
-                yield Button("Start selected", id="btn-start-selected", variant="primary", classes="thin-button")
-                yield Button("Stop selected", id="btn-stop-selected", variant="warning", classes="thin-button")
-                yield Button("Enable", id="btn-enable-selected", classes="thin-button")
-                yield Button("Disable", id="btn-disable-selected", classes="thin-button")
-                yield Button("New Script", id="btn-new-script", classes="thin-button")
-                yield Button("Remove selected", id="btn-remove-selected", variant="error", classes="thin-button")
+                # The only screen-level action left: every per-script operation is an in-table
+                # action column on its own row, so there is no selection to act on.
+                yield Button("New Script", id="btn-new-script", variant="primary", classes="thin-button")
             yield Static("", id="status-message", classes="status-text")
 
     def on_mount(self) -> None:
         table = self.query_one("#scripts-table", SingleClickDataTable)
-        table.add_column("", width=3)
-        table.add_column("ID", width=20)
-        table.add_column("Path", width=40)
-        table.add_column("Status", width=30)
+        # Column budget (DESIGN.md §4): content + 2 padding per column against the 115-cell
+        # usable viewport at 121x30. Data 16+27+20 = 63, actions 9+11+8+10 = 38, 7 columns →
+        # 101 + 14 = 115.
+        table.add_column("ID", width=16)
+        table.add_column("Path", width=27)
+        table.add_column("Status", width=20)
+        # Start/Stop and Enable/Disable are one toggle column each, not two static ones: six
+        # static action columns need 56 content cells and blow the budget above, and only one
+        # of each pair is ever applicable to a given row anyway.
+        table.add_action_column(
+            TableAction(
+                "run",
+                lambda sid: "Stop" if self._status_by_id.get(sid, {}).get("unit_active") else "Start",
+                width=9,
+                confirm="{action} script {row}?",
+            )
+        )
+        table.add_action_column(
+            TableAction(
+                "boot",
+                lambda sid: "Disable" if self._status_by_id.get(sid, {}).get("unit_enabled") else "Enable",
+                width=11,
+                confirm="{action} script {row} at boot?",
+            )
+        )
         # Edit already existed as a keybinding ('e') with no clickable affordance — exposing it
         # as a per-row action column makes it discoverable without a mouse-only regression.
         table.add_action_column(TableAction("edit", "Edit"))
@@ -298,27 +320,27 @@ class ScriptsScreen(CockpitScreenBase):
                 st = scripts_step.status(script["id"])
                 status_text = f"{'active' if st['unit_active'] else 'stopped'}, {'enabled' if st['unit_enabled'] else 'disabled'}"
             except Exception as e:
+                st = {"unit_active": False, "unit_enabled": False}
                 status_text = f"error checking status ({e})"
-            rows.append((script, status_text))
+            rows.append((script, st, status_text))
         self.app.call_from_thread(self._apply_rows, rows)
 
-    def _apply_rows(self, rows: list[tuple[dict, str]]) -> None:
+    def _apply_rows(self, rows: list[tuple[dict, dict[str, bool], str]]) -> None:
         if not self.is_mounted:
             return
         table = self.query_one("#scripts-table", SingleClickDataTable)
         table.clear()
-        known_ids = {script["id"] for script, _ in rows}
-        self._selected_ids &= known_ids
-        if self._cursor_script_id not in known_ids:
+        # Before any action_cells() call below: the Run/Boot columns read their labels here.
+        self._status_by_id = {script["id"]: st for script, st, _ in rows}
+        if self._cursor_script_id not in self._status_by_id:
             self._cursor_script_id = None
-        for script, status_text in rows:
+        for script, _st, status_text in rows:
             sid = script["id"]
             # rich.text.Text, not raw str (DESIGN.md §4.6 / Phase 0a.6): the app console has
             # markup=True, so an operator-chosen script path, or a status string embedding an
             # exception message, containing brackets would have that span silently eaten by
             # Rich as a markup tag.
             table.add_row(
-                selection_marker(sid in self._selected_ids),
                 Text(sid),
                 Text(script["path"]),
                 Text(status_text),
@@ -330,34 +352,11 @@ class ScriptsScreen(CockpitScreenBase):
             # sync explicitly here.
             row_key, _ = table.coordinate_to_cell_key(table.cursor_coordinate)
             self._cursor_script_id = row_key.value if row_key is not None else None
-        self._sync_button_state()
-
-    def _sync_button_state(self) -> None:
-        has_ticked = bool(self._selected_ids)
-        self.query_one("#btn-start-selected", Button).disabled = not has_ticked
-        self.query_one("#btn-stop-selected", Button).disabled = not has_ticked
-        self.query_one("#btn-enable-selected", Button).disabled = not has_ticked
-        self.query_one("#btn-disable-selected", Button).disabled = not has_ticked
-        self.query_one("#btn-remove-selected", Button).disabled = not has_ticked
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
         if event.data_table.id != "scripts-table":
             return
         self._cursor_script_id = event.row_key.value if event.row_key is not None else None
-        self._sync_button_state()
-
-    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        if event.data_table.id != "scripts-table" or event.row_key is None or event.row_key.value is None:
-            return
-        sid = event.row_key.value
-        if sid in self._selected_ids:
-            self._selected_ids.discard(sid)
-        else:
-            self._selected_ids.add(sid)
-        self._refresh_table()
-
-    def _script_by_id(self, script_id: str) -> dict[str, Any] | None:
-        return next((s for s in self.scripts.get("scripts", []) if s["id"] == script_id), None)
 
     def _set_status(self, text: str) -> None:
         self.query_one("#status-message", Static).update(text)
@@ -399,90 +398,54 @@ class ScriptsScreen(CockpitScreenBase):
             self._set_status(f"script {script_id!r} updated — scripts.yaml written")
 
     def action_edit_script(self) -> None:
-        target_id = next(iter(self._selected_ids)) if len(self._selected_ids) == 1 else self._cursor_script_id
-        if target_id:
-            self._open_modal_for_edit(target_id)
+        if self._cursor_script_id:
+            self._open_modal_for_edit(self._cursor_script_id)
         else:
             self._set_status("select a script row first")
 
     # ------------------------------------------------------------------ per-row table actions
 
     async def handle_table_action(self, action_id: str, row_key: str, table) -> None:
+        # Already confirmed by CockpitScreenBase._on_table_action_invoked for every action
+        # that declared a confirm= / destructive=True.
         if action_id == "edit":
             self._open_modal_for_edit(row_key)
         elif action_id == "remove":
-            # Already confirmed (TableAction(destructive=True)) — unlike the bulk "Remove
-            # selected" button below, which still confirms itself via ConfirmModal since it
-            # names every ticked id in the prompt.
             await self._remove_ids([row_key])
+        elif action_id == "run":
+            active = self._status_by_id.get(row_key, {}).get("unit_active")
+            self._run_unit_action("stop" if active else "start", row_key)
+        elif action_id == "boot":
+            enabled = self._status_by_id.get(row_key, {}).get("unit_enabled")
+            self._run_unit_action("disable" if enabled else "enable", row_key)
+
+    @work(thread=True)
+    def _run_unit_action(self, verb: str, script_id: str) -> None:
+        action = {
+            "start": scripts_step.start,
+            "stop": scripts_step.stop,
+            "enable": scripts_step.enable,
+            "disable": scripts_step.disable,
+        }[verb]
+        try:
+            action(script_id, self.runner)
+        except Exception as e:
+            self.app.call_from_thread(
+                self.app.notify, f"{script_id}: {verb} failed — {e}", severity="error"
+            )
+        else:
+            # Not f"{verb}ed" — that produced "stoped"/"enableed". The verb is already the
+            # right word; it just isn't a regular past tense.
+            self.app.call_from_thread(self.app.notify, f"{script_id}: {verb} complete")
+        self.app.call_from_thread(self._refresh_table)
 
     # ------------------------------------------------------------------ button dispatch
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
-        button_id = event.button.id or ""
-        if button_id == "btn-start-selected":
-            await self._handle_bulk_press("start", scripts_step.start)
-        elif button_id == "btn-stop-selected":
-            await self._handle_bulk_press("stop", scripts_step.stop)
-        elif button_id == "btn-enable-selected":
-            await self._handle_bulk_press("enable", scripts_step.enable)
-        elif button_id == "btn-disable-selected":
-            await self._handle_bulk_press("disable", scripts_step.disable)
-        elif button_id == "btn-new-script":
+        if (event.button.id or "") == "btn-new-script":
             await self._open_modal_for_add()
-        elif button_id == "btn-remove-selected":
-            await self._confirm_and_remove_selected()
-
-    # ------------------------------------------------------------------ bulk start/stop/enable/disable
-
-    async def _handle_bulk_press(self, verb: str, action) -> None:
-        ids = sorted(self._selected_ids)
-        if not ids:
-            return
-        # DESIGN.md §5 tier 2: start/stop/enable/disable all act on generated systemd units.
-        confirmed = await self.confirm(
-            f"{verb.capitalize()} {len(ids)} script(s)?\n{', '.join(ids)}",
-            confirm_label=verb.capitalize(),
-            mutates_system=True,
-        )
-        if confirmed:
-            self._run_bulk(verb, action, ids)
-
-    @work(thread=True)
-    def _run_bulk(self, verb: str, action, ids: list[str]) -> None:
-        failures: list[str] = []
-        for sid in ids:
-            try:
-                action(sid, self.runner)
-            except Exception as e:
-                failures.append(sid)
-                self.app.call_from_thread(self.app.notify, f"{sid}: {verb} failed — {e}", severity="error")
-        if not failures:
-            self.app.call_from_thread(self.app.notify, f"{verb}ed {len(ids)} script(s)")
-        self.app.call_from_thread(self._refresh_table)
 
     # ------------------------------------------------------------------ remove
-
-    @work
-    async def _confirm_and_remove_selected(self) -> None:
-        # Tick-based only (no cursor fallback) — the single-row case now has its own per-row
-        # Remove action column, already confirmed there; this button is for genuine multi-delete.
-        ids_to_remove = sorted(self._selected_ids)
-        if not ids_to_remove:
-            self._set_status("tick at least one script row first")
-            return
-
-        confirmed = await self.app.push_screen_wait(
-            ConfirmModal(
-                f"Remove {len(ids_to_remove)} script(s) from scripts.yaml?\n{', '.join(ids_to_remove)}\n"
-                "Systemd unit(s) are left in place (stop first if running).",
-                confirm_label="Remove",
-                danger=True,
-            )
-        )
-        if not confirmed:
-            return
-        await self._remove_ids(ids_to_remove)
 
     async def _remove_ids(self, ids_to_remove: list[str]) -> None:
         remove_set = set(ids_to_remove)

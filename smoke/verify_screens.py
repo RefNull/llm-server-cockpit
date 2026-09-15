@@ -16,7 +16,57 @@ import bootstrap  # noqa: E402
 bootstrap.add_venv_site_packages(_REPO_ROOT)
 
 from cockpit.app import CockpitApp  # noqa: E402
+from cockpit.screens.scripts import ScriptsScreen  # noqa: E402
+from cockpit.widgets import CockpitDataTable  # noqa: E402
 from textual.widgets import Button, TabbedContent  # noqa: E402
+
+USABLE_WIDTH = 115
+"""DESIGN.md §4.2: 121 (the -wide breakpoint) minus $space-edge on both sides. Every
+non-modal table's render width must fit this, because no table pins columns any more."""
+
+
+def _assert_table_widths_in_budget(app: CockpitApp, context: str) -> None:
+    """DESIGN.md §4.2/§4.4. `fixed_columns` is gone, so a table that overflows has no pinned
+    identifier to fall back on and its right-hand action columns are simply unreachable —
+    which is the defect that budget replaced pinning to prevent."""
+    for table in app.query(CockpitDataTable):
+        if not table.is_on_screen:
+            continue
+        assert table.fixed_columns == 0, (
+            f"[{context}] {table.id}: fixed_columns={table.fixed_columns}; DESIGN.md §4.2 "
+            "forbids pinned columns (datatable--fixed replaces the row style and bands the "
+            "zebra stripes)"
+        )
+        columns = list(table.ordered_columns)
+        render_width = sum(c.width for c in columns) + 2 * len(columns)
+        assert render_width <= USABLE_WIDTH, (
+            f"[{context}] {table.id}: render width {render_width} > {USABLE_WIDTH} usable "
+            f"cells — its rightmost column is off-screen at 121x30"
+        )
+
+
+def _assert_script_toggle_labels(app: CockpitApp, context: str) -> None:
+    """The two toggle columns on scripts-table resolve their label per row (DESIGN.md §9). A
+    static label would silently offer "Start" on an already-running unit."""
+    screen = app.query_one(ScriptsScreen)
+    screen._apply_rows(
+        [
+            ({"id": "running", "path": "/opt/a.py"}, {"unit_active": True, "unit_enabled": True}, "active, enabled"),
+            ({"id": "stopped", "path": "/opt/b.py"}, {"unit_active": False, "unit_enabled": False}, "stopped, disabled"),
+        ]
+    )
+    table = app.query_one("#scripts-table", CockpitDataTable)
+    expected = {
+        ("run", "running"): "Stop",
+        ("run", "stopped"): "Start",
+        ("boot", "running"): "Disable",
+        ("boot", "stopped"): "Enable",
+    }
+    for (action_id, row_key), want in expected.items():
+        got = table._actions[action_id].resolve_label(row_key)
+        assert got == want, f"[{context}] {action_id} on {row_key}: expected {want!r}, got {got!r}"
+    # The prompt must name the verb the operator actually clicked, not a fixed one.
+    assert table._actions["run"].confirm_message("running") == "Stop script running?"
 
 
 def _assert_buttons_in_bounds(app: CockpitApp, context: str) -> None:
@@ -47,16 +97,18 @@ async def verify_geometry_and_export_screenshots() -> None:
         ((121, 30), "-wide", "horizontal"),
     ]
 
+    # (name, root TabPane id, nested TabbedContent id or None, nested TabPane id or None)
     screens = [
         ("dashboard", "dashboard", None, None),
-        ("builds", "llm", "backends", None),
-        ("containers", "containers", None, None),
-        ("scripts", "scripts", None, None),
-        ("deploy", "llm", "models", None),
-        ("downloads", "llm", "hf-downloads", None),
-        ("settings", "settings", None, "settings-tab-host"),
-        ("settings_gpus", "settings", None, "settings-tab-gpus"),
-        ("settings_services", "settings", None, "settings-tab-services"),
+        ("builds", "llm", "#llm-tabs", "backends"),
+        ("deploy", "llm", "#llm-tabs", "models"),
+        ("downloads", "llm", "#llm-tabs", "hf-downloads"),
+        ("containers", "deployments", "#deployment-tabs", "containers"),
+        ("scripts", "deployments", "#deployment-tabs", "scripts"),
+        ("settings", "settings", "#settings-tabs", "settings-tab-host"),
+        ("settings_gpus", "settings", "#settings-tabs", "settings-tab-gpus"),
+        ("settings_connectors", "settings", "#settings-tabs", "settings-tab-connectors"),
+        ("settings_services", "settings", "#settings-tabs", "settings-tab-services"),
     ]
 
     for size, expected_class, expected_layout in resolutions:
@@ -84,19 +136,23 @@ async def verify_geometry_and_export_screenshots() -> None:
             print(f"#dashboard-columns layout: {actual_layout}")
             assert actual_layout == expected_layout, f"Expected layout {expected_layout}, got {actual_layout}"
 
-            root_tc = app.query(TabbedContent).first()
-            llm_tc = app.query(TabbedContent)[1]
+            # By id, not by position: the nested TabbedContents used to be addressed as
+            # query(TabbedContent)[1], which silently pointed at a different group the moment
+            # another one was added (Deployments).
+            root_tc = app.query_one("#main-tabs", TabbedContent)
 
-            for name, root_pane, sub_pane, settings_pane in screens:
-                print(f"Navigating to {name} (root: {root_pane}, sub: {sub_pane}, settings: {settings_pane})...")
+            for name, root_pane, sub_tc_id, sub_pane in screens:
+                print(f"Navigating to {name} (root: {root_pane}, sub: {sub_tc_id}/{sub_pane})...")
                 root_tc.active = root_pane
-                if sub_pane:
-                    llm_tc.active = sub_pane
-                if settings_pane:
-                    settings_tc = app.query_one("#settings-tabs", TabbedContent)
-                    settings_tc.active = settings_pane
+                if sub_tc_id:
+                    await pilot.pause(0.1)
+                    app.query_one(sub_tc_id, TabbedContent).active = sub_pane
                 await pilot.pause(0.2)
                 _assert_buttons_in_bounds(app, f"{name} @ {w}x{h}")
+                _assert_table_widths_in_budget(app, f"{name} @ {w}x{h}")
+                if name == "scripts":
+                    _assert_script_toggle_labels(app, f"{name} @ {w}x{h}")
+                    await pilot.pause(0.1)
 
                 svg = app.export_screenshot()
                 svg_path = out_dir / f"{name}_{w}x{h}.svg"

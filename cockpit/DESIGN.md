@@ -76,7 +76,7 @@ CockpitHeader { margin: 0 $space-edge $space-normal $space-edge; } /* the banner
 Two rules, one value. `CockpitHeader` is a sibling of `#main-tabs` in `CockpitApp.compose`, not a descendant, so it cannot inherit the inset and has to restate `$space-edge`. That is the whole exemption — the header is **not** allowed a different value, and there is no third place. The header's side margin is load-bearing for the §2 breakpoint (see above): change it and the breakpoint changes with it.
 
 - **Rule**: No screen, panel, or scroll container may add horizontal padding or margin of its own for the purpose of insetting content. A screen that wants breathing room already has it.
-- **Rationale (the bug this replaces)**: the rule used to be `TabbedContent { margin: 0 2 }` — a *type* selector, so it applied a second time to the `TabbedContent` nested inside the LLM and Settings tabs, and `.panel` then added a third cell via `padding: 0 1`. Net left inset was 2 (Containers, Scripts), 3 (Dashboard), 4 (LLM > Models, LLM > HF Downloads) or 5 (LLM > Backends, Settings) depending on how deeply a screen happened to be nested and whether it used a panel. Scoping the margin to the outer container's id and dropping `.panel`'s horizontal padding (`.panel` paints no border and no background, so that padding was invisible indentation) makes all nine sub-views land at 3.
+- **Rationale (the bug this replaces)**: the rule used to be `TabbedContent { margin: 0 2 }` — a *type* selector, so it applied a second time to the `TabbedContent` nested inside the LLM and Settings tabs, and `.panel` then added a third cell via `padding: 0 1`. Net left inset was 2 (Containers, Scripts), 3 (Dashboard), 4 (LLM > Models, LLM > HF Downloads) or 5 (LLM > Backends, Settings) depending on how deeply a screen happened to be nested and whether it used a panel. Scoping the margin to the outer container's id and dropping `.panel`'s horizontal padding (`.panel` paints no border and no background, so that padding was invisible indentation) makes every sub-view land at 3.
 - **`.panel` contract**: `.panel` carries `height: auto` and `margin-bottom` only. It must never carry horizontal padding.
 
 ### Tab-Bar Gap
@@ -116,7 +116,7 @@ Textual's `Tabs` is `height: 2`, docked top, with no bottom margin, and `TabPane
 5. **Two-Column Layout Threshold**:
    - Multi-column layouts (such as `#dashboard-columns`) are permitted only when the `Screen.-wide` class is active (terminal width ≥ 121).
    - Under `Screen.-narrow` (< 121 cells), multi-column containers must collapse to a single vertical stack (`layout: vertical`) via `.columns-responsive`.
-   - **Precedent**: Settings was refactored upstream into `TabbedContent` (`#settings-tabs`), removing the former hardcoded `#settings-columns` layout. The responsive multi-column pattern is standardized via `.columns-responsive` on `#dashboard-columns`.
+   - **Precedent**: The responsive multi-column pattern is standardized via `.columns-responsive` — on `#dashboard-columns`, and on the paired `.panel`s inside the Settings `Host Profile` and `System Services` sub-tabs (`.settings-columns`).
 
 ---
 
@@ -127,26 +127,30 @@ Textual's `DataTable` is a scroll container (`overflow-x: auto`) that scrolls ho
 1. **Explicit Column Widths**:
    - Every `add_column()` invocation must specify an explicit integer `width=`. Dynamic automatic sizing without bounds causes layout instability.
    - **Enforcement**: [`CockpitDataTable`](file:///Users/nystrom/GitHub/llm-server-cockpit/cockpit/widgets.py#L336-L354) overrides `add_column` to raise `ValueError` if `width` is omitted or None.
-2. **Pinned Identifier Columns**:
-   - Any table whose cumulative width can exceed the usable width of an 80-column terminal must set `fixed_columns >= 1` so the primary key remains pinned during horizontal scrolling.
+2. **No Pinned Columns — fit the viewport instead**:
+   - `fixed_columns` is **forbidden** in `cockpit/screens/`. A pinned cell is painted with `datatable--fixed`, and `_render_line_in_row` uses that style *instead of* the row style rather than compositing with it — so a pinned column cuts a flat, unstriped band down the left of every zebra table, which reads as "this column is selected". No CSS fixes it; the style replacement is structural.
+   - The rule it replaces (`fixed_columns >= 1` for any table wider than 80 cells) also never delivered: the columns that actually scroll out of reach are the per-row action columns on the *right*, and pinning the identifier on the left does nothing to reach them.
+   - **Instead**: every table's render width (§4.4) must fit the 115-cell usable viewport at 121×30, so no horizontal scroll happens at or above the breakpoint. Below it, the table scrolls and no column is pinned.
 3. **No Resting Highlight**:
-   - A table that has not been interacted with must paint **no** selection band. A freshly mounted `DataTable` otherwise shows two overlapping ones: the row-0 block cursor (`show_cursor` defaults `True`, `cursor_coordinate` defaults `(0, 0)`, and `add_row` force-posts a highlight when the first row lands) and an amber `$secondary-muted` band down every fixed column (`datatable--fixed`). Both read as "this is selected" when nothing is.
-   - **Enforcement**: CSS in `SHARED_CSS` only — `datatable--cursor` and `datatable--fixed-cursor` are transparent at rest and repaint under `DataTable:focus`; `datatable--fixed` is pinned to `$surface`, the table's own background.
+   - A table that has not been interacted with must paint **no** selection band, and its zebra stripes must alternate correctly from the first row.
+   - **Cursor**: `show_cursor` defaults `True` and `cursor_coordinate` defaults `(0, 0)`, so a freshly mounted table paints a block cursor on row 0. `datatable--cursor` / `datatable--fixed-cursor` are therefore transparent at rest and repaint only under `DataTable:focus`.
+   - **Zebra phase**: Textual tints the *even* rows (0, 2, 4…). Row 0 is even, and the resting cursor repaints it `$surface` — so rows 0 and 1 came out identical and the alternation started a row late ("the first two lines are always highlighted"). `SHARED_CSS` swaps the phase: `datatable--even-row` is `$surface` and `datatable--odd-row` carries the tint, which makes the row-0 cursor repaint a no-op.
    - **Forbidden**: `show_cursor=False`. `DataTable._on_click` gates *every* selection message on `show_cursor`, so disabling it silently destroys all click handling and keyboard navigation while appearing to fix the cosmetics. `grep -rn "show_cursor" cockpit/` must never find a `False`.
 
 4. **Audit & Enforced Contracts**:
    - Every table in `cockpit/screens/` derives from `CockpitDataTable` — directly, or via `SingleClickDataTable`, which was rebased onto it so the tick-able tables are covered by the same enforcement rather than bypassing it.
-   - A **tick-able** table's column 0 is the `[ ]`/`[x]` `selection_marker`, so its identifier lives in column 1 and pinning it requires `fixed_columns=2`. Plain tables pin column 0 with `fixed_columns=1`.
-   - All 9 tables across 6 screens (Dashboard renders no table):
-     - `backends-table` (`builds.py`, tick-able, `fixed_columns=2`): 4 columns ("" w=3, "Component" w=22 pinned, "Pinned" w=8, "Update" w=34).
-     - `builds-table` (`builds.py`, `fixed_columns=1`): 4 columns ("Backend" w=12 pinned, "Ref" w=14, "Status" w=12, "Integrity" w=12).
-     - `history-table` (`builds.py` `BuildHistoryModal`, `fixed_columns=1`): 4 columns ("Backend" w=12 pinned, "Timestamp (UTC)" w=22, "Outcome" w=16, "Detail" w=40).
-     - `models-table` (`deploy.py`, `fixed_columns=1`): 6 columns ("ID" w=24 pinned, "Engine" w=12, "GPU" w=10, "Backend" w=10, "Group" w=12, "TTL" w=8).
-     - `import-table` (`deploy.py`, tick-able, `fixed_columns=2`): 4 columns ("" w=3, "ID" w=24 pinned, "Engine" w=12, "cmd" w=60).
-     - `model-table` (`downloads.py`, tick-able, `fixed_columns=2`): 5 columns ("" w=3, "ID" w=24 pinned, "Repo ID" w=36, "Quant File" w=26, "Status" w=32).
-     - `containers-table` (`containers.py`, `fixed_columns=1`): 5 columns ("Name" w=24 pinned, "Image" w=30, "Status" w=22, "Ports" w=24, "Compose" w=9).
-     - `scripts-table` (`scripts.py`, tick-able, `fixed_columns=2`): 4 columns ("" w=3, "ID" w=20 pinned, "Path" w=40, "Status" w=30).
-     - `gpu-table` (`settings.py`, `fixed_columns=1`): 3 columns ("GPU ID" w=16 pinned, "Vendor" w=16, "Backends" w=30). Composed in both the first-run wizard and the normal-mode GPU Topology sub-tab — only one branch is ever mounted, with identical columns.
+   - A **tick-able** table's column 0 is the `[ ]`/`[x]` `selection_marker`. Only `import-table` is still tick-able; `backends-table`, `model-table` and `scripts-table` dropped theirs when their bulk "act on selected" buttons became per-row action columns, which is also what put their `ID` flush against the left edge.
+   - **Render width** = content width + 2 cells of padding per column (`Column.get_render_width`). Budget: **≤ 115**, the usable viewport at 121×30 (121 − 2 × `$space-edge`). Modal-hosted tables are budgeted against their dialog width, not this.
+   - The 8 tables (Dashboard renders no table; `builds-table` no longer exists — retained builds moved into `RetainedBuildsModal`):
+     - `backends-table` (`builds.py`): 4 columns ("Component" w=22, "Pinned ref" w=14, "Status" w=34, `Update` action w=10). Render 88.
+     - `models-table` (`deploy.py`): 8 columns ("ID" w=24, "Engine" w=12, "GPU" w=10, "Backend" w=10, "Group" w=12, "TTL" w=8, `Edit` action w=8, `Remove` action w=10). Render 110.
+     - `model-table` (`downloads.py`): 6 columns ("ID" w=20, "Repo ID" w=26, "Status" w=20, "Size" w=10, "Release Date" w=12, `Download` action w=12). Render 112.
+     - `containers-table` (`containers.py`): 6 columns ("Name" w=22, "Image" w=24, "Status" w=20, "Ports" w=18, "Compose" w=8, `Restart` action w=11). Render 115.
+     - `scripts-table` (`scripts.py`): 7 columns ("ID" w=16, "Path" w=27, "Status" w=20, `run` toggle w=9, `boot` toggle w=11, `Edit` action w=8, `Remove` action w=10). Render 115.
+     - `gpu-table` (`settings.py`): 4 columns ("GPU ID" w=16, "Vendor" w=16, "Backends" w=30, "Driver Status" w=40). Render 110. Composed in both the first-run wizard and the normal-mode GPU Topology sub-tab — only one branch is ever mounted, with identical columns.
+     - `history-table` (`builds.py` `BuildHistoryModal`, 90%-width dialog): 4 columns ("Backend" w=12, "Timestamp (UTC)" w=22, "Outcome" w=16, "Detail" w=40). Render 98.
+     - `retained-table` (`builds.py` `RetainedBuildsModal`, 90%-width dialog): 6 columns ("Backend" w=12, "Ref" w=14, "Status" w=12, "Integrity" w=12, `Rollback` action w=12, `Remove` action w=10). Render 84.
+     - `import-table` (`deploy.py` import modal, tick-able): 4 columns ("" w=3, "ID" w=24, "Engine" w=12, "cmd" w=60). Render 107.
 
 ---
 
@@ -176,16 +180,16 @@ All 20 modal confirmation call sites across the 6 mutating screens (Dashboard is
   - `_confirm_and_import_selected`: `ConfirmModal(danger=True)` (declarative `models.yaml` write).
   - `_confirm_and_apply`: `mutates_system=True` (tier 2 — installs systemd units and restarts `llama-swap`).
 - **Downloads** (`downloads.py`):
-  - `_confirm_and_download_selected`: `ConfirmModal(danger=True)` (batch download; the single-model download this replaced was `danger=False`, but a batch consumes bandwidth/storage at the same order as download-all).
-  - `_confirm_and_download_all`: `ConfirmModal(danger=True)` (bulk download consuming significant network/storage).
+  - `download` `TableAction` (`confirm="Download {row}?"`): `mutates_system=True` via `CockpitScreenBase._on_table_action_invoked` — per-model download.
+  - `_on_download_all_missing`: `confirm(..., mutates_system=True)` (bulk download consuming significant network/storage).
 - **Containers** (`containers.py`):
   - `_handle_restart_press`: `mutates_system=True` (tier 2 — restarts a running background service on the host).
   - `_handle_restart_all_press`: `mutates_system=True` (tier 2 — restarts every container service at once).
   - Exec shell, view logs, view compose: no modal — read-only, or a terminal handover the operator initiated explicitly.
 - **Scripts** (`scripts.py`):
-  - `_handle_bulk_press` (start / stop / enable / disable — one call site, four verbs): `mutates_system=True` (tier 2 — all four act on generated systemd units).
-  - `_confirm_and_save`: `ConfirmModal(danger=True)` (declarative `scripts.yaml` write).
-  - `_confirm_and_remove`: `ConfirmModal(danger=True)` (declarative `scripts.yaml` write; the systemd unit is deliberately left in place).
+  - `run` / `boot` `TableAction`s (start↔stop, enable↔disable — two toggle columns, four verbs): confirmed with `mutates_system=True` by `CockpitScreenBase._on_table_action_invoked` (tier 2 — all four act on generated systemd units). Each prompt names the verb via the `{action}` substitution, so the toggle's current meaning reaches the modal.
+  - `EditScriptModal.on_button_pressed`: `ConfirmModal(danger=True)` (declarative `scripts.yaml` write).
+  - `remove` `TableAction` (`destructive=True`): confirmed by the same gate (declarative `scripts.yaml` write; the systemd unit is deliberately left in place).
 - **Settings** (`settings.py`):
   - `_real_deploy` (first-setup): `ConfirmModal(danger=True)` (writes a new `hosts/<hostname>.yaml`).
   - `_confirm_and_save_profile`: `ConfirmModal(danger=True)` (mutates an existing `hosts/<hostname>.yaml`).
@@ -249,13 +253,17 @@ Every screen in `llm-server-cockpit` conforms to one of three structural archety
 - **Resource Gauge Metrics**: Standardized inline gauge rows using shared classes in `SHARED_CSS`:
   - `.res-row`: Container row (`height: 1; align-vertical: middle; margin-bottom: 0;`).
   - `.res-label`: Fixed metric identifier (`width: 6; text-style: bold; color: $accent;`).
-  - `.res-row ProgressBar`: Flexible bar indicator (`width: 1fr; height: 1;`).
+  - `.res-row ProgressBar`: Flexible bar indicator (`width: 1fr; height: 1;`), with `PercentageStatus` offset by `margin-left: $space-normal`.
   - `.res-val`: Numerical readout (`width: 18; text-align: right; color: $text-muted;`).
+- **Every gauge row carries all three columns**, including a `.res-val` that is empty when the metric has no absolute reading (CPU). This is structural, not decoration: the `%` readout sits at the `ProgressBar`'s right edge, so a row that omitted `.res-val` let its bar run 18 cells longer and put its percentage in a different screen column from the row above it. Bars of equal length are what make two gauges comparable at a glance.
+- **Bar track**: `.res-row Bar > .bar--bar` overrides Textual's default `background: $surface` — identical to the panel behind it, which left the unfilled part of a gauge invisible and gave the fill nothing to be read against. The track is `$surface-lighten-2`; `.bar--complete` is `$error`, not Textual's `$success`, because these are saturation gauges and a full RAM bar is not a success.
+- **Column gutter**: at `Screen.-wide`, `#dashboard-left` carries `margin-right`/`padding-right: $space-section` plus `border-right: solid $surface-lighten-2` — a rule, not whitespace. One cell of gap let a long line in the right column read as a continuation of the row beside it.
 - **Interaction Contract**: Read-only display. Passive background workers update gauges and status panels inline; toasts emit on error only. Zero modal triggers.
 
 ### Archetype B: Table-Driven Inventory (`Builds`, `Deploy`, `Downloads`, `Containers`, `Scripts`)
 - **Role**: Collection browsing, status inspection, and lifecycle operations over system items.
-- **Layout**: Strict `CockpitDataTable` containment (maximum 3 tables per screen), with pinned primary identifier columns (`fixed_columns >= 1`, or `2` for tick-able selection tables). Dedicated filter/search input row placed immediately above table if present.
+- **Layout**: Strict `CockpitDataTable` containment (maximum 3 tables per screen), no `fixed_columns` (§4.2), every table budgeted to fit the 115-cell usable viewport. Dedicated filter/search input row placed immediately above table if present.
+- **Per-row before bulk**: an operation that acts on *one* row is an in-table action column (§9), never a tick-box column plus a "… selected" button. An action row holds only operations that have no single-row meaning (`New Script`, `Download all missing`). This is what keeps column 0 the identifier, flush left.
 - **Action Rows**: Standardized button rows positioned directly beneath the table:
   - `.action-row-primary`: Primary lifecycle actions (`height: auto; align: left middle; margin-top: $space-normal; margin-bottom: 0;`).
   - `.action-row-secondary`: Subordinate/management actions (`height: auto; align: left middle; margin-top: $space-normal; margin-bottom: 0;`).
@@ -267,8 +275,9 @@ Every screen in `llm-server-cockpit` conforms to one of three structural archety
 - **Layout**: Structured `.panel` containers organized via sub-tabs (`TabbedContent`) or vertical sections.
 - **Form Rows**: Standardized key-value and field rows:
   - `.form-row`: Container row (`height: auto; align-vertical: middle; margin-bottom: 1;`).
-  - `.form-label`: Fixed label header (`width: 24; text-style: bold; color: $text-muted;`).
-  - `.form-field`: Flexible input, select, or display widget (`width: 1fr;`).
+  - `.form-label`: Fixed label header (`width: 20; text-style: bold; color: $text-muted;`).
+  - `.form-field`: Flexible input, select, or display widget (`width: 1fr; max-width: 40;`).
+- **Paired panels**: 20 + 40 = 60 cells per form row, so two `.panel`s fit side by side inside the 115-cell usable viewport. A sub-tab with two panels wraps them in `Horizontal(classes="columns-responsive settings-columns")` — side by side above the breakpoint, stacked below it — with the same rule-plus-`$space-section` gutter the Dashboard uses. The cap on `.form-field` exists for this: full-width inputs made every Settings sub-tab one tall column that had to be scrolled to reach its own save button.
 - **Interaction Contract**: Synchronous validation failures update inline `.status-text` or `.error-text` only (never toast). File saves and hardware probes prompt via `ConfirmModal`.
 
 ---
@@ -296,7 +305,8 @@ A per-row action, rendered as a **table cell in its own column**, e.g. `[ Update
 - **Action columns go last**, after every data column, in declaration order. A row's action cells are refreshed in place with `table.refresh_action_cells(row_key)`; do not `clear()` + rebuild to repaint one cell.
 - **Conditional actions**: `TableAction(..., available=predicate)` — the cell renders blank and is inert on rows where the predicate is False (e.g. "Update" only where an update exists).
 - **This is not a `Button` and cannot be.** A Textual `Widget` has no `__rich_console__`, so `DataTable` — whose cells are `list[RenderableType]` rendered through `console.render_lines` — raises `NotRenderableError` on one. Nothing may ever be mounted into a `DataTable` cell.
-- **Rendering contract**: `[ Label ]`, one space inside each bracket. Column width is `len(longest label in that column) + 4`.
+- **Rendering contract**: `[ Label ]`, one space inside each bracket. Column width is `len(label) + 4`.
+- **State toggles**: `TableAction(id, callable, width=N)` — a callable label resolves per row, so one column reads `[ Start ]` on a stopped row and `[ Stop ]` on a running one. Two static columns would reserve both widths on every row forever; `scripts-table` only fits its six operations inside the 115-cell budget because start/stop and enable/disable are one toggle column each. A callable label must pass an explicit `width=` (there is no single label to measure), and `confirm="…{action}…"` substitutes the resolved label so the prompt names the verb the operator clicked.
 - **Returns `Text`, never `str`.** The app console has markup enabled, so a raw `"[ Update ]"` is parsed as a Rich tag and renders as the empty string.
 - **Destructive actions** (Remove, Delete) take the theme's `$error` colour and bold, not a different label shape — so danger reads at a glance down the column. They route through `confirm(..., mutates_system=)` per §5.
 

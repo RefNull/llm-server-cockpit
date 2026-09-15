@@ -105,6 +105,12 @@ class SettingsScreen(CockpitScreenBase):
     SettingsScreen .data-table {
         margin-top: $space-normal;
     }
+    SettingsScreen .settings-columns {
+        height: auto;
+    }
+    SettingsScreen .settings-columns > .panel {
+        width: 1fr;
+    }
     SettingsScreen #gpu-add-form {
         border: solid $accent;
         padding: $space-normal;
@@ -186,7 +192,7 @@ class SettingsScreen(CockpitScreenBase):
                 yield Input(id="f-token-env")
 
                 yield Static("GPUs", classes="section-title")
-                yield CockpitDataTable(id="gpu-table", zebra_stripes=True, classes="data-table", fixed_columns=1)
+                yield CockpitDataTable(id="gpu-table", zebra_stripes=True, classes="data-table")
                 with Horizontal(classes="action-row-primary"):
                     yield Button("Add GPU", id="btn-add-gpu", variant="primary", classes="thin-button")
                     yield Button("Remove Selected", id="btn-remove-gpu", variant="error", classes="thin-button")
@@ -224,6 +230,12 @@ class SettingsScreen(CockpitScreenBase):
         with TabbedContent(initial="settings-tab-host", id="settings-tabs"):
             with TabPane("Host Profile", id="settings-tab-host"):
                 with VerticalScroll():
+                  # Side by side above 121 cells, stacked below it (SHARED_CSS
+                  # .columns-responsive, the same hook the Dashboard's two columns use). With
+                  # .form-field capped at 40 a form row is 60 cells, so two panels fit inside
+                  # the 115-cell usable width — which is the point: these sub-tabs were one
+                  # tall column that had to be scrolled to reach the save buttons.
+                  with Horizontal(classes="columns-responsive settings-columns"):
                     with Vertical(classes="panel"):
                         yield Static("Host Identity & Network", classes="panel-title")
                         with Horizontal(classes="form-row"):
@@ -259,11 +271,11 @@ class SettingsScreen(CockpitScreenBase):
                             yield Static("Builds Directory", classes="form-label")
                             yield Input(id="f-prefix-root", classes="form-field")
 
-                    yield Static("", id="profile-error", classes="error-text")
-                    with Horizontal(classes="action-row-primary"):
+                  yield Static("", id="profile-error", classes="error-text")
+                  with Horizontal(classes="action-row-primary"):
                         yield Button("Save Profile", id="btn-save-profile", variant="primary", classes="thin-button")
                         yield Button("Deploy", id="btn-deploy-profile", classes="thin-button")
-                    yield Static("", id="profile-status", classes="status-text")
+                  yield Static("", id="profile-status", classes="status-text")
 
             with TabPane("GPU Topology", id="settings-tab-gpus"):
                 with VerticalScroll():
@@ -273,7 +285,7 @@ class SettingsScreen(CockpitScreenBase):
                         # table's own last column (item 8b) — one row already is one GPU, so a
                         # separate text block repeated the same identifiers instead of adding
                         # information.
-                        yield CockpitDataTable(id="gpu-table", zebra_stripes=True, classes="data-table", fixed_columns=1)
+                        yield CockpitDataTable(id="gpu-table", zebra_stripes=True, classes="data-table")
                     # Reuses the first-run wizard's own add-GPU form (below) rather than a
                     # second implementation — see _save_gpu_form's host_profile-is-None branch.
                     with Vertical(id="gpu-add-form", classes="panel"):
@@ -295,11 +307,6 @@ class SettingsScreen(CockpitScreenBase):
 
             with TabPane("Connectors", id="settings-tab-connectors"):
                 with VerticalScroll():
-                    yield Static(
-                        "Third-party integrations — a catch-all separate from the core host "
-                        "profile, extended here as more connectors are added.",
-                        classes="subtitle",
-                    )
                     with Vertical(classes="panel"):
                         yield Static("Hugging Face", classes="panel-title")
                         with Horizontal(classes="form-row"):
@@ -312,6 +319,7 @@ class SettingsScreen(CockpitScreenBase):
 
             with TabPane("System Services", id="settings-tab-services"):
                 with VerticalScroll():
+                  with Horizontal(classes="columns-responsive settings-columns"):
                     with Vertical(classes="panel"):
                         yield Static("Inference & Supervision", classes="panel-title")
                         with Horizontal(classes="form-row"):
@@ -348,12 +356,12 @@ class SettingsScreen(CockpitScreenBase):
                             yield Static("Tailscale Status", classes="form-label")
                             yield Static("not checked yet", id="tailscale-status", classes="form-field status-text")
 
-                    yield Static("", id="service-error", classes="error-text")
-                    with Horizontal(classes="action-row-primary"):
+                  yield Static("", id="service-error", classes="error-text")
+                  with Horizontal(classes="action-row-primary"):
                         yield Button("Apply Service Settings", id="btn-apply-service", variant="primary", classes="thin-button")
                         yield Button("Check / Enable WOL", id="btn-check-wol", variant="warning", classes="thin-button")
                         yield Button("Check / Enable Tailscale", id="btn-check-tailscale", variant="warning", classes="thin-button")
-                    yield Static("", id="service-status", classes="status-text")
+                  yield Static("", id="service-status", classes="status-text")
 
     def on_mount(self) -> None:
         self._populate_profile_form()
