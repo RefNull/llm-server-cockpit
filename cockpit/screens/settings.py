@@ -18,6 +18,7 @@ the systemd unit/timers).
 from __future__ import annotations
 
 import copy
+import os
 import socket
 import subprocess
 from pathlib import Path
@@ -67,6 +68,18 @@ _LSPCI_CMD = (
 )
 
 
+def _root_hint() -> str:
+    """Appended to a failed apply. This step installs into /usr/local/bin and writes
+    /etc/systemd/system (README "Privileges"), so an unprivileged cockpit fails with a bare
+    `install ... returned non-zero exit status 1` that says nothing about why."""
+    if os.geteuid() == 0:
+        return ""
+    return (
+        f" — cockpit is running as uid {os.geteuid()}; this step installs into /usr/local/bin "
+        "and /etc/systemd/system, which needs root (sudo bin/cockpit)."
+    )
+
+
 def _default_paths() -> dict[str, str]:
     """A single root under the invoking user's home, with subfolders — proposed as real
     prefilled values (not just placeholder ghost text), editable before saving."""
@@ -108,9 +121,6 @@ class SettingsScreen(CockpitScreenBase):
     SettingsScreen .settings-columns {
         height: auto;
     }
-    SettingsScreen .settings-columns > .panel {
-        width: 1fr;
-    }
     SettingsScreen #gpu-add-form {
         border: solid $accent;
         padding: $space-normal;
@@ -146,6 +156,9 @@ class SettingsScreen(CockpitScreenBase):
         # the schema requires gpus: minItems 1, so this always starts with one blank entry
         # matching the previous single-GPU default (id=gpu0/vendor=nvidia/backends=cuda).
         self._pending_gpus: list[dict[str, Any]] = [{"id": "gpu0", "vendor": "nvidia", "backends": ["cuda"]}]
+        # NIC name -> live MAC, refreshed by _populate_wol_form. Empty on a host without
+        # sysfs (or in the first-run wizard, where the WOL form isn't composed at all).
+        self._iface_macs: dict[str, str] = {}
         # Driver Status used to be a standalone text dump below the GPU table; it's now a
         # per-row column (item 8b), so the check result is kept per-gpu-id here and applied by
         # re-rendering the table rather than updating a separate Static.
@@ -236,6 +249,7 @@ class SettingsScreen(CockpitScreenBase):
                   # the 115-cell usable width — which is the point: these sub-tabs were one
                   # tall column that had to be scrolled to reach the save buttons.
                   with Horizontal(classes="columns-responsive settings-columns"):
+                   with Vertical(classes="settings-column"):
                     with Vertical(classes="panel"):
                         yield Static("Host Identity & Network", classes="panel-title")
                         with Horizontal(classes="form-row"):
@@ -259,6 +273,7 @@ class SettingsScreen(CockpitScreenBase):
                             yield Static("Builds to Keep", classes="form-label")
                             yield Input(id="f-retain", classes="form-field")
 
+                   with Vertical(classes="settings-column"):
                     with Vertical(classes="panel"):
                         yield Static("Storage Paths", classes="panel-title")
                         with Horizontal(classes="form-row"):
@@ -320,6 +335,7 @@ class SettingsScreen(CockpitScreenBase):
             with TabPane("System Services", id="settings-tab-services"):
                 with VerticalScroll():
                   with Horizontal(classes="columns-responsive settings-columns"):
+                   with Vertical(classes="settings-column"):
                     with Vertical(classes="panel"):
                         yield Static("Inference & Supervision", classes="panel-title")
                         with Horizontal(classes="form-row"):
@@ -340,28 +356,49 @@ class SettingsScreen(CockpitScreenBase):
                         with Horizontal(classes="form-row"):
                             yield Static("Check Schedule", classes="form-label")
                             yield Input(id="f-update-check-calendar", placeholder="e.g. daily", classes="form-field")
+                    yield Static("", id="service-error", classes="error-text")
+                    with Horizontal(classes="action-row-primary"):
+                        yield Button("Apply Service Settings", id="btn-apply-service", variant="primary", classes="thin-button")
+                    yield Static("", id="service-status", classes="status-text")
 
+                   # Wake-on-LAN and Tailscale were one "Host & Network Services" panel sharing
+                   # one action row with the llama-swap settings above. They have nothing to do
+                   # with each other, and worse: saving a WOL interface went through "Apply
+                   # Service Settings", which runs swap.run() — a llama-swap reinstall into
+                   # /usr/local/bin that needs root and fails for an unprivileged cockpit. Each
+                   # concern now owns its own panel and its own buttons.
+                   with Vertical(classes="settings-column"):
                     with Vertical(classes="panel"):
-                        yield Static("Host & Network Services", classes="panel-title")
+                        yield Static("Wake-on-LAN", classes="panel-title")
                         with Horizontal(classes="form-row"):
-                            yield Static("WOL Interface", classes="form-label")
-                            yield Input(id="f-wol-interface", placeholder="e.g. enp5s0", classes="form-field")
+                            yield Static("Interface", classes="form-label")
+                            # Populated from live NICs in _populate_wol_form. The operator had
+                            # to know and retype an interface name exactly, with the answer one
+                            # tab away behind the Host Profile tab's "ip a" button.
+                            yield Select([], id="f-wol-interface", allow_blank=True, classes="form-field")
                         with Horizontal(classes="form-row"):
-                            yield Static("WOL MAC Address", classes="form-label")
+                            yield Static("MAC Address", classes="form-label")
                             yield Input(id="f-wol-mac", placeholder="e.g. 00:11:22:33:44:55", classes="form-field")
                         with Horizontal(classes="form-row"):
-                            yield Static("WOL Status", classes="form-label")
+                            yield Static("Status", classes="form-label")
                             yield Static("not checked yet", id="wol-status", classes="form-field status-text")
-                        with Horizontal(classes="form-row"):
-                            yield Static("Tailscale Status", classes="form-label")
-                            yield Static("not checked yet", id="tailscale-status", classes="form-field status-text")
+                        yield Static("", id="wol-error", classes="error-text")
+                        with Horizontal(classes="action-row-primary"):
+                            # Save writes hosts/<hostname>.yaml and nothing else — declarative,
+                            # so it works unprivileged. Applying it to the NIC (ethtool, a
+                            # systemd unit, TLP/NetworkManager) is the separate button, and
+                            # that one does need root.
+                            yield Button("Save WOL Settings", id="btn-save-wol", variant="primary", classes="thin-button")
+                            yield Button("Check / Enable WOL", id="btn-check-wol", variant="warning", classes="thin-button")
+                        yield Static("", id="wol-save-status", classes="status-text")
 
-                  yield Static("", id="service-error", classes="error-text")
-                  with Horizontal(classes="action-row-primary"):
-                        yield Button("Apply Service Settings", id="btn-apply-service", variant="primary", classes="thin-button")
-                        yield Button("Check / Enable WOL", id="btn-check-wol", variant="warning", classes="thin-button")
-                        yield Button("Check / Enable Tailscale", id="btn-check-tailscale", variant="warning", classes="thin-button")
-                  yield Static("", id="service-status", classes="status-text")
+                    with Vertical(classes="panel"):
+                        yield Static("Tailscale", classes="panel-title")
+                        with Horizontal(classes="form-row"):
+                            yield Static("Status", classes="form-label")
+                            yield Static("not checked yet", id="tailscale-status", classes="form-field status-text")
+                        with Horizontal(classes="action-row-primary"):
+                            yield Button("Check / Enable Tailscale", id="btn-check-tailscale", variant="warning", classes="thin-button")
 
     def on_mount(self) -> None:
         self._populate_profile_form()
@@ -722,12 +759,42 @@ class SettingsScreen(CockpitScreenBase):
         self.query_one("#f-scheduled-restart-calendar", Input).value = scheduled.get("on_calendar", "daily")
         self.query_one("#f-update-check-enabled", Switch).value = update_check_cfg.get("enabled", False)
         self.query_one("#f-update-check-calendar", Input).value = update_check_cfg.get("on_calendar", "daily")
-        if self.query("#f-wol-interface"):
-            wol_cfg = self.host_profile.get("network", {}).get("wol", {})
-            self.query_one("#f-wol-interface", Input).value = wol_cfg.get("interface", "")
-        if self.query("#f-wol-mac"):
-            wol_cfg = self.host_profile.get("network", {}).get("wol", {})
+        self._populate_wol_form()
+
+    def _populate_wol_form(self) -> None:
+        """Offer the host's real NICs instead of asking the operator to retype a name exactly.
+
+        The configured interface is added to the options even when it isn't among them — a
+        profile carrying hosts/example.yaml's "TODO" placeholder, or a NIC that has since been
+        renamed or removed, must still round-trip through this form rather than silently
+        resolving to a different interface on save.
+        """
+        if not self.query("#f-wol-interface"):
+            return
+        wol_cfg = (self.host_profile or {}).get("network", {}).get("wol", {})
+        configured = wol_cfg.get("interface", "")
+        self._iface_macs = {i["name"]: i["mac"] for i in wol.list_interfaces()}
+        names = list(self._iface_macs)
+        if configured and configured not in self._iface_macs:
+            names.append(configured)
+        select = self.query_one("#f-wol-interface", Select)
+        # prevent(): set_options and value both fire Select.Changed, and the handler below
+        # overwrites the MAC field from the chosen interface. Without this, populating the
+        # form would clobber a deliberately-overridden MAC with the NIC's real one.
+        with self.prevent(Select.Changed):
+            select.set_options([(n, n) for n in names])
+            select.value = configured if configured in names else Select.BLANK
             self.query_one("#f-wol-mac", Input).value = wol_cfg.get("mac", "")
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        """Auto-fill the MAC from the chosen NIC. It stays an editable Input, not a read-only
+        label: a profile can legitimately carry a MAC this host doesn't currently report (a
+        replaced NIC, a bonded pair), and wol.run() treats the profile as the source of truth."""
+        if event.select.id != "f-wol-interface":
+            return
+        mac = self._iface_macs.get(str(event.value), "")
+        if mac:
+            self.query_one("#f-wol-mac", Input).value = mac
 
     def _update_vpn_preview(self, interface: str) -> None:
         interface = interface.strip()
@@ -785,7 +852,7 @@ class SettingsScreen(CockpitScreenBase):
             return None, "gateway.port must be an integer between 1 and 65535"
         wol = dict(_WOL_PLACEHOLDER) if self.host_profile is None else dict(self.host_profile.get("network", {}).get("wol", _WOL_PLACEHOLDER))
         if self.query("#f-wol-interface"):
-            wol_iface = self.query_one("#f-wol-interface", Input).value.strip()
+            wol_iface = self._selected_wol_interface()
             if wol_iface:
                 wol["interface"] = wol_iface
         if self.query("#f-wol-mac"):
@@ -966,6 +1033,57 @@ class SettingsScreen(CockpitScreenBase):
             return
         self.query_one("#wol-status", Static).update(text)
 
+    def _selected_wol_interface(self) -> str:
+        value = self.query_one("#f-wol-interface", Select).value
+        return "" if value is Select.BLANK else str(value).strip()
+
+    @work
+    async def _confirm_and_save_wol(self) -> None:
+        """Write network.wol to hosts/<hostname>.yaml and stop there.
+
+        Declarative only — no ethtool, no systemd, no llama-swap — so it works as an
+        unprivileged user. Applying the saved config to the NIC is "Check / Enable WOL",
+        which does need root.
+        """
+        iface = self._selected_wol_interface()
+        mac = self.query_one("#f-wol-mac", Input).value.strip()
+        if not iface or not mac:
+            self.query_one("#wol-error", Static).update("interface and MAC address are both required")
+            return
+
+        candidate = copy.deepcopy(self.host_profile)
+        candidate.setdefault("network", {})["wol"] = {"interface": iface, "mac": mac}
+        try:
+            schema.validate_host_profile_dict(candidate)
+        except schema.ValidationError as e:
+            self.query_one("#wol-error", Static).update(f"validation failed: {e}")
+            return
+        self.query_one("#wol-error", Static).update("")
+
+        actual = self._iface_macs.get(iface)
+        drift = ""
+        if actual and actual.lower() != mac.lower():
+            # wol.run() exits on this mismatch rather than proceeding, so say it now instead
+            # of letting the operator discover it from "Check / Enable WOL" later.
+            drift = f"\nNote: {iface} currently reports {actual}, not {mac}."
+        confirmed = await self.confirm(
+            f"Save Wake-on-LAN settings ({iface} / {mac}) to hosts/{self.host_profile['hostname']}.yaml?"
+            f"{drift}\nThis only writes the file — use 'Check / Enable WOL' to apply it to the NIC.",
+            confirm_label="Save",
+        )
+        if not confirmed:
+            return
+
+        target_path = self._host_profile_path()
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        target_path.write_text(yaml.safe_dump(candidate, sort_keys=False), encoding="utf-8")
+        self.host_profile = candidate
+        self.query_one("#wol-save-status", Static).update(
+            f"saved — {target_path.name} now records {iface} / {mac}"
+        )
+        self.notify("Wake-on-LAN settings saved")
+        self._refresh_wol_status()
+
     @work
     async def _confirm_and_check_wol(self) -> None:
         message = (
@@ -1118,13 +1236,10 @@ class SettingsScreen(CockpitScreenBase):
         candidate = copy.deepcopy(self.host_profile)
         candidate["service"] = service
         candidate["update_check"] = update_check_cfg
-        if self.query("#f-wol-interface") and self.query("#f-wol-mac"):
-            wol_iface = self.query_one("#f-wol-interface", Input).value.strip()
-            wol_mac = self.query_one("#f-wol-mac", Input).value.strip()
-            if wol_iface and wol_mac:
-                if "network" not in candidate:
-                    candidate["network"] = {}
-                candidate["network"]["wol"] = {"interface": wol_iface, "mac": wol_mac}
+        # WOL is deliberately NOT read here any more. It used to ride along on this button,
+        # which means changing an interface name ran swap.run() — a llama-swap reinstall into
+        # /usr/local/bin — and failed outright for an unprivileged cockpit. WOL has its own
+        # Save button, which only writes the profile.
         try:
             schema.validate_host_profile_dict(candidate)
         except schema.ValidationError as e:
@@ -1158,9 +1273,9 @@ class SettingsScreen(CockpitScreenBase):
             swap.sync_scheduled_restart(profile, self.repo_root, self.runner)
             swap.sync_update_check_timer(profile, self.repo_root, self.runner)
         except SystemExit as e:
-            msg = f"apply failed: {e.code}"
+            msg = f"apply failed: {e.code}{_root_hint()}"
         except Exception as e:
-            msg = f"apply failed: {e}"
+            msg = f"apply failed: {e}{_root_hint()}"
         else:
             msg = "service settings applied"
             self.app.call_from_thread(self._set_service_status, msg)
@@ -1205,6 +1320,8 @@ class SettingsScreen(CockpitScreenBase):
             self._confirm_and_save_profile()
         elif bid == "btn-deploy-profile":
             self._confirm_and_deploy_profile()
+        elif bid == "btn-save-wol":
+            self._confirm_and_save_wol()
         elif bid in ("btn-check-wol", "btn-wol-check"):
             self._confirm_and_check_wol()
         elif bid in ("btn-check-tailscale", "btn-tailscale-check"):

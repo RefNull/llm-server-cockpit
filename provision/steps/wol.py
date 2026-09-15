@@ -17,6 +17,10 @@ log = logging.getLogger("provision")
 # one hanging and freezing the cockpit's status-check worker, not a real operational limit.
 _TIMEOUT_S = 10
 
+# Module-level so a test can point list_interfaces() at a fixture tree; this host's real
+# sysfs is the only value it ever takes in production.
+_SYSFS_NET = Path("/sys/class/net")
+
 
 def _read_iface_mac(iface: str) -> str | None:
     if shutil.which("ip") is None:  # iproute2 isn't guaranteed present on a minimal image
@@ -32,6 +36,40 @@ def _read_iface_mac(iface: str) -> str | None:
         return None
     m = re.search(r"link/ether ([0-9a-fA-F:]{17})", result.stdout)
     return m.group(1) if m else None
+
+
+def list_interfaces() -> list[dict[str, str]]:
+    """Wake-capable NICs on this host as [{"name", "mac"}], sorted by name.
+
+    sysfs rather than `ip link`: no iproute2 dependency (it isn't guaranteed present on a
+    minimal image — see _read_iface_mac's guard), and the filters below are the ones that
+    matter here. `device` exists only for an interface backed by real hardware, which excludes
+    lo, docker0, veth*, tailscale0 and friends — none of which can be woken. `type` 1 is
+    ARPHRD_ETHER. `wireless`/`phy80211` marks a wifi NIC, where magic-packet wake is a
+    different (and usually absent) mechanism, so it is not offered.
+
+    Returns [] rather than raising on a host without sysfs, so callers can fall back to a
+    free-typed interface name.
+    """
+    root = _SYSFS_NET
+    if not root.is_dir():
+        return []
+    interfaces: list[dict[str, str]] = []
+    for path in sorted(root.iterdir()):
+        if not (path / "device").exists():
+            continue
+        if (path / "wireless").is_dir() or (path / "phy80211").exists():
+            continue
+        try:
+            if (path / "type").read_text().strip() != "1":
+                continue
+            mac = (path / "address").read_text().strip()
+        except OSError:
+            continue
+        if not mac or mac == "00:00:00:00:00:00":
+            continue
+        interfaces.append({"name": path.name, "mac": mac})
+    return interfaces
 
 
 def _read_wake_flags(iface: str) -> str | None:

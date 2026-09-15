@@ -312,7 +312,13 @@ Screen.-narrow DashboardScreen #dashboard-left {
    here too it has to live in SHARED_CSS rather than SettingsScreen.DEFAULT_CSS: a scoped
    DEFAULT_CSS rule beginning with "Screen..." is rewritten to require a SettingsScreen
    ancestor of a Screen, which never matches. */
-Screen.-wide SettingsScreen .settings-columns > .panel:first-of-type {
+/* Each side is a .settings-column wrapper rather than a bare .panel, because a column can
+   hold more than one panel (System Services stacks Wake-on-LAN above Tailscale). */
+SettingsScreen .settings-column {
+    width: 1fr;
+    height: auto;
+}
+Screen.-wide SettingsScreen .settings-columns > .settings-column:first-of-type {
     margin-right: $space-section;
     padding-right: $space-section;
     border-right: solid $surface-lighten-2;

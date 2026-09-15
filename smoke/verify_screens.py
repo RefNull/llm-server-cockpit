@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import inspect
+import tempfile
 from pathlib import Path
 import sys
 
@@ -18,6 +20,8 @@ bootstrap.add_venv_site_packages(_REPO_ROOT)
 
 from cockpit.app import CockpitApp  # noqa: E402
 from cockpit.screens.scripts import ScriptsScreen  # noqa: E402
+from cockpit.screens.settings import SettingsScreen  # noqa: E402
+from provision.steps import wol  # noqa: E402
 from cockpit.widgets import CockpitDataTable  # noqa: E402
 from textual.widgets import Button, TabbedContent  # noqa: E402
 
@@ -105,6 +109,68 @@ def _assert_no_awaited_workers() -> None:
     assert not offenders, "awaited @work method(s):\n  " + "\n  ".join(offenders)
 
 
+def _assert_apply_service_ignores_wol() -> None:
+    """Saving a WOL interface must not go through "Apply Service Settings".
+
+    That button runs swap.run() — a llama-swap reinstall into /usr/local/bin plus systemd
+    units — so changing an interface name failed outright for an unprivileged cockpit with
+    `install ... returned non-zero exit status 1`. WOL is declarative config and has its own
+    Save button; if these fields ever get read here again the same crash comes back.
+    """
+    source = inspect.getsource(SettingsScreen._confirm_and_apply_service)
+    assert "f-wol" not in source, (
+        "SettingsScreen._confirm_and_apply_service reads the WOL fields again — that routes a "
+        "declarative WOL save through swap.run(), which needs root"
+    )
+
+
+async def _assert_wol_form_wiring(app: CockpitApp, pilot, context: str) -> None:
+    """The Interface Select offers real NICs and auto-fills the MAC from the chosen one.
+
+    Driven against a fixture sysfs tree so it runs anywhere, including the macOS dev box that
+    has no /sys/class/net at all.
+    """
+    from textual.widgets import Input, Select
+
+    with tempfile.TemporaryDirectory() as td:
+        net = Path(td) / "net"
+        for name, mac in (("enp6s0", "d8:bb:c1:00:11:22"), ("eno1", "00:1a:2b:33:44:55")):
+            iface = net / name
+            iface.mkdir(parents=True)
+            (iface / "type").write_text("1\n")
+            (iface / "address").write_text(mac + "\n")
+            (iface / "device").mkdir()
+        real_sysfs, wol._SYSFS_NET = wol._SYSFS_NET, net
+        try:
+            screen = app.query_one(SettingsScreen)
+            screen._populate_wol_form()
+            await pilot.pause(0.1)
+            select = app.query_one("#f-wol-interface", Select)
+            mac_field = app.query_one("#f-wol-mac", Input)
+
+            options = [value for _, value in select._options if value is not Select.BLANK]
+            for name in ("enp6s0", "eno1"):
+                assert name in options, f"[{context}] {name} missing from the interface Select: {options}"
+
+            select.value = "enp6s0"
+            await pilot.pause(0.2)
+            assert mac_field.value == "d8:bb:c1:00:11:22", (
+                f"[{context}] MAC did not auto-fill from the chosen NIC: {mac_field.value!r}"
+            )
+
+            # An operator override must survive a repopulate — hence prevent(Select.Changed)
+            # in _populate_wol_form.
+            mac_field.value = "de:ad:be:ef:00:01"
+            screen.host_profile["network"]["wol"] = {"interface": "enp6s0", "mac": "de:ad:be:ef:00:01"}
+            screen._populate_wol_form()
+            await pilot.pause(0.2)
+            assert mac_field.value == "de:ad:be:ef:00:01", (
+                f"[{context}] repopulating clobbered the operator's MAC override: {mac_field.value!r}"
+            )
+        finally:
+            wol._SYSFS_NET = real_sysfs
+
+
 def _assert_buttons_in_bounds(app: CockpitApp, context: str) -> None:
     """Defect 3 (plans/03-ui-qa-pass.md remediation pass): a mounted, enabled Button must
     never extend past the right edge of the screen viewport. This script used to only assert
@@ -127,6 +193,8 @@ def _assert_buttons_in_bounds(app: CockpitApp, context: str) -> None:
 async def verify_geometry_and_export_screenshots() -> None:
     _assert_no_awaited_workers()
     print("No awaited @work methods.")
+    _assert_apply_service_ignores_wol()
+    print("Apply Service Settings does not read the WOL fields.")
 
     out_dir = _REPO_ROOT / "screenshots" / "verification"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -192,6 +260,8 @@ async def verify_geometry_and_export_screenshots() -> None:
                 if name == "scripts":
                     _assert_script_toggle_labels(app, f"{name} @ {w}x{h}")
                     await pilot.pause(0.1)
+                if name == "settings_services":
+                    await _assert_wol_form_wiring(app, pilot, f"{name} @ {w}x{h}")
 
                 svg = app.export_screenshot()
                 svg_path = out_dir / f"{name}_{w}x{h}.svg"

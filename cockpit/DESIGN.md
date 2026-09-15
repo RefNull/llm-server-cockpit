@@ -194,6 +194,7 @@ All 20 modal confirmation call sites across the 6 mutating screens (Dashboard is
   - `_real_deploy` (first-setup): `ConfirmModal(danger=True)` (writes a new `hosts/<hostname>.yaml`).
   - `_confirm_and_save_profile`: `ConfirmModal(danger=True)` (mutates an existing `hosts/<hostname>.yaml`).
   - `_confirm_and_deploy_profile`: `mutates_system=True` (tier 2 — saves profile, restarts `llama-swap` and syncs timers).
+  - `_confirm_and_save_wol`: `ConfirmModal()` with no `danger` (declarative `hosts/<hostname>.yaml` write; no NIC, systemd or binary is touched, so it works unprivileged).
   - `_confirm_and_check_wol`: `mutates_system=True` (tier 1+2 — NIC wake flags, TLP/NetworkManager config, a systemd persistence unit).
   - `_confirm_and_check_tailscale`: `mutates_system=True` (tier 1 — installs a system package if missing and joins the host to a tailnet).
   - `_confirm_and_check_drivers`: `ConfirmModal()` with no `danger` (read-only inspection; exits loudly on drift, never auto-corrects).
@@ -277,7 +278,9 @@ Every screen in `llm-server-cockpit` conforms to one of three structural archety
   - `.form-row`: Container row (`height: auto; align-vertical: middle; margin-bottom: 1;`).
   - `.form-label`: Fixed label header (`width: 20; text-style: bold; color: $text-muted;`).
   - `.form-field`: Flexible input, select, or display widget (`width: 1fr; max-width: 40;`).
-- **Paired panels**: 20 + 40 = 60 cells per form row, so two `.panel`s fit side by side inside the 115-cell usable viewport. A sub-tab with two panels wraps them in `Horizontal(classes="columns-responsive settings-columns")` — side by side above the breakpoint, stacked below it — with the same rule-plus-`$space-section` gutter the Dashboard uses. The cap on `.form-field` exists for this: full-width inputs made every Settings sub-tab one tall column that had to be scrolled to reach its own save button.
+- **Paired panels**: 20 + 40 = 60 cells per form row, so two columns fit side by side inside the 115-cell usable viewport. A two-column sub-tab wraps each side in `Vertical(classes="settings-column")` inside a `Horizontal(classes="columns-responsive settings-columns")` — side by side above the breakpoint, stacked below it — with the same rule-plus-`$space-section` gutter the Dashboard uses. A column wraps *panels*, not fields, so one side can stack several (System Services puts Wake-on-LAN above Tailscale). The cap on `.form-field` exists for this: full-width inputs made every Settings sub-tab one tall column that had to be scrolled to reach its own save button.
+- **One concern per panel, and its buttons inside it.** A panel's action row belongs to that panel (§3.3), not to the sub-tab. Wake-on-LAN and Tailscale used to share a "Host & Network Services" panel and a screen-level action row with the llama-swap settings, which is how saving a WOL interface came to run `swap.run()` — a root-only reinstall — and fail. If two groups of fields do not save together, they are two panels.
+- **Offer what the host already knows.** A field whose valid values are enumerable from the host is a `Select` over those values, not an `Input` the operator has to type exactly (`f-wol-interface` over `wol.list_interfaces()`); a field derivable from another is prefilled from it (`f-wol-mac` from the chosen NIC) and stays editable, because the profile is the source of truth and can legitimately disagree with the current hardware. Prefilling from a `Select` must be wrapped in `self.prevent(Select.Changed)` when repopulating the form, or reloading clobbers the operator's override.
 - **Interaction Contract**: Synchronous validation failures update inline `.status-text` or `.error-text` only (never toast). File saves and hardware probes prompt via `ConfirmModal`.
 
 ---
