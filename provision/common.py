@@ -1,7 +1,13 @@
-"""Shared execution primitives: dry-run gating, idempotency helpers, atomic swap.
+"""Shared execution primitives: dry-run gating, privilege escalation, idempotency helpers,
+atomic swap.
 
 Every mutating action goes through Runner so --dry-run is threaded by
-construction, not by remembering to check a flag at each call site.
+construction, not by remembering to check a flag at each call site. `sudo` is
+threaded the same way and for the same reason: the CLI requires root up front
+(cli.py's require_root), but the cockpit is normally launched unprivileged and
+elevates per action, so *every* mutation has to honour the flag or a step
+half-succeeds — subprocesses run as root while Python's own file writes still
+fail with EACCES.
 """
 from __future__ import annotations
 
@@ -10,18 +16,38 @@ import os
 import shlex
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Sequence
 
 log = logging.getLogger("provision")
 
 
+_ATOMIC_SYMLINK = (
+    "import os, sys\n"
+    "target, tmp, link = sys.argv[1:4]\n"
+    "if os.path.islink(tmp) or os.path.exists(tmp):\n"
+    "    os.unlink(tmp)\n"
+    "os.symlink(target, tmp)\n"
+    "os.replace(tmp, link)\n"
+)
+"""Runner.atomic_symlink's sudo branch, as a script rather than a shell one-liner."""
+
+
 class Runner:
-    def __init__(self, dry_run: bool = False):
+    def __init__(self, dry_run: bool = False, sudo: bool = False):
         self.dry_run = dry_run
+        # Set by the cockpit once the operator has authenticated (see
+        # cockpit.widgets.ensure_root). `-n` throughout: this never prompts for a password
+        # from inside a running TUI — the credential is cached before the flag is set, and an
+        # expired cache fails loudly rather than blocking on a hidden prompt.
+        self.sudo = sudo
 
     def _announce(self, action: str) -> None:
-        log.info("%s%s", "[dry-run] " if self.dry_run else "", action)
+        log.info("%s%s%s", "[dry-run] " if self.dry_run else "", "[sudo] " if self.sudo else "", action)
+
+    def _elevate(self, cmd: Sequence[str]) -> list[str]:
+        return ["sudo", "-n", *(str(c) for c in cmd)] if self.sudo else [str(c) for c in cmd]
 
     def run(
         self,
@@ -36,7 +62,7 @@ class Runner:
         if self.dry_run:
             return None
         return subprocess.run(
-            cmd,
+            self._elevate(cmd),
             check=check,
             env=env,
             cwd=cwd,
@@ -50,12 +76,28 @@ class Runner:
         self._announce(f"shell: {script}" + (f"  (cwd={cwd})" if cwd else ""))
         if self.dry_run:
             return None
-        return subprocess.run(["bash", "-c", script], check=check, cwd=cwd)
+        return subprocess.run(self._elevate(["bash", "-c", script]), check=check, cwd=cwd)
 
     def write_file(self, path: str | Path, content: str, *, mode: int | None = None) -> None:
         path = Path(path)
         self._announce(f"write file: {path} ({len(content)} bytes)")
         if self.dry_run:
+            return
+        if self.sudo:
+            # Staged through a temp file and installed, rather than `sudo tee`: the content
+            # never has to survive a shell. `mkdir -p` + `install -m` rather than GNU's
+            # `install -D`, which BSD install spells differently — the deployment target is
+            # Debian, but a portable pair is one that can actually be tested off it.
+            # 0644 is what write_text() below produces under a normal umask, so an unspecified
+            # mode means the same thing on both paths.
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as tmp:
+                tmp.write(content)
+                staged = tmp.name
+            try:
+                self.run(["mkdir", "-p", str(path.parent)])
+                self.run(["install", "-m", format(mode if mode is not None else 0o644, "04o"), staged, str(path)])
+            finally:
+                os.unlink(staged)
             return
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content)
@@ -69,6 +111,9 @@ class Runner:
         self._announce(f"mkdir -p: {path}")
         if self.dry_run:
             return
+        if self.sudo:
+            self.run(["mkdir", "-p", "-m", format(mode, "04o"), str(path)])
+            return
         path.mkdir(parents=True, mode=mode, exist_ok=True)
 
     def atomic_symlink(self, link_path: str | Path, target_path: str | Path) -> None:
@@ -79,6 +124,13 @@ class Runner:
         if self.dry_run:
             return
         tmp = link_path.with_name(f".{link_path.name}.tmp-{os.getpid()}")
+        if self.sudo:
+            # The identical create-then-rename, run as root. Not `ln -sfn`: `-f` unlinks
+            # before it symlinks, reopening exactly the window this method exists to close.
+            # Not `mv -T` either — that spelling is GNU-only. python3 is by definition present
+            # (it is running this), and os.replace is the same rename(2) the branch below uses.
+            self.run(["python3", "-c", _ATOMIC_SYMLINK, str(target_path), str(tmp), str(link_path)])
+            return
         if tmp.is_symlink() or tmp.exists():
             tmp.unlink()
         tmp.symlink_to(target_path)
@@ -94,7 +146,7 @@ class Runner:
         self._announce(f"apt-get install -y {' '.join(missing)}")
         if self.dry_run:
             return
-        subprocess.run(["apt-get", "install", "-y", *missing], check=True)
+        subprocess.run(self._elevate(["apt-get", "install", "-y", *missing]), check=True)
 
 
 def _apt_package_installed(name: str) -> bool:

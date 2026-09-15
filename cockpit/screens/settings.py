@@ -989,7 +989,11 @@ class SettingsScreen(CockpitScreenBase):
             f"Deploy host profile at hosts/{hostname}.yaml and reconfigure services?\n"
             "(writes host configuration and restarts background services)"
         )
-        confirmed = await self.confirm(message, confirm_label="Deploy", mutates_system=True)
+        # Same _apply_service_in_background as "Apply Service Settings" below, so the same
+        # root requirement.
+        confirmed = await self.confirm(
+            message, confirm_label="Deploy", mutates_system=True, requires_root=True
+        )
         if not confirmed:
             return
 
@@ -1091,7 +1095,9 @@ class SettingsScreen(CockpitScreenBase):
             "TLP/NetworkManager config, and enable a systemd persistence unit)"
         )
         # DESIGN.md §5 tier 1+2: NIC wake flags, TLP/NetworkManager config, a systemd unit.
-        confirmed = await self.confirm(message, confirm_label="Check / Enable", mutates_system=True)
+        confirmed = await self.confirm(
+            message, confirm_label="Check / Enable", mutates_system=True, requires_root=True
+        )
         if not confirmed:
             return
         self.query_one("#wol-status", Static).update("checking...")
@@ -1100,7 +1106,7 @@ class SettingsScreen(CockpitScreenBase):
     @work(thread=True)
     def _run_wol(self) -> None:
         try:
-            wol.run(self.host_profile, self.manifest, self.models, self.runner, self.repo_root)
+            wol.run(self.host_profile, self.manifest, self.models, self.privileged_runner, self.repo_root)
         except SystemExit as e:
             self.app.call_from_thread(self.app.notify, f"WOL check failed: {e.code}", severity="error")
         except Exception as e:
@@ -1143,7 +1149,9 @@ class SettingsScreen(CockpitScreenBase):
         )
         # DESIGN.md §5 tier 1: installs a system package if missing and joins the host to a
         # tailnet — host-level state, not a declarative preview file.
-        confirmed = await self.confirm(message, confirm_label="Check / Enable", mutates_system=True)
+        confirmed = await self.confirm(
+            message, confirm_label="Check / Enable", mutates_system=True, requires_root=True
+        )
         if not confirmed:
             return
         self.query_one("#tailscale-status", Static).update("checking...")
@@ -1156,7 +1164,7 @@ class SettingsScreen(CockpitScreenBase):
 
     def _run_tailscale_check(self) -> None:
         try:
-            tailscale.ensure_installed(self.runner)
+            tailscale.ensure_installed(self.privileged_runner)
         except Exception as e:
             self.notify(f"tailscale install failed: {e}", severity="error")
             self._refresh_tailscale_status()
@@ -1252,7 +1260,9 @@ class SettingsScreen(CockpitScreenBase):
             "restart llama-swap and (re)install/remove systemd timers)"
         )
         # DESIGN.md §5 tier 2: restarts llama-swap and (re)installs/removes systemd timers.
-        confirmed = await self.confirm(message, confirm_label="Apply", mutates_system=True)
+        confirmed = await self.confirm(
+            message, confirm_label="Apply", mutates_system=True, requires_root=True
+        )
         if not confirmed:
             return
 
@@ -1269,9 +1279,10 @@ class SettingsScreen(CockpitScreenBase):
         # DESIGN.md §6: #service-status is on a Settings sub-tab the operator may well have
         # navigated away from while systemd is restarting, so toast every outcome too.
         try:
-            swap.run(profile, self.manifest, self.models, self.runner, self.repo_root)
-            swap.sync_scheduled_restart(profile, self.repo_root, self.runner)
-            swap.sync_update_check_timer(profile, self.repo_root, self.runner)
+            runner = self.privileged_runner
+            swap.run(profile, self.manifest, self.models, runner, self.repo_root)
+            swap.sync_scheduled_restart(profile, self.repo_root, runner)
+            swap.sync_update_check_timer(profile, self.repo_root, runner)
         except SystemExit as e:
             msg = f"apply failed: {e.code}{_root_hint()}"
         except Exception as e:

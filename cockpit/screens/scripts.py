@@ -285,6 +285,7 @@ class ScriptsScreen(CockpitScreenBase):
                 lambda sid: "Stop" if self._status_by_id.get(sid, {}).get("unit_active") else "Start",
                 width=9,
                 confirm="{action} script {row}?",
+                requires_root=True,
             )
         )
         table.add_action_column(
@@ -293,6 +294,7 @@ class ScriptsScreen(CockpitScreenBase):
                 lambda sid: "Disable" if self._status_by_id.get(sid, {}).get("unit_enabled") else "Enable",
                 width=11,
                 confirm="{action} script {row} at boot?",
+                requires_root=True,
             )
         )
         # Edit already existed as a keybinding ('e') with no clickable affordance — exposing it
@@ -428,7 +430,7 @@ class ScriptsScreen(CockpitScreenBase):
             "disable": scripts_step.disable,
         }[verb]
         try:
-            action(script_id, self.runner)
+            action(script_id, self.privileged_runner)
         except Exception as e:
             self.app.call_from_thread(
                 self.app.notify, f"{script_id}: {verb} failed — {e}", severity="error"

@@ -31,7 +31,9 @@ it there raises UnresolvedVariableError at mount. They live in `CockpitApp.SPACE
 """
 from __future__ import annotations
 
+import os
 import re
+import shutil
 import subprocess
 from dataclasses import dataclass
 from importlib import import_module
@@ -39,7 +41,7 @@ from pathlib import Path
 from typing import Callable
 from rich.text import Text, TextType
 from textual import work
-from textual.app import ComposeResult
+from textual.app import ComposeResult, SuspendNotSupported
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.coordinate import Coordinate
 from textual.message import Message
@@ -48,6 +50,8 @@ from textual.theme import Theme
 from textual.widget import Widget
 from textual.widgets import Button, DataTable, Static
 from textual.widgets.data_table import CellType, ColumnKey
+
+from provision.common import Runner
 
 AMBER_THEME = Theme(
     name="cockpit-amber",
@@ -446,6 +450,10 @@ class TableAction:
                 restart). `{row}` is substituted with the row key and `{action}` with this
                 row's resolved label. Destructive actions get a default prompt and don't need
                 this.
+    requires_root
+                this action writes under /etc, /opt or /usr/local, or drives systemctl/apt.
+                The confirm gate then elevates first (see CockpitScreenBase.confirm) and the
+                handler must use `self.privileged_runner`.
     available   predicate on the row key: when it returns False the cell renders blank and
                 clicking it does nothing. This is how "Update" appears only on rows that
                 actually have an update. None = always available.
@@ -456,6 +464,7 @@ class TableAction:
     width: int | None = None
     destructive: bool = False
     confirm: str | None = None
+    requires_root: bool = False
     available: Callable[[str], bool] | None = None
 
     @property
@@ -622,6 +631,49 @@ class SingleClickDataTable(CockpitDataTable):
         event.stop()
 
 
+async def acquire_sudo(app) -> Runner | None:
+    """Authenticate for one privileged action and return an elevated Runner (None on failure).
+
+    `sudo -n -v` first: with a live credential cache this needs no password and no suspend, so
+    a run of several privileged actions prompts once rather than every time. Only when that
+    fails does the TUI step aside for a real prompt — Textual owns the terminal, so a password
+    prompt cannot be rendered from inside it.
+
+    Module-level rather than a CockpitScreenBase method because RetainedBuildsModal is a
+    ModalScreen (a different widget-tree root) and its rollback/remove write under prefix_root
+    just the same.
+    """
+    if shutil.which("sudo") is None:
+        app.notify("sudo is not installed — restart the cockpit as root to run this", severity="error")
+        return None
+    if subprocess.run(["sudo", "-n", "-v"], capture_output=True).returncode != 0:
+        try:
+            with app.suspend():
+                print("\nllm-server-cockpit needs root for this action.")
+                authenticated = subprocess.run(["sudo", "-v"]).returncode == 0
+        except SuspendNotSupported:
+            # Some drivers can't hand the terminal back (headless, and the test pilot). There
+            # is nowhere to render a password prompt, so say what to do instead of failing
+            # with an opaque traceback from inside a worker.
+            app.notify(
+                "cannot prompt for a sudo password here — restart with: sudo bin/cockpit",
+                severity="error",
+            )
+            return None
+        if not authenticated:
+            app.notify("sudo authentication failed or was cancelled", severity="error")
+            return None
+    return Runner(sudo=True)
+
+
+def root_note(message: str) -> str:
+    """Appended to a confirm prompt for an action that needs root and hasn't got it."""
+    return message + (
+        "\n\nThis needs root. Confirming will ask for your sudo password in the terminal, "
+        "then run the action as root."
+    )
+
+
 class InfoModal(ModalScreen[None]):
     """Read-only scrollable popup for showing command output. Usage: self.app.push_screen(
     InfoModal("PCIe devices", run_shell_capture(cmd))) — scrolling is defined once here so
@@ -744,6 +796,8 @@ class CockpitScreenBase(Widget):
        property of the declaration rather than of each call site remembering to await confirm().
     """
 
+    _privileged_runner: Runner | None = None
+
     def on_mount(self) -> None:
         if type(self).on_refresh_requested is CockpitScreenBase.on_refresh_requested:
             raise NotImplementedError(
@@ -765,6 +819,16 @@ class CockpitScreenBase(Widget):
         """Re-read this tab's state. Called by CockpitApp.action_refresh_all ('r')."""
         raise NotImplementedError
 
+    @property
+    def privileged_runner(self) -> Runner:
+        """The Runner for work behind `confirm(requires_root=True)` — never `self.runner`.
+
+        A separate object on purpose: `self.runner` is shared app-wide, so flipping its sudo
+        flag would leak elevation into actions that must NOT run as root. An HF download under
+        sudo writes root-owned files into models_dir, which is the operator's to manage.
+        """
+        return self._privileged_runner if self._privileged_runner is not None else self.runner
+
     async def confirm(
         self,
         message: str,
@@ -772,15 +836,34 @@ class CockpitScreenBase(Widget):
         confirm_label: str = "Confirm",
         mutates_system: bool = False,
         danger: bool = False,
+        requires_root: bool = False,
     ) -> bool:
         """Await a ConfirmModal. `mutates_system=True` forces the DESIGN.md §5 danger tier
         (host-level state, a service restart, or an irreversible change) — pass it instead of
-        deciding `danger=` independently at each call site."""
-        return bool(
+        deciding `danger=` independently at each call site.
+
+        `requires_root=True` marks an action that writes under /etc, /opt or /usr/local, or
+        drives systemctl/apt. The cockpit is normally launched unprivileged (bin/cockpit), so
+        such an action used to fail with a raw non-zero exit from `install` or `systemctl`
+        deep inside a worker. The prompt now says root is needed, and confirming authenticates
+        before the action runs. Handlers behind this flag must use `self.privileged_runner`.
+        """
+        needs_sudo = requires_root and os.geteuid() != 0
+        if needs_sudo:
+            message = root_note(message)
+        confirmed = bool(
             await self.app.push_screen_wait(
                 ConfirmModal(message, confirm_label=confirm_label, danger=mutates_system or danger)
             )
         )
+        if not confirmed:
+            return False
+        if needs_sudo:
+            elevated = await acquire_sudo(self.app)
+            if elevated is None:
+                return False
+            self._privileged_runner = elevated
+        return True
 
     @work
     async def _on_table_action_invoked(self, event: TableActionInvoked) -> None:
@@ -788,8 +871,14 @@ class CockpitScreenBase(Widget):
         needs a worker context; the message pump is not blocked while the modal is up."""
         event.stop()
         message = event.action.confirm_message(event.row_key)
+        if message is None and event.action.requires_root:
+            # A root-needing action always confirms: the sudo prompt is part of that dialog.
+            message = f"{event.action.resolve_label(event.row_key)} {event.row_key}?"
         if message is not None and not await self.confirm(
-            message, confirm_label=event.action.resolve_label(event.row_key), mutates_system=True
+            message,
+            confirm_label=event.action.resolve_label(event.row_key),
+            mutates_system=True,
+            requires_root=event.action.requires_root,
         ):
             return
         await self.handle_table_action(event.action.id, event.row_key, event.table)

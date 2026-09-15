@@ -690,6 +690,7 @@ class DeployScreen(CockpitScreenBase):
             "Deploy llama-swap service and apply configuration to systemd?",
             confirm_label="Deploy",
             mutates_system=True,
+            requires_root=True,
         )
         if not confirmed:
             return
@@ -700,7 +701,7 @@ class DeployScreen(CockpitScreenBase):
     def _apply_in_background(self) -> None:
         # DESIGN.md §6: toasts on both success and failure for background operations.
         try:
-            swap.run(self.host_profile, self.manifest, self.models, self.runner, self.repo_root)
+            swap.run(self.host_profile, self.manifest, self.models, self.privileged_runner, self.repo_root)
         except SystemExit as e:
             msg = f"deploy failed: {e.code}"
         except Exception as e:

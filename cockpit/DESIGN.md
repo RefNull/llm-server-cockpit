@@ -164,6 +164,29 @@ An action is classified as **Dangerous** (`danger=True`, rendering the confirm b
 2. Restarts or alters background system services or systemd timers (e.g. `llama-swap`, scheduled reboots).
 3. Executes irreversible state modifications (e.g. deleting downloaded weights, rolling back runtime binaries).
 
+### Root-Requiring Actions
+
+The CLI demands root up front (`cli.py`'s `require_root`: "every step writes under /opt, /etc,
+/var/lib or installs apt packages"). The cockpit is normally launched unprivileged, and used to
+apply that rule nowhere at all — a root-needing action just failed deep inside a worker with a
+raw `install ... returned non-zero exit status 1`.
+
+- **`confirm(..., requires_root=True)`** (and `TableAction(requires_root=True)`) marks an action
+  that writes under `/etc`, `/opt` or `/usr/local`, or drives `systemctl`/`apt`. The prompt then
+  says root is needed, and confirming authenticates before the action runs: `sudo -n -v` first,
+  so a live credential cache costs no password and no suspend, and only a cache miss drops out of
+  the TUI for a real prompt. Failing or declining that aborts the action.
+- **Handlers behind the flag must use `self.privileged_runner`, never `self.runner`.** The shared
+  `Runner` is app-wide; elevating it in place would silently put unrelated later actions through
+  sudo — an HF download under sudo leaves root-owned files in the operator's `models_dir`.
+- **`requires_root` is not `mutates_system`.** They overlap but are not the same set: downloading
+  a model mutates host state and must *not* be elevated; restarting a container goes through the
+  docker group, not root. Decide it from what the step actually writes.
+- **Elevation is threaded through `Runner`, not applied per call site** — the same argument
+  `dry_run` makes. Wrapping only `run()` is worse than not wrapping at all: subprocesses go as
+  root while `write_file`/`mkdir`/`atomic_symlink` still fail with EACCES, so a step half-succeeds.
+  `smoke/verify_runner_sudo.py` covers every branch.
+
 ### Expressing the Tier
 Two idioms, split on which fact the call site actually knows:
 - An action meeting one of the three clauses above calls `self.confirm(..., mutates_system=True)` (`CockpitScreenBase.confirm`), which derives `danger=True`. The call site declares *what the action does*, not how the button should look.
@@ -178,7 +201,7 @@ All 20 modal confirmation call sites across the 6 mutating screens (Dashboard is
   - `_confirm_and_save`: `ConfirmModal(danger=True)` (declarative `models.yaml` write).
   - `_delete_selected`: `ConfirmModal(danger=True)` (declarative `models.yaml` write).
   - `_confirm_and_import_selected`: `ConfirmModal(danger=True)` (declarative `models.yaml` write).
-  - `_confirm_and_apply`: `mutates_system=True` (tier 2 — installs systemd units and restarts `llama-swap`).
+  - `_confirm_and_apply`: `mutates_system=True`, `requires_root=True` (tier 2 — installs systemd units and restarts `llama-swap`).
 - **Downloads** (`downloads.py`):
   - `download` `TableAction` (`confirm="Download {row}?"`): `mutates_system=True` via `CockpitScreenBase._on_table_action_invoked` — per-model download.
   - `_on_download_all_missing`: `confirm(..., mutates_system=True)` (bulk download consuming significant network/storage).
@@ -193,12 +216,12 @@ All 20 modal confirmation call sites across the 6 mutating screens (Dashboard is
 - **Settings** (`settings.py`):
   - `_real_deploy` (first-setup): `ConfirmModal(danger=True)` (writes a new `hosts/<hostname>.yaml`).
   - `_confirm_and_save_profile`: `ConfirmModal(danger=True)` (mutates an existing `hosts/<hostname>.yaml`).
-  - `_confirm_and_deploy_profile`: `mutates_system=True` (tier 2 — saves profile, restarts `llama-swap` and syncs timers).
+  - `_confirm_and_deploy_profile`: `mutates_system=True`, `requires_root=True` (tier 2 — saves profile, restarts `llama-swap` and syncs timers).
   - `_confirm_and_save_wol`: `ConfirmModal()` with no `danger` (declarative `hosts/<hostname>.yaml` write; no NIC, systemd or binary is touched, so it works unprivileged).
-  - `_confirm_and_check_wol`: `mutates_system=True` (tier 1+2 — NIC wake flags, TLP/NetworkManager config, a systemd persistence unit).
-  - `_confirm_and_check_tailscale`: `mutates_system=True` (tier 1 — installs a system package if missing and joins the host to a tailnet).
+  - `_confirm_and_check_wol`: `mutates_system=True`, `requires_root=True` (tier 1+2 — NIC wake flags, TLP/NetworkManager config, a systemd persistence unit).
+  - `_confirm_and_check_tailscale`: `mutates_system=True`, `requires_root=True` (tier 1 — installs a system package if missing and joins the host to a tailnet).
   - `_confirm_and_check_drivers`: `ConfirmModal()` with no `danger` (read-only inspection; exits loudly on drift, never auto-corrects).
-  - `_confirm_and_apply_service`: `mutates_system=True` (tier 2 — restarts `llama-swap` and (re)installs/removes systemd timers).
+  - `_confirm_and_apply_service`: `mutates_system=True`, `requires_root=True` (tier 2 — restarts `llama-swap` and (re)installs/removes systemd timers).
 
 ---
 

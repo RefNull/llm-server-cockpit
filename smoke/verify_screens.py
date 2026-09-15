@@ -8,6 +8,8 @@ from __future__ import annotations
 import ast
 import asyncio
 import inspect
+import os
+import shutil
 import tempfile
 from pathlib import Path
 import sys
@@ -171,6 +173,71 @@ async def _assert_wol_form_wiring(app: CockpitApp, pilot, context: str) -> None:
             wol._SYSFS_NET = real_sysfs
 
 
+async def _assert_root_gate(app: CockpitApp, pilot, context: str) -> None:
+    """confirm(requires_root=True) warns about root, elevates a SEPARATE Runner, and aborts
+    cleanly when it cannot authenticate.
+
+    The separate Runner is the load-bearing part: `self.runner` is shared app-wide, so
+    elevating it in place would silently put every later action on the same screen — an HF
+    download, say — through sudo and leave root-owned files in the operator's models_dir.
+    """
+    from textual.widgets import Static
+
+    screen = app.query_one(SettingsScreen)
+    bindir = Path(tempfile.mkdtemp())
+    real_path, real_notify = os.environ["PATH"], app.notify
+    try:
+        # A stub `sudo` that reports a live credential cache, so no terminal prompt is needed.
+        (bindir / "sudo").write_text("#!/bin/sh\nexit 0\n")
+        (bindir / "sudo").chmod(0o755)
+        os.environ["PATH"] = f"{bindir}{os.pathsep}{real_path}"
+
+        screen._privileged_runner = None
+        worker = screen.run_worker(screen.confirm("Do the thing?", requires_root=True))
+        await pilot.pause(0.3)
+        prompt = str(app.screen.query_one("#confirm-message", Static).render())
+        assert "needs root" in prompt and "sudo password" in prompt, (
+            f"[{context}] root prompt does not mention sudo: {prompt!r}"
+        )
+        app.screen.dismiss(True)
+        assert await worker.wait() is True, f"[{context}] confirm(requires_root=True) refused a cached sudo"
+        assert screen.privileged_runner.sudo, f"[{context}] privileged_runner was not elevated"
+        assert not screen.runner.sudo, (
+            f"[{context}] elevation leaked onto the shared Runner — every later action on this "
+            "screen would now run as root"
+        )
+
+        # No sudo available at all: refuse, and say what to do. Never a traceback from a worker.
+        (bindir / "sudo").write_text("#!/bin/sh\nexit 1\n")
+        (bindir / "sudo").chmod(0o755)
+        screen._privileged_runner = None
+        notifications: list[str] = []
+        app.notify = lambda message, **kwargs: notifications.append(str(message))
+        worker = screen.run_worker(screen.confirm("Do the thing?", requires_root=True))
+        await pilot.pause(0.3)
+        app.screen.dismiss(True)
+        assert await worker.wait() is False, f"[{context}] confirm proceeded without sudo"
+        assert notifications, f"[{context}] refused silently — the operator was told nothing"
+
+        # An action that does not require root must not be elevated or warned about.
+        app.notify = real_notify
+        screen._privileged_runner = None
+        worker = screen.run_worker(screen.confirm("Harmless?", mutates_system=True))
+        await pilot.pause(0.3)
+        prompt = str(app.screen.query_one("#confirm-message", Static).render())
+        assert "needs root" not in prompt, f"[{context}] non-root action asked for sudo: {prompt!r}"
+        app.screen.dismiss(True)
+        await worker.wait()
+        assert screen.privileged_runner is screen.runner, (
+            f"[{context}] a non-root action got an elevated Runner"
+        )
+    finally:
+        os.environ["PATH"] = real_path
+        app.notify = real_notify
+        screen._privileged_runner = None
+        shutil.rmtree(bindir, ignore_errors=True)
+
+
 def _assert_buttons_in_bounds(app: CockpitApp, context: str) -> None:
     """Defect 3 (plans/03-ui-qa-pass.md remediation pass): a mounted, enabled Button must
     never extend past the right edge of the screen viewport. This script used to only assert
@@ -262,6 +329,7 @@ async def verify_geometry_and_export_screenshots() -> None:
                     await pilot.pause(0.1)
                 if name == "settings_services":
                     await _assert_wol_form_wiring(app, pilot, f"{name} @ {w}x{h}")
+                    await _assert_root_gate(app, pilot, f"{name} @ {w}x{h}")
 
                 svg = app.export_screenshot()
                 svg_path = out_dir / f"{name}_{w}x{h}.svg"

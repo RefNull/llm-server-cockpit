@@ -59,6 +59,10 @@ below, never mixed into the routing above.
   ```bash
   python3 -m py_compile cockpit/*.py cockpit/screens/*.py provision/*.py provision/steps/*.py
   ```
+- **Runner privilege-escalation verification**:
+  ```bash
+  .venv/bin/python smoke/verify_runner_sudo.py
+  ```
 - **Schema & configuration validation**:
   ```bash
   python3 -c "from provision import schema; from pathlib import Path; r = Path('.'); m = schema.load_manifest(r/'manifest.yaml'); h = schema.load_host_profile(r/'hosts/example.yaml'); schema.load_models(r/'models.example.yaml', h, m); print('OK')"

@@ -6,6 +6,7 @@ the ConfirmModal gate in front of every mutating call.
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 from rich.text import Text
@@ -23,6 +24,8 @@ from cockpit.widgets import (
     SingleClickDataTable,
     TableAction,
     TableActionInvoked,
+    acquire_sudo,
+    root_note,
 )
 from provision.common import Runner
 from provision.steps import build as build_step
@@ -268,11 +271,23 @@ class RetainedBuildsModal(ModalScreen[None]):
         event.stop()
         message = event.action.confirm_message(event.row_key)
         if message is not None:
+            # Both actions write under prefix_root (/opt/...), so this modal repeats
+            # CockpitScreenBase.confirm's root gate — it can't inherit it, being a ModalScreen.
+            needs_sudo = os.geteuid() != 0
             confirmed = await self.app.push_screen_wait(
-                ConfirmModal(message, confirm_label=event.action.resolve_label(event.row_key), danger=True)
+                ConfirmModal(
+                    root_note(message) if needs_sudo else message,
+                    confirm_label=event.action.resolve_label(event.row_key),
+                    danger=True,
+                )
             )
             if not confirmed:
                 return
+            if needs_sudo:
+                elevated = await acquire_sudo(self.app)
+                if elevated is None:
+                    return
+                self.runner = elevated
         build = self._builds.get(event.row_key)
         if build is None:
             return
@@ -402,6 +417,7 @@ class BuildsScreen(CockpitScreenBase):
                 "update",
                 "Update",
                 confirm="Build/update {row}? This can take several minutes.",
+                requires_root=True,
                 available=self._backend_has_update,
             )
         )
@@ -495,7 +511,7 @@ class BuildsScreen(CockpitScreenBase):
         provision_logger.addHandler(handler)
 
         try:
-            build_step.run(self.host_profile, self.manifest, self.models, self.runner, self.repo_root, backends=backends)
+            build_step.run(self.host_profile, self.manifest, self.models, self.privileged_runner, self.repo_root, backends=backends)
         except SystemExit as e:
             self.app.call_from_thread(self.app.notify, f"build failed: {e}", severity="error")
         except Exception as e:  # never let a build-time exception crash the whole TUI
