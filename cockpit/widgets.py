@@ -251,15 +251,29 @@ Screen.-narrow .action-row-primary, Screen.-narrow .action-row-secondary {
 Screen.-narrow .action-row-primary Button, Screen.-narrow .action-row-secondary Button {
     margin-bottom: $space-normal;
 }
+/* No `align-vertical: middle` here. It was declared and silently did nothing: Textual does
+   not offset a short child inside a `height: auto` Horizontal, so a 1-line label sat on row 0
+   of a 3-line Input — i.e. on its top border, not beside its value. The two margin rules below
+   do the alignment explicitly instead of declaring an intent the layout never honoured. */
 .form-row {
     height: auto;
-    align-vertical: middle;
     margin-bottom: $space-normal;
 }
+/* An Input/Select/Switch is 3 cells tall with its text on row 1, so the label drops one row to
+   sit beside the value rather than above it. */
 .form-label {
     width: 20;
+    margin-top: $space-normal;
     text-style: bold;
     color: $text-muted;
+}
+/* A plain-text value (a status readout, the VPN resolution preview) is 1 cell tall with no
+   border, so it takes the same offset as the label. Without this a multi-line status rendered
+   a full line below its own label — most visible on WOL Status, whose three lines started
+   under "Status" instead of beside it. Type + class outranks the bare `.status-text` rule
+   above, so a value carrying both classes resolves here and not there. */
+.form-row Static.form-field {
+    margin-top: $space-normal;
 }
 /* `max-width` caps a field that would otherwise stretch the full width of a single-column
    panel. 20 + 40 = 60 cells per form row, so two panels fit side by side inside the 115-cell
