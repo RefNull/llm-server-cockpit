@@ -342,15 +342,18 @@ class DownloadsScreen(CockpitScreenBase):
     # Button handling & download actions
     # ------------------------------------------------------------------
 
-    async def on_button_pressed(self, event: Button.Pressed) -> None:
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        # No `await` on a @work method: the decorator returns a Worker, which is not
+        # awaitable — awaiting one raises TypeError and takes down the app. The worker is
+        # already running by the time the call returns; there is nothing to wait for here.
         if event.button.id == "btn-download-all":
-            await self._on_download_all_missing()
+            self._on_download_all_missing()
         elif event.button.id == "track-btn":
-            await self._on_track_model()
+            self._on_track_model()
 
-    async def on_input_submitted(self, event: Input.Submitted) -> None:
+    def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id == "track-model-input":
-            await self._on_track_model()
+            self._on_track_model()
 
     @staticmethod
     def _parse_track_input(raw: str) -> tuple[str, str] | None:

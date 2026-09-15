@@ -5,6 +5,7 @@ screens, and exports SVG screenshots.
 """
 from __future__ import annotations
 
+import ast
 import asyncio
 from pathlib import Path
 import sys
@@ -69,6 +70,41 @@ def _assert_script_toggle_labels(app: CockpitApp, context: str) -> None:
     assert table._actions["run"].confirm_message("running") == "Stop script running?"
 
 
+def _assert_no_awaited_workers() -> None:
+    """`@work` returns a `Worker`, which is not awaitable — `await self._some_worker()` raises
+    `TypeError: 'Worker' object can't be awaited` and takes the whole app down the moment the
+    button is pressed. It type-checks as a coroutine call at a glance and nothing catches it
+    until a user clicks, so this is a static sweep rather than a per-button click test: driving
+    every button under the pilot would fire real host mutations (container restarts, deploys).
+
+    Seven call sites shipped with this bug across deploy.py, downloads.py and scripts.py.
+    """
+    offenders: list[str] = []
+    for path in sorted(Path(_REPO_ROOT / "cockpit").rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        workers = {
+            fn.name
+            for fn in ast.walk(tree)
+            if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+            for d in fn.decorator_list
+            if (d.func.id if isinstance(d, ast.Call) and isinstance(d.func, ast.Name) else
+                d.id if isinstance(d, ast.Name) else None) == "work"
+        }
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Await) and isinstance(node.value, ast.Call)):
+                continue
+            func = node.value.func
+            if (
+                isinstance(func, ast.Attribute)
+                and isinstance(func.value, ast.Name)
+                and func.value.id == "self"
+                and func.attr in workers
+            ):
+                rel = path.relative_to(_REPO_ROOT)
+                offenders.append(f"{rel}:{node.lineno}: await self.{func.attr}() — {func.attr} is @work")
+    assert not offenders, "awaited @work method(s):\n  " + "\n  ".join(offenders)
+
+
 def _assert_buttons_in_bounds(app: CockpitApp, context: str) -> None:
     """Defect 3 (plans/03-ui-qa-pass.md remediation pass): a mounted, enabled Button must
     never extend past the right edge of the screen viewport. This script used to only assert
@@ -89,6 +125,9 @@ def _assert_buttons_in_bounds(app: CockpitApp, context: str) -> None:
 
 
 async def verify_geometry_and_export_screenshots() -> None:
+    _assert_no_awaited_workers()
+    print("No awaited @work methods.")
+
     out_dir = _REPO_ROOT / "screenshots" / "verification"
     out_dir.mkdir(parents=True, exist_ok=True)
 

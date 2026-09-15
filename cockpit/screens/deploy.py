@@ -723,13 +723,16 @@ class DeployScreen(CockpitScreenBase):
 
     # -- Button Dispatch -------------------------------------------------------
 
-    async def on_button_pressed(self, event: Button.Pressed) -> None:
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        # No `await` on a @work method: the decorator returns a Worker, which is not
+        # awaitable — awaiting one raises TypeError and takes down the app. The worker is
+        # already running by the time the call returns; there is nothing to wait for here.
         bid = event.button.id
         if bid == "btn-apply":
-            await self._confirm_and_apply()
+            self._confirm_and_apply()
         elif bid == "btn-add-model":
-            await self._on_add_model()
+            self._on_add_model()
         elif bid == "btn-import-toggle":
-            await self._on_import_toggle()
+            self._on_import_toggle()
         elif bid == "btn-preview-yaml":
             self._on_preview_yaml()

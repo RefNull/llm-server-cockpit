@@ -441,9 +441,12 @@ class ScriptsScreen(CockpitScreenBase):
 
     # ------------------------------------------------------------------ button dispatch
 
-    async def on_button_pressed(self, event: Button.Pressed) -> None:
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        # No `await` on a @work method: the decorator returns a Worker, which is not
+        # awaitable — awaiting one raises TypeError and takes down the app. The worker is
+        # already running by the time the call returns; there is nothing to wait for here.
         if (event.button.id or "") == "btn-new-script":
-            await self._open_modal_for_add()
+            self._open_modal_for_add()
 
     # ------------------------------------------------------------------ remove
 
