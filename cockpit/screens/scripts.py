@@ -6,7 +6,7 @@ build-candidate -> validate -> write -> reload pattern deploy.py uses for models
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any
 
 import yaml
 from rich.text import Text
@@ -20,26 +20,9 @@ from provision import schema
 from provision.common import Runner
 from provision.steps import scripts as scripts_step
 
-from cockpit.widgets import (
-    CockpitScreenBase,
-    ConfirmModal,
-    InfoModal,
-    SingleClickDataTable,
-    TableAction,
-)
+from cockpit.widgets import CockpitScreenBase, ConfirmModal, SingleClickDataTable, TableAction
 
 _RESTART_POLICY_OPTIONS = [("on-failure", "on-failure"), ("always", "always"), ("no", "no")]
-
-
-class UnitRow(NamedTuple):
-    """One row of the Units table. `script_id` is None for every unit this toolkit installs but
-    does not own per-script config for (llama-swap.service, its timers, the WOL unit) — that's
-    also the switch `_build_unit_rows`' callers use to gate Edit/Remove to script units only."""
-
-    unit: str
-    label: str
-    kind: str  # "service" | "timer"
-    script_id: str | None
 
 
 class EditScriptModal(ModalScreen[bool]):
@@ -235,11 +218,7 @@ class EditScriptModal(ModalScreen[bool]):
 
 
 class ScriptsScreen(CockpitScreenBase):
-    """Cockpit "Units" tab (TabPane id stays "scripts" — smoke/verify_screens.py navigates by
-    it) conforming to Archetype B (Table-Driven Inventory). Lists every systemd unit this
-    toolkit installs: llama-swap.service, its two optional timers, the WOL unit, and one row
-    per registered script — not an arbitrary systemd browser (AGENTS.md "Not a monitor"), so
-    the source list in `_build_unit_rows` is exhaustive by design, not a first cut."""
+    """Cockpit "Scripts" tab conforming to Archetype B (Table-Driven Inventory)."""
 
     BINDINGS = [
         ("e", "edit_script", "Edit"),
@@ -267,16 +246,11 @@ class ScriptsScreen(CockpitScreenBase):
         self.repo_root = repo_root
         self.cockpit_app = app_ref
         self.scripts = getattr(app_ref, "scripts", {"scripts": []})
-        # unit name -> {"unit_active": bool, "unit_enabled": bool} from the last refresh. Drives
-        # the Run toggle column's label, so it must be written before action_cells() is called
-        # for a row (see _apply_rows).
+        # id -> {"unit_active": bool, "unit_enabled": bool} from the last refresh. Drives the
+        # Run/Boot toggle columns' labels, so it must be written before action_cells() is
+        # called for a row (see _apply_rows).
         self._status_by_id: dict[str, dict[str, bool]] = {}
-        # unit name -> script_id, for the rows currently shown. Only script units have an entry
-        # here; Edit/Remove key off this to stay unavailable on every other row (llama-swap,
-        # its timers, WOL — none of them have a scripts.yaml entry to edit or remove).
-        self._script_id_by_unit: dict[str, str] = {}
-        self._cursor_unit: str | None = None
-        # Pre-existing bug found in scope: _remove_ids() referenced this without ever
+        self._cursor_script_id: str | None = None
 
     def compose(self) -> ComposeResult:
         with VerticalScroll():
@@ -297,47 +271,37 @@ class ScriptsScreen(CockpitScreenBase):
     def on_mount(self) -> None:
         table = self.query_one("#scripts-table", SingleClickDataTable)
         # Column budget (DESIGN.md §4): content + 2 padding per column against the 115-cell
-        # usable viewport at 121x30. Data 26+8+20 = 54, actions 9+8+9+8+10 = 44, 8 columns →
-        # 98 + 16 = 114.
-        #
-        # No Boot (enable/disable) toggle column: it fit the old 7-column budget at width 11,
-        # but the Logs and (unit file) Unit actions this brief adds don't leave room for it
-        # inside the same 115-cell ceiling — 26+8+20+9+8+9+11+8+10 = 109 content, 127 rendered.
-        # Reachability isn't lost for the units that matter here: llama-swap.service and its two
-        # timers are enabled declaratively, from host_profile via Settings > Apply Service
-        # Settings (swap.sync_scheduled_restart / sync_update_check_timer) — a per-row toggle
-        # would fight that source of truth, not add one. A script's boot-enable state is set in
-        # EditScriptModal's "Enable on boot" switch, which this tab still exposes via Edit.
-        table.add_column("Unit", width=26)
-        table.add_column("Type", width=8)
+        # usable viewport at 121x30. Data 16+27+20 = 63, actions 9+11+8+10 = 38, 7 columns →
+        # 101 + 14 = 115.
+        table.add_column("ID", width=16)
+        table.add_column("Path", width=27)
         table.add_column("Status", width=20)
-        table.add_action_column(TableAction("logs", "Logs", width=9, requires_root=True))
-        table.add_action_column(TableAction("unitfile", "Unit"))
-        # Start/Stop is one toggle column, not two static ones — matches the pre-existing run
-        # toggle, just re-keyed on the unit name instead of the script id (see _apply_rows).
+        # Start/Stop and Enable/Disable are one toggle column each, not two static ones: six
+        # static action columns need 56 content cells and blow the budget above, and only one
+        # of each pair is ever applicable to a given row anyway.
         table.add_action_column(
             TableAction(
                 "run",
-                lambda unit: "Stop" if self._status_by_id.get(unit, {}).get("unit_active") else "Start",
+                lambda sid: "Stop" if self._status_by_id.get(sid, {}).get("unit_active") else "Start",
                 width=9,
-                confirm="{action} {row}?",
+                confirm="{action} script {row}?",
                 requires_root=True,
             )
         )
-        # Edit/Remove stay script-only: available=False renders a blank, inert cell on every
-        # non-script unit (llama-swap, its timers, WOL) rather than raising on a script_id-less
-        # row.
-        table.add_action_column(
-            TableAction("edit", "Edit", available=lambda unit: unit in self._script_id_by_unit)
-        )
         table.add_action_column(
             TableAction(
-                "remove",
-                "Remove",
-                destructive=True,
-                confirm="Remove script {row} from scripts.yaml?",
-                available=lambda unit: unit in self._script_id_by_unit,
+                "boot",
+                lambda sid: "Disable" if self._status_by_id.get(sid, {}).get("unit_enabled") else "Enable",
+                width=11,
+                confirm="{action} script {row} at boot?",
+                requires_root=True,
             )
+        )
+        # Edit already existed as a keybinding ('e') with no clickable affordance — exposing it
+        # as a per-row action column makes it discoverable without a mouse-only regression.
+        table.add_action_column(TableAction("edit", "Edit"))
+        table.add_action_column(
+            TableAction("remove", "Remove", destructive=True, confirm="Remove script {row} from scripts.yaml?")
         )
         # No data read here — ensure_first_view() does it when this tab is first shown.
 
@@ -347,82 +311,54 @@ class ScriptsScreen(CockpitScreenBase):
 
     # ------------------------------------------------------------------ rendering
 
-    def _build_unit_rows(self) -> list[UnitRow]:
-        """The exhaustive source list (AGENTS.md "Not a monitor" — never enumerate systemd),
-        in the order the brief fixed: llama-swap.service always, its two timers only when the
-        matching host_profile section enables them, the WOL unit always, then one row per
-        registered script."""
-        rows = [UnitRow("llama-swap.service", "llama-swap", "service", None)]
-
-        service_cfg = self.host_profile.get("service", {})
-        if service_cfg.get("scheduled_restart", {}).get("enabled", False):
-            rows.append(UnitRow("llama-swap-restart.timer", "llama-swap-restart", "timer", None))
-
-        if self.host_profile.get("update_check", {}).get("enabled", False):
-            rows.append(
-                UnitRow("llm-server-cockpit-update-check.timer", "update-check", "timer", None)
-            )
-
-        wol_iface = self.host_profile["network"]["wol"]["interface"]
-        rows.append(UnitRow(f"wol-{wol_iface}.service", f"wol-{wol_iface}", "service", None))
-
-        for script in self.scripts.get("scripts", []):
-            sid = script["id"]
-            rows.append(UnitRow(scripts_step._unit_name(sid), sid, "service", sid))
-
-        return rows
-
     @work(thread=True)
     def _refresh_table(self) -> None:
-        # Passive status read, no completion toast (DESIGN.md §6): a unit's systemctl error is
-        # rendered into its own Status cell, and this runs on mount/refresh rather than on an
-        # operator action.
+        # Passive status read, no completion toast (DESIGN.md §6): per-script systemctl errors
+        # are rendered into the row's own Status cell, and this runs on mount/refresh rather
+        # than on an operator action.
         rows = []
-        for row in self._build_unit_rows():
+        for script in self.scripts.get("scripts", []):
             try:
-                st = scripts_step.unit_status(row.unit)
+                st = scripts_step.status(script["id"])
                 status_text = f"{'active' if st['unit_active'] else 'stopped'}, {'enabled' if st['unit_enabled'] else 'disabled'}"
             except Exception as e:
                 st = {"unit_active": False, "unit_enabled": False}
                 status_text = f"error checking status ({e})"
-            rows.append((row, st, status_text))
+            rows.append((script, st, status_text))
         self.app.call_from_thread(self._apply_rows, rows)
 
-    def _apply_rows(self, rows: list[tuple[UnitRow, dict[str, bool], str]]) -> None:
+    def _apply_rows(self, rows: list[tuple[dict, dict[str, bool], str]]) -> None:
         if not self.is_mounted:
             return
         table = self.query_one("#scripts-table", SingleClickDataTable)
         table.clear()
-        # Before any action_cells() call below: the Run column reads its label, and Edit/Remove
-        # read their availability, from these two.
-        self._status_by_id = {row.unit: st for row, st, _ in rows}
-        self._script_id_by_unit = {
-            row.unit: row.script_id for row, _st, _text in rows if row.script_id is not None
-        }
-        if self._cursor_unit not in self._status_by_id:
-            self._cursor_unit = None
-        for row, _st, status_text in rows:
+        # Before any action_cells() call below: the Run/Boot columns read their labels here.
+        self._status_by_id = {script["id"]: st for script, st, _ in rows}
+        if self._cursor_script_id not in self._status_by_id:
+            self._cursor_script_id = None
+        for script, _st, status_text in rows:
+            sid = script["id"]
             # rich.text.Text, not raw str (DESIGN.md §4.6 / Phase 0a.6): the app console has
-            # markup=True, so an operator-chosen script id, or a status string embedding an
+            # markup=True, so an operator-chosen script path, or a status string embedding an
             # exception message, containing brackets would have that span silently eaten by
             # Rich as a markup tag.
             table.add_row(
-                Text(row.label),
-                Text(row.kind),
+                Text(sid),
+                Text(script["path"]),
                 Text(status_text),
-                *table.action_cells(row.unit),
-                key=row.unit,
+                *table.action_cells(sid),
+                key=sid,
             )
-        if self._cursor_unit is None and table.row_count > 0:
+        if self._cursor_script_id is None and table.row_count > 0:
             # DataTable defaults its cursor to row 0 without firing RowHighlighted for it, so
             # sync explicitly here.
             row_key, _ = table.coordinate_to_cell_key(table.cursor_coordinate)
-            self._cursor_unit = row_key.value if row_key is not None else None
+            self._cursor_script_id = row_key.value if row_key is not None else None
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
         if event.data_table.id != "scripts-table":
             return
-        self._cursor_unit = event.row_key.value if event.row_key is not None else None
+        self._cursor_script_id = event.row_key.value if event.row_key is not None else None
 
     def _set_status(self, text: str) -> None:
         self.query_one("#status-message", Static).update(text)
@@ -464,79 +400,46 @@ class ScriptsScreen(CockpitScreenBase):
             self._set_status(f"script {script_id!r} updated — scripts.yaml written")
 
     def action_edit_script(self) -> None:
-        script_id = self._script_id_by_unit.get(self._cursor_unit or "")
-        if script_id:
-            self._open_modal_for_edit(script_id)
-        elif self._cursor_unit:
-            self._set_status(f"{self._cursor_unit} isn't a script unit — nothing to edit")
+        if self._cursor_script_id:
+            self._open_modal_for_edit(self._cursor_script_id)
         else:
-            self._set_status("select a row first")
+            self._set_status("select a script row first")
 
     # ------------------------------------------------------------------ per-row table actions
 
     async def handle_table_action(self, action_id: str, row_key: str, table) -> None:
         # Already confirmed by CockpitScreenBase._on_table_action_invoked for every action
-        # that declared a confirm= / destructive=True. row_key is the unit name for every
-        # action — edit/remove translate it back to a script id via _script_id_by_unit, and
-        # are `available=` False on rows where that lookup would miss.
+        # that declared a confirm= / destructive=True.
         if action_id == "edit":
-            script_id = self._script_id_by_unit.get(row_key)
-            if script_id:
-                self._open_modal_for_edit(script_id)
+            self._open_modal_for_edit(row_key)
         elif action_id == "remove":
-            script_id = self._script_id_by_unit.get(row_key)
-            if script_id:
-                await self._remove_ids([script_id])
+            await self._remove_ids([row_key])
         elif action_id == "run":
             active = self._status_by_id.get(row_key, {}).get("unit_active")
             self._run_unit_action("stop" if active else "start", row_key)
-        elif action_id == "logs":
-            self._view_logs(row_key)
-        elif action_id == "unitfile":
-            self._view_unitfile(row_key)
+        elif action_id == "boot":
+            enabled = self._status_by_id.get(row_key, {}).get("unit_enabled")
+            self._run_unit_action("disable" if enabled else "enable", row_key)
 
     @work(thread=True)
-    def _run_unit_action(self, verb: str, unit: str) -> None:
-        script_id = self._script_id_by_unit.get(unit)
+    def _run_unit_action(self, verb: str, script_id: str) -> None:
+        action = {
+            "start": scripts_step.start,
+            "stop": scripts_step.stop,
+            "enable": scripts_step.enable,
+            "disable": scripts_step.disable,
+        }[verb]
         try:
-            if script_id is not None:
-                action = {"start": scripts_step.start, "stop": scripts_step.stop}[verb]
-                action(script_id, self.privileged_runner)
-            else:
-                # Every non-script unit this tab lists (llama-swap, its timers, WOL) is a plain
-                # systemd unit with no script-specific wrapper to go through.
-                self.privileged_runner.run(["systemctl", verb, unit])
+            action(script_id, self.privileged_runner)
         except Exception as e:
             self.app.call_from_thread(
-                self.app.notify, f"{unit}: {verb} failed — {e}", severity="error"
+                self.app.notify, f"{script_id}: {verb} failed — {e}", severity="error"
             )
         else:
-            # Not f"{verb}ed" — that produced "stoped". The verb is already the right word; it
-            # just isn't a regular past tense.
-            self.app.call_from_thread(self.app.notify, f"{unit}: {verb} complete")
+            # Not f"{verb}ed" — that produced "stoped"/"enableed". The verb is already the
+            # right word; it just isn't a regular past tense.
+            self.app.call_from_thread(self.app.notify, f"{script_id}: {verb} complete")
         self.app.call_from_thread(self._refresh_table)
-
-    @work(thread=True)
-    def _view_logs(self, unit: str) -> None:
-        # privileged_runner, not runner: the action declares requires_root=True, so the
-        # operator has already been prompted. Running journalctl unprivileged anyway would
-        # ask for a password and then not use it — and root-owned unit logs come back empty.
-        content = scripts_step.journal_tail(unit, runner=self.privileged_runner)
-        self.app.call_from_thread(
-            self.app.push_screen, InfoModal(f"journalctl -u {unit}", content)
-        )
-
-    @work(thread=True)
-    def _view_unitfile(self, unit: str) -> None:
-        path = Path("/etc/systemd/system") / unit
-        if not path.exists():
-            content = f"{path} does not exist"
-        else:
-            try:
-                content = path.read_text()
-            except OSError as e:
-                content = f"couldn't read {path}: {e}"
-        self.app.call_from_thread(self.app.push_screen, InfoModal(f"Unit file — {unit}", content))
 
     # ------------------------------------------------------------------ button dispatch
 

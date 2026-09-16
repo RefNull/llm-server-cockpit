@@ -75,6 +75,7 @@ _TABS = [
     ("llm", "#llm-tabs", "hf-downloads"),
     ("deployments", "#deployment-tabs", "containers"),
     ("deployments", "#deployment-tabs", "scripts"),
+    ("deployments", "#deployment-tabs", "systemd"),
     ("settings", "#settings-tabs", "settings-tab-host"),
     ("settings", "#settings-tabs", "settings-tab-gpus"),
     ("settings", "#settings-tabs", "settings-tab-services"),

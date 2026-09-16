@@ -25,6 +25,7 @@ from cockpit.screens.deploy import DeployScreen
 from cockpit.screens.downloads import DownloadsScreen
 from cockpit.screens.scripts import ScriptsScreen
 from cockpit.screens.settings import SettingsScreen
+from cockpit.screens.systemd import SystemdScreen
 from cockpit.widgets import AMBER_THEME, SHARED_CSS, CockpitScreenBase
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -82,8 +83,7 @@ class CockpitApp(App):
     Normal mode's tabs are grouped two levels deep via nested TabbedContent — Dashboard is the
     default/landing tab, "LLM" groups Backends/Models/HF Downloads (BuildsScreen/DeployScreen/
     DownloadsScreen — renamed labels only, same screen classes), "Deployments" groups
-    Containers/Units (label "Units", TabPane id stays "scripts" — smoke/verify_screens.py
-    navigates by it), Settings groups its own sub-tabs internally (see
+    Containers/Scripts/Systemd, Settings groups its own sub-tabs internally (see
     SettingsScreen._compose_normal). Nesting doesn't change how
     action_refresh_all's DOM query below finds screens: Textual mounts every TabPane's content
     up front (no lazy-mount), so a query for a screen class matches regardless of nesting depth.
@@ -217,17 +217,17 @@ class CockpitApp(App):
                         with TabPane("HF Downloads", id="hf-downloads"):
                             yield DownloadsScreen(self.host_profile, self.manifest, self.models, self.runner, self.repo_root, self)
                 with TabPane("Deployments", id="deployments"):
-                    # Containers and Units are the same job seen twice — supervised
+                    # Containers and Scripts are the same job seen twice — supervised
                     # long-running processes this host owns — so they group the way
                     # Backends/Models/HF Downloads already do rather than each taking a
-                    # top-level tab. "Units" (not "Scripts") because the tab now lists every
-                    # systemd unit this toolkit installs, not only script-backed ones — see
-                    # ScriptsScreen's docstring.
+                    # top-level tab.
                     with TabbedContent(initial="containers", id="deployment-tabs"):
                         with TabPane("Containers", id="containers"):
                             yield ContainersScreen(self.host_profile, self.manifest, self.models, self.runner, self.repo_root, self)
-                        with TabPane("Units", id="scripts"):
+                        with TabPane("Scripts", id="scripts"):
                             yield ScriptsScreen(self.host_profile, self.manifest, self.models, self.runner, self.repo_root, self)
+                        with TabPane("Systemd", id="systemd"):
+                            yield SystemdScreen(self.host_profile, self.manifest, self.models, self.runner, self.repo_root, self)
                 with TabPane("Settings", id="settings"):
                     yield SettingsScreen(self.host_profile, self.manifest, self.models, self.runner, self.repo_root, self)
         yield Footer()
