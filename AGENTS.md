@@ -31,6 +31,7 @@ below, never mixed into the routing above.
 - **Dual planes**:
   - Headless CLI (`bin/provision`) for automated, declarative setup and CI/CD.
   - Interactive Textual TUI (`bin/cockpit`) for manual operator inspection, model rollout, and live compilation.
+- **Not a monitor**: the cockpit deploys and supervises; it does not measure host utilization. No CPU/RAM/GPU telemetry, live or on demand — reading GPU telemetry wakes the device and cost two fan-ramp incidents. Host monitoring belongs to a monitoring stack. Home-server services (DNS, media, shares, backups) are out of scope too; that is a separate toolkit's job, split by workload rather than by hardware.
 - **Inference supervision**: `llama.cpp` builds per backend and `llama-swap` reverse proxy managed via `systemd`. Unmanaged external services (e.g. containerized STT/TTS) route via `engine: unmanaged`.
 
 ### Repository Discipline

@@ -168,6 +168,45 @@ async def _assert_launch_defers_hidden_tabs() -> None:
         urllib.request.urlopen = real_urlopen
 
 
+async def _assert_markup_escaping_survives_textual() -> None:
+    """Operator/vendor data with a `[` must reach the screen intact.
+
+    Textual 8.2.8 parses its own content markup and accepts tags Rich does not: Rich's tag
+    regex requires `[a-z#/@]` after the bracket, Textual's does not. So `Intel Corporation DG2
+    [Arc A770]` passes through BOTH `rich.markup.escape` and `textual.markup.escape` untouched
+    — each built around the Rich-era rule — and is then eaten by Textual's parser, truncating
+    the value at the bracket with no error and no exception. `cockpit.widgets.escape_markup`
+    exists for exactly this and is the only thing that works.
+
+    Measured before the fix: a GPU name rendered as `gpu-intel · Intel Corporation DG2`.
+    """
+    from textual.app import App
+    from textual.geometry import Region
+    from textual.widgets import Static
+
+    from cockpit.widgets import escape_markup, service_row
+
+    raw = "Intel Corporation DG2 [Arc A770]"
+
+    class _Probe(App):
+        def compose(self):
+            yield Static(f"[$accent]{escape_markup(raw)}[/]", id="probe-escaped")
+            yield Static(service_row("[prod] web", True, raw), id="probe-row")
+
+    app = _Probe()
+    async with app.run_test(size=(80, 6)) as pilot:
+        await pilot.pause(0.3)
+        for widget_id, must_contain in (("probe-escaped", raw), ("probe-row", "[prod] web")):
+            widget = app.query_one(f"#{widget_id}", Static)
+            strip = widget.render_lines(Region(0, 0, widget.size.width, 1))[0]
+            rendered = "".join(seg.text for seg in strip._segments)
+            assert must_contain in rendered, (
+                f"{widget_id}: Textual's markup parser ate the bracket span — "
+                f"expected {must_contain!r} in {rendered.strip()!r}"
+            )
+    print("bracketed vendor/operator data survives Textual's markup parser")
+
+
 def _assert_apply_service_ignores_wol() -> None:
     """Saving a WOL interface must not go through "Apply Service Settings".
 
@@ -320,6 +359,7 @@ async def verify_geometry_and_export_screenshots() -> None:
     _assert_apply_service_ignores_wol()
     print("Apply Service Settings does not read the WOL fields.")
     await _assert_launch_defers_hidden_tabs()
+    await _assert_markup_escaping_survives_textual()
 
     out_dir = _REPO_ROOT / "screenshots" / "verification"
     out_dir.mkdir(parents=True, exist_ok=True)

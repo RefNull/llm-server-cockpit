@@ -1,14 +1,23 @@
 #!/usr/bin/env python3
-"""Regression guard: launching the cockpit must not touch GPU telemetry.
+"""Regression guard: the cockpit must never spawn a GPU vendor tool.
 
 Reading GPU telemetry wakes the device. `nvidia-smi`/`xpu-smi` on an Intel Arc keep its sysman
-telemetry active, and the fans ramp — hard, within moments of opening the app. This has now
-been fixed twice: commit 5c986a4 removed a 1Hz sampler, and the Dashboard's remaining
-mount-time read was removed after QA saw the ramp again on plain launch. The Dashboard is the
-landing tab, so *any* automatic read means every launch pokes every GPU.
+telemetry active, and the fans ramp — hard, within moments of opening the app. This was fixed
+three times: 5c986a4 removed a 1Hz sampler, b799d83 removed the Dashboard's mount-time read and
+put the remaining one behind a button, and plans/04 deleted live measurement from the cockpit
+outright — because a button still leaves a telemetry path in a deployment tool.
 
-The assertion is at the subprocess boundary rather than on metrics.read_gpus, so it also
-catches a new caller reaching a vendor tool some other way (a driver query, a shell one-liner).
+So the assertion is now **never**, not "not at launch": no GPU vendor tool may be spawned by
+launching, by visiting any tab, by the global refresh, or by sitting idle. The only sanctioned
+caller left in the repo is `drivers.run()` behind Settings → Check Drivers, which this script
+does not exercise.
+
+`lspci` is deliberately NOT on the forbidden list. It reads the PCI ID database to name a
+device; it does not open the DRM/NVML interfaces that bring a GPU out of a low-power state.
+The Dashboard uses it for accelerator product names (plans/04 §0c-bis).
+
+The assertion is at the subprocess boundary rather than on a named function, so it also catches
+a new caller reaching a vendor tool some other way (a driver query, a shell one-liner).
 
 Run: .venv/bin/python smoke/verify_no_gpu_wake.py
 """
@@ -56,20 +65,7 @@ subprocess.run = _run
 subprocess.Popen = _Popen
 
 from cockpit.app import CockpitApp  # noqa: E402
-from provision.steps import metrics  # noqa: E402
-from textual.widgets import Button, TabbedContent  # noqa: E402
-
-_reads = 0
-_real_read_gpus = metrics.read_gpus
-
-
-def _counted_read_gpus():
-    global _reads
-    _reads += 1
-    return _real_read_gpus()
-
-
-metrics.read_gpus = _counted_read_gpus
+from textual.widgets import TabbedContent  # noqa: E402
 
 # Every sub-view, so a new tab that samples on mount is caught too.
 _TABS = [
@@ -89,7 +85,8 @@ async def main() -> None:
     app = CockpitApp(host="example")
     async with app.run_test(size=(140, 44)) as pilot:
         await pilot.pause(0.8)
-        assert app.query(".res-label"), "dashboard gauges did not mount — this check proves nothing"
+        # Sentinel: if the Dashboard never mounted, everything below passes vacuously.
+        assert app.query("#inv-model"), "dashboard inventory did not mount — this check proves nothing"
 
         for root, sub_tc, sub in _TABS:
             app.query_one("#main-tabs", TabbedContent).active = root
@@ -105,17 +102,8 @@ async def main() -> None:
         for _ in range(8):
             await pilot.pause(0.5)
 
-        assert _reads == 0, f"metrics.read_gpus() ran {_reads}x without the operator asking"
-        assert not _spawned, f"a GPU tool was spawned automatically: {_spawned}"
-        print(f"launch + all {len(_TABS)} sub-views + global refresh + 4s idle: 0 GPU reads, 0 GPU tool spawns")
-
-        # ...and the feature still works when the operator does ask.
-        app.query_one("#main-tabs", TabbedContent).active = "dashboard"
-        await pilot.pause(0.4)
-        app.query_one("#btn-sample-gpus", Button).press()
-        await pilot.pause(1.5)
-        assert _reads == 1, f"Sample GPUs took {_reads} readings, expected exactly 1"
-        print("Sample GPUs: exactly 1 reading, only when pressed")
+        assert not _spawned, f"a GPU vendor tool was spawned: {_spawned}"
+        print(f"launch + all {len(_TABS)} sub-views + global refresh + 4s idle: 0 GPU tool spawns")
 
     print("No-GPU-wake verification PASSED.")
 

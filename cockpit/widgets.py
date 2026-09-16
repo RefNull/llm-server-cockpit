@@ -177,49 +177,9 @@ Tab {
     margin-bottom: $space-normal;
 }
 
-/* Screen archetype tokens (DESIGN.md §8). Standardized rows, gauges, action containers,
-   and key-value form fields shared across all screens. */
-.res-row {
-    height: 1;
-    align-vertical: middle;
-    margin-bottom: 0;
-}
-.res-label {
-    width: 6;
-    text-style: bold;
-    color: $accent;
-}
-.res-row ProgressBar {
-    width: 1fr;
-    height: 1;
-}
-/* The unfilled part of the track. Textual's Bar paints it `background: $surface` — the same
-   colour as the panel behind it — so a gauge at 12% read as a short amber smear floating in
-   empty space with no visible "out of what". A distinct track is what makes the proportion
-   legible at a glance (htop/btop/gotop all draw one). $error at 100% rather than Textual's
-   default $success: these are saturation gauges, not download progress — a full RAM bar is
-   not a success. */
-.res-row Bar > .bar--bar {
-    color: $primary;
-    background: $surface-lighten-2;
-}
-.res-row Bar > .bar--complete {
-    color: $error;
-    background: $surface-lighten-2;
-}
-.res-row PercentageStatus {
-    margin-left: $space-normal;
-}
-/* Fixed width, right-aligned, and present on EVERY .res-row even when that metric has no
-   absolute reading (CPU). The percentage sits at the ProgressBar's right edge, so a row
-   without this column let its bar run 18 cells further and put its "%" in a different screen
-   column than the row above it — the "bars of differing lengths" defect. Structural: the
-   empty Static is the column, not decoration. */
-.res-val {
-    width: 18;
-    text-align: right;
-    color: $text-muted;
-}
+/* Screen archetype tokens (DESIGN.md §8). Standardized action containers and key-value form
+   fields shared across all screens. The `.res-*` gauge rows that used to live here went with
+   the Dashboard's live measurement (plans/04) — nothing else ever used them. */
 .action-row-primary {
     height: auto;
     align: left middle;
@@ -315,6 +275,15 @@ Screen.-wide .columns-responsive {
    GPU row beside it. A rule plus $space-section either side gives 5 cells and an unambiguous
    boundary, which is cheaper to read than more whitespace would be at any width that still
    leaves room for the columns themselves. */
+/* Both columns fill the row, so the divider below runs its full length. This has to be here
+   rather than in DashboardScreen.DEFAULT_CSS: `.panel` sets `height: auto` and lives in this
+   sheet, which is App.CSS — a higher tier than any widget's DEFAULT_CSS — so an id selector
+   over there loses to a class selector over here regardless of specificity. Measured: the rule
+   in DEFAULT_CSS left `styles.height` as `auto` and the rule was simply inert. */
+Screen.-wide DashboardScreen #dashboard-left,
+Screen.-wide DashboardScreen #dashboard-right {
+    height: 1fr;
+}
 Screen.-wide DashboardScreen #dashboard-left {
     margin-right: $space-section;
     padding-right: $space-section;
@@ -408,6 +377,54 @@ def selection_marker(selected: bool) -> Text:
     toggled on DataTable.RowSelected, and the table is rebuilt (clear() + re-add_row()) so this
     marker always reflects current state rather than being independently mutated."""
     return Text("[x]" if selected else "[ ]", style="bold" if selected else "")
+
+
+def escape_markup(value: str) -> str:
+    """Escape operator/vendor data for a markup-enabled Static. **Not `rich.markup.escape`.**
+
+    Textual 8.2.8 parses its own content markup, and it accepts tags Rich does not: Rich's
+    tag regex requires `[a-z#/@]` after the bracket, Textual's does not. So a PCI product name
+    like `Intel Corporation DG2 [Arc A770]` is left untouched by BOTH `rich.markup.escape` and
+    `textual.markup.escape` — each is built around the Rich-era rule — and is then eaten by
+    Textual's parser, truncating the value at the bracket with no error. Measured in a live
+    app at 70 cells: the plain string rendered as `gpu-intel · Intel Corporation DG2`.
+
+    A literal backslash is the only escape that survives, so this doubles backslashes first
+    and then escapes every `[`. Use it for anything an operator or a vendor supplies — a
+    container name, a script id, a device name. Table cells use `rich.text.Text` instead
+    (DESIGN.md §4.6), which bypasses markup parsing entirely and needs none of this.
+    """
+    return value.replace("\\", "\\\\").replace("[", "\\[")
+
+
+_SERVICE_GLYPHS: dict[bool | None, tuple[str, str]] = {
+    True: ("✔", "$success"),
+    False: ("✖", "$error"),
+    None: ("●", "$text-muted"),
+}
+
+
+def service_row(name: str, state: bool | None, detail: str = "", width: int = 22) -> str:
+    """One service line for the Dashboard: **name first, then the glyph, then muted detail.**
+
+    The glyph used to lead (`✔ llama-swap: running`), which put it in a different column on
+    every line and made the one ✖ in a list of ✔ hard to find. Name-then-glyph gives a single
+    scannable column, which is the only thing the mark is for.
+
+    `state` is three-valued on purpose: True is running/enabled, False is not, and **None is
+    "not managed or not knowable"** — a host without docker, a timer that was never installed.
+    An error is None with the error text as `detail`; it is not a ✖, because ✖ means "this is
+    off" and an unreachable daemon is not the same claim.
+
+    Returns console markup, so `name` and `detail` go through `escape_markup` — a container
+    named `[prod] web` would otherwise be truncated to nothing with no error. Padding is
+    applied before escaping, since the escape is invisible in the rendered width.
+    """
+    glyph, colour = _SERVICE_GLYPHS[state]
+    line = f"{escape_markup(name.ljust(width))} [{colour}]{glyph}[/]"
+    if detail:
+        line += f"  [$text-muted]{escape_markup(detail)}[/]"
+    return line
 
 
 def action_cell(label: str, *, destructive: bool = False) -> Text:
