@@ -149,6 +149,30 @@ class Runner:
         subprocess.run(self._elevate(["apt-get", "install", "-y", *missing]), check=True)
 
 
+def unit_value(value: str) -> str:
+    """Escape a value interpolated into ANY systemd unit setting.
+
+    systemd expands `%` specifiers everywhere in a unit file, so a literal `%` must be doubled.
+    Unescaped, `WorkingDirectory=/opt/%HOSTDIR` renders as `/opt/<hostname>OSTDIR` — `%H` is the
+    hostname specifier. A value containing no `%` is returned unchanged.
+    """
+    return value.replace("%", "%%")
+
+
+def unit_command(value: str) -> str:
+    """Escape a value interpolated into a systemd COMMAND setting (ExecStart=, ExecStartPre=).
+
+    Command lines additionally expand `$VAR` / `${VAR}` from the service environment, so a
+    literal `$` must be doubled too. Unescaped, an argument of `$HOME/data` reached the process
+    as `/data`. Only for command settings: `$` is literal in `Description=` and
+    `WorkingDirectory=`, where doubling it would render a stray second `$`.
+
+    Never apply either helper to llama-swap's config.yaml — `${PORT}` there is a llama-swap
+    placeholder that must survive verbatim (provision/steps/swap.py::_build_model_entry).
+    """
+    return unit_value(value).replace("$", "$$")
+
+
 def _apt_package_installed(name: str) -> bool:
     result = subprocess.run(
         ["dpkg-query", "-W", "-f=${Status}", name],

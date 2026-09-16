@@ -59,6 +59,10 @@ below, never mixed into the routing above.
   ```bash
   python3 -m py_compile cockpit/*.py cockpit/screens/*.py provision/*.py provision/steps/*.py
   ```
+- **Rendered-artifact verification** (every generated systemd unit + llama-swap config.yaml):
+  ```bash
+  .venv/bin/python smoke/verify_rendered_units.py
+  ```
 - **GPU fan-ramp non-regression** (launch must not wake any GPU):
   ```bash
   .venv/bin/python smoke/verify_no_gpu_wake.py

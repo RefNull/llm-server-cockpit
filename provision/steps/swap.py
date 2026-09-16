@@ -14,7 +14,7 @@ from typing import Any
 
 import yaml
 
-from provision.common import Runner
+from provision.common import Runner, unit_command, unit_value
 
 log = logging.getLogger("provision")
 
@@ -194,9 +194,9 @@ def _install_unit(repo_root: Path, binary_path: Path, config_path: Path, listen_
     tmpl_path = repo_root / "systemd" / "llama-swap.service.tmpl"
     template = Template(tmpl_path.read_text())
     content = template.substitute(
-        binary_path=str(binary_path),
-        config_path=str(config_path),
-        listen_addr=listen_addr,
+        binary_path=unit_command(str(binary_path)),
+        config_path=unit_command(str(config_path)),
+        listen_addr=unit_command(listen_addr),
         restart_policy=restart_policy,
         restart_sec=str(restart_sec),
     )
@@ -277,7 +277,7 @@ def sync_scheduled_restart(host_profile: dict[str, Any], repo_root: Path, runner
     enabled = cfg.get("enabled", False)
     on_calendar = cfg.get("on_calendar", "daily")
     service_content = (repo_root / "systemd" / "llama-swap-restart.service.tmpl").read_text()
-    timer_content = Template((repo_root / "systemd" / "llama-swap-restart.timer.tmpl").read_text()).substitute(on_calendar=on_calendar)
+    timer_content = Template((repo_root / "systemd" / "llama-swap-restart.timer.tmpl").read_text()).substitute(on_calendar=unit_value(on_calendar))
     _sync_timer_pair("llama-swap-restart", service_content, timer_content, enabled, runner)
 
 
@@ -287,9 +287,10 @@ def sync_update_check_timer(host_profile: dict[str, Any], repo_root: Path, runne
     on_calendar = cfg.get("on_calendar", "daily")
     check_updates_path = repo_root / "bin" / "check-updates"
     service_content = Template((repo_root / "systemd" / "update-check.service.tmpl").read_text()).substitute(
-        check_updates_path=str(check_updates_path), hostname=host_profile["hostname"]
+        check_updates_path=unit_command(str(check_updates_path)),
+        hostname=unit_command(host_profile["hostname"]),
     )
-    timer_content = Template((repo_root / "systemd" / "update-check.timer.tmpl").read_text()).substitute(on_calendar=on_calendar)
+    timer_content = Template((repo_root / "systemd" / "update-check.timer.tmpl").read_text()).substitute(on_calendar=unit_value(on_calendar))
     _sync_timer_pair("llm-server-cockpit-update-check", service_content, timer_content, enabled, runner)
 
 

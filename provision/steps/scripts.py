@@ -12,7 +12,7 @@ from pathlib import Path
 from string import Template
 from typing import Any
 
-from provision.common import Runner
+from provision.common import Runner, unit_command, unit_value
 
 log = logging.getLogger("provision")
 
@@ -48,9 +48,9 @@ def install_unit(script: dict[str, Any], host_profile: dict[str, Any], repo_root
     tmpl_path = repo_root / "systemd" / "python-script.service.tmpl"
     template = Template(tmpl_path.read_text())
     content = template.substitute(
-        script_id=script["id"],
-        working_dir=working_dir,
-        exec_start=_build_exec_start(script),
+        script_id=unit_value(script["id"]),
+        working_dir=unit_value(working_dir),
+        exec_start=unit_command(_build_exec_start(script)),
         restart_policy=restart_policy,
         restart_sec=str(restart_sec),
     )
