@@ -183,10 +183,39 @@ def check_cpu_amd_core_suffix() -> None:
         shutil.rmtree(root, ignore_errors=True)
 
 
+def check_wol_detects_foreign_unit() -> None:
+    """WOL armed by a unit this toolkit did not install must still read as armed.
+
+    The operator's host arms enp6s0 from a hand-written `wol.service`; status() only ever
+    checked `wol-<iface>.service`, so a working setup reported "persistence unit enabled: no".
+    The sysfs wake flag needs neither ethtool nor root nor a particular unit name, which is why
+    it is now the primary signal.
+    """
+    from provision.steps import wol
+
+    root = pathlib.Path(tempfile.mkdtemp())
+    try:
+        power = root / "enp6s0" / "device" / "power"
+        power.mkdir(parents=True)
+        (power / "wakeup").write_text("enabled\n")
+        original, wol._SYSFS_NET = wol._SYSFS_NET, root
+        try:
+            assert wol.read_wakeup_flag("enp6s0") == "enabled", wol.read_wakeup_flag("enp6s0")
+            assert wol.read_wakeup_flag("missing0") is None
+            (power / "wakeup").write_text("disabled\n")
+            assert wol.read_wakeup_flag("enp6s0") == "disabled"
+        finally:
+            wol._SYSFS_NET = original
+        print("read_wakeup_flag(): armed/disabled/absent — PASSED")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def main() -> None:
     _check_board()
     _check_cpu()
     check_cpu_amd_core_suffix()
+    check_wol_detects_foreign_unit()
     _check_memory()
     _check_pci_gpus()
     check_pci_gpus_domain_qualified()

@@ -178,6 +178,48 @@ def _arm_networkmanager(iface: str, runner: Runner) -> None:
     runner.run(["nmcli", "con", "up", conn])
 
 
+def read_wakeup_flag(iface: str) -> str | None:
+    """`/sys/class/net/<iface>/device/power/wakeup` — "enabled" or "disabled".
+
+    The authoritative "is wake armed right now" answer, and the only one that needs neither
+    ethtool nor root nor any particular unit name. It is what an operator checks by hand
+    (`cat /sys/class/net/enp6s0/device/power/wakeup`), and it stays correct on a host where
+    WOL was set up by something other than this toolkit.
+    """
+    try:
+        return (_SYSFS_NET / iface / "device" / "power" / "wakeup").read_text().strip() or None
+    except OSError:
+        return None
+
+
+def find_persistence_unit(iface: str) -> str | None:
+    """An enabled unit that re-arms WOL for `iface`, whatever it is called.
+
+    This used to check only `wol-<iface>.service`, the name run() installs — so a host where
+    the operator had already set WOL up under a different name (`wol.service` is the obvious
+    one) was reported as "persistence unit enabled: no" while working perfectly. Checks the
+    canonical name, then the common bare name, then any unit file in /etc/systemd/system whose
+    ExecStart actually arms this interface. The last step is a plain file read: no systemctl,
+    no root.
+    """
+    for candidate in (f"wol-{iface}.service", "wol.service"):
+        if _is_enabled(candidate):
+            return candidate
+    unit_dir = Path("/etc/systemd/system")
+    needle = re.compile(rf"ethtool\s+-s\s+{re.escape(iface)}\s+wol")
+    try:
+        candidates = sorted(unit_dir.glob("*.service"))
+    except OSError:
+        return None
+    for path in candidates:
+        try:
+            if needle.search(path.read_text()) and _is_enabled(path.name):
+                return path.name
+        except OSError:
+            continue
+    return None
+
+
 def status(host_profile: dict[str, Any]) -> dict[str, Any]:
     """Read-only WOL facts for display (e.g. the cockpit's Settings tab) — reuses run()'s own
     verification helpers but never mutates anything (no ethtool -s, no systemctl enable)."""
@@ -187,12 +229,19 @@ def status(host_profile: dict[str, Any]) -> dict[str, Any]:
     actual_mac = _read_iface_mac(iface)
     mac_matches = actual_mac is not None and actual_mac.lower() == expected_mac.lower()
     wake_flags = _read_wake_flags(iface)
-    unit_enabled = _is_enabled(f"wol-{iface}.service")
+    wakeup = read_wakeup_flag(iface)
+    unit = find_persistence_unit(iface)
+    # armed: sysfs is preferred because it needs no ethtool; ethtool's "Wake-on: g" is the
+    # fallback for a NIC whose driver exposes no power/wakeup attribute.
+    armed = (wakeup == "enabled") if wakeup is not None else (bool(wake_flags) and "g" in wake_flags)
     return {
         "mac_matches": mac_matches,
         "actual_mac": actual_mac,
         "wake_flags": wake_flags,
-        "unit_enabled": unit_enabled,
+        "wakeup_sysfs": wakeup,
+        "armed": armed,
+        "unit_name": unit,
+        "unit_enabled": unit is not None,
     }
 
 

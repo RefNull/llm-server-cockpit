@@ -340,17 +340,19 @@ class DashboardScreen(CockpitScreenBase):
         except Exception as e:
             lines.append(service_row("tailscaled", None, f"error ({e})"))
 
-        wol_cfg = self.host_profile.get("network", {}).get("wol", {})
-        wol_name = f"wol-{wol_cfg.get('interface', 'unknown')}"
+        iface = self.host_profile.get("network", {}).get("wol", {}).get("interface", "unknown")
         try:
             wol_st = wol.status(self.host_profile)
-            flags = wol_st.get("wake_flags") or "unknown"
-            detail = f"wake flags {flags}"
+            # The glyph reports whether wake is ARMED, not whether our own unit exists: a host
+            # where WOL was set up by hand under another unit name is working, and reporting it
+            # as off was the bug. The unit, whatever it is called, is detail.
+            source = wol_st.get("unit_name") or "no persistence unit"
+            detail = f"{wol_st.get('wakeup_sysfs') or wol_st.get('wake_flags') or 'state unknown'} · {source}"
             if not wol_st.get("mac_matches"):
                 detail += f" · MAC drift (actual {wol_st.get('actual_mac') or 'unknown'})"
-            lines.append(service_row(wol_name, bool(wol_st.get("unit_enabled")), detail))
+            lines.append(service_row(f"wake-on-lan ({iface})", bool(wol_st.get("armed")), detail))
         except Exception as e:
-            lines.append(service_row(wol_name, None, f"error ({e})"))
+            lines.append(service_row(f"wake-on-lan ({iface})", None, f"error ({e})"))
 
         lines.append(self._power_row())
         return "\n".join(lines)

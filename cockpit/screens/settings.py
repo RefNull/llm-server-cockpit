@@ -1029,8 +1029,13 @@ class SettingsScreen(CockpitScreenBase):
             lines = [
                 f"MAC matches host profile: {'yes' if status['mac_matches'] else 'no'} "
                 f"(actual: {status['actual_mac'] or 'unknown'})",
-                f"Wake-on-LAN flags: {status['wake_flags'] or 'unknown'}",
-                f"persistence unit enabled: {'yes' if status['unit_enabled'] else 'no'}",
+                # sysfs first: it needs no ethtool, so it still answers on a host where the
+                # package is absent — which used to make this read as a failure on a machine
+                # with working WOL.
+                f"wake armed: {'yes' if status.get('armed') else 'no'}"
+                f" (power/wakeup: {status.get('wakeup_sysfs') or 'n/a'},"
+                f" ethtool: {status['wake_flags'] or 'n/a'})",
+                f"persistence unit: {status.get('unit_name') or 'none found'}",
             ]
             text = "\n".join(lines)
         except Exception as e:
