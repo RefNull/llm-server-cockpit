@@ -181,6 +181,7 @@ class DownloadsScreen(CockpitScreenBase):
                 # Per-model download is the in-table [ Download ] action column. This one is
                 # the genuine bulk case, not a second way to act on a selection.
                 yield Button("Download all missing", id="btn-download-all", variant="primary", classes="thin-button")
+                yield Button("Scan models folder", id="btn-scan-models", classes="thin-button")
 
             with Horizontal(classes="action-row-secondary"):
                 yield Static("", id="disk-usage")
@@ -352,7 +353,9 @@ class DownloadsScreen(CockpitScreenBase):
         # No `await` on a @work method: the decorator returns a Worker, which is not
         # awaitable — awaiting one raises TypeError and takes down the app. The worker is
         # already running by the time the call returns; there is nothing to wait for here.
-        if event.button.id == "btn-download-all":
+        if event.button.id == "btn-scan-models":
+            self._on_scan_models()
+        elif event.button.id == "btn-download-all":
             self._on_download_all_missing()
         elif event.button.id == "track-btn":
             self._on_track_model()
@@ -360,6 +363,96 @@ class DownloadsScreen(CockpitScreenBase):
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id == "track-model-input":
             self._on_track_model()
+
+    def _build_model_entry(self, repo_id: str, quant_file: str, taken_ids: set[str]) -> dict[str, Any]:
+        """One models.yaml entry. Shared by "Track" and the disk scan so both produce the same
+        shape — id derived from the filename, bound to the first declared GPU/backend, which is
+        a starting point the operator edits on the Models tab rather than a claim about where
+        it should run."""
+        stem = Path(quant_file).stem
+        clean_id = re.sub(r"[^a-zA-Z0-9_\.\-]", "-", stem).lower().strip("-") or "model"
+        candidate_id = clean_id
+        counter = 2
+        while candidate_id in taken_ids:
+            candidate_id = f"{clean_id}-{counter}"
+            counter += 1
+        gpus = self.host_profile.get("gpus", [])
+        gpu_id = gpus[0]["id"] if gpus else "gpu-0"
+        backend = gpus[0]["backends"][0] if gpus and gpus[0].get("backends") else "cuda"
+        return {
+            "id": candidate_id,
+            "engine": "llama-cpp",
+            "repo_id": repo_id,
+            "quant_file": quant_file,
+            "bind": {"gpu": gpu_id, "backend": backend},
+            "ttl": 300,
+        }
+
+    def _find_untracked_ggufs(self) -> tuple[list[str], str | None]:
+        """Every .gguf under models_dir that models.yaml does not already name, as paths
+        RELATIVE to models_dir — `quant_file` is joined onto models_dir by hf.model_status, so a
+        nested file only resolves if it is stored relative. Returns (files, error)."""
+        models_dir = Path(self.host_profile["paths"]["models_dir"])
+        if not models_dir.is_dir():
+            return [], f"{models_dir} does not exist — check paths.models_dir in Settings > Host Profile"
+        tracked = {m.get("quant_file") for m in self.models.get("models", [])}
+        found = sorted(
+            str(p.relative_to(models_dir))
+            for p in models_dir.rglob("*.gguf")
+            if p.is_file() and str(p.relative_to(models_dir)) not in tracked
+        )
+        return found, None
+
+    @work
+    async def _on_scan_models(self) -> None:
+        """Register every .gguf already sitting in models_dir that models.yaml does not know.
+
+        repo_id is recorded as "local": the file did not come from a repo, and inventing one
+        would be a claim this app cannot support. hf.model_status keys "downloaded" off the
+        file existing rather than off repo_id, so these rows read correctly; and because
+        "local" can never return HTTP 200 from the Hub, the Download action stays unavailable
+        for them instead of offering to fetch something that has no source.
+        """
+        found, error = self._find_untracked_ggufs()
+        if error:
+            self.notify(error, severity="error")
+            return
+        if not found:
+            self.notify("no untracked .gguf files in the models folder")
+            return
+
+        listing = "\n".join(f"  {name}" for name in found[:12])
+        if len(found) > 12:
+            listing += f"\n  ... and {len(found) - 12} more"
+        confirmed = await self.confirm(
+            f"Add {len(found)} model(s) found on disk to models.yaml?\n{listing}\n\n"
+            "Each is bound to the first declared GPU/backend — adjust on the Models tab.",
+            confirm_label="Add",
+        )
+        if not confirmed:
+            return
+
+        models_list = list(self.models.get("models", []))
+        taken = {m.get("id") for m in models_list}
+        for quant_file in found:
+            entry = self._build_model_entry("local", quant_file, taken)
+            taken.add(entry["id"])
+            models_list.append(entry)
+        try:
+            validated = schema.validate_models_dict(
+                {"models": models_list}, self.host_profile, self.manifest, source="models.yaml"
+            )
+            (self.repo_root / "models.yaml").write_text(
+                yaml.safe_dump(validated, sort_keys=False), encoding="utf-8"
+            )
+            self.cockpit_app.reload_models()
+            self.models = self.cockpit_app.models
+        except Exception as e:
+            self.notify(f"could not write models.yaml: {e}", severity="error")
+            return
+        self.notify(f"added {len(found)} model(s) from disk")
+        self._refresh_table()
+        self._refresh_disk_usage()
 
     @staticmethod
     def _parse_track_input(raw: str) -> tuple[str, str] | None:
@@ -417,27 +510,7 @@ class DownloadsScreen(CockpitScreenBase):
             self.notify(f"already tracked as {existing['id']!r}", severity="warning")
             return
 
-        stem = Path(quant_file).stem
-        clean_id = re.sub(r"[^a-zA-Z0-9_\.\-]", "-", stem).lower().strip("-") or "model"
-        candidate_id = clean_id
-        existing_ids = {m.get("id") for m in self.models.get("models", [])}
-        counter = 2
-        while candidate_id in existing_ids:
-            candidate_id = f"{clean_id}-{counter}"
-            counter += 1
-
-        gpus = self.host_profile.get("gpus", [])
-        gpu_id = gpus[0]["id"] if gpus else "gpu-0"
-        backend = gpus[0]["backends"][0] if gpus and gpus[0].get("backends") else "cuda"
-
-        target_model = {
-            "id": candidate_id,
-            "engine": "llama-cpp",
-            "repo_id": repo_id,
-            "quant_file": quant_file,
-            "bind": {"gpu": gpu_id, "backend": backend},
-            "ttl": 300,
-        }
+        target_model = self._build_model_entry(repo_id, quant_file, {m.get("id") for m in self.models.get("models", [])})
         models_list = list(self.models.get("models", []))
         models_list.append(target_model)
         candidate_data = {"models": models_list}
@@ -457,7 +530,7 @@ class DownloadsScreen(CockpitScreenBase):
             return
 
         self.query_one("#track-model-input", Input).value = ""
-        self.notify(f"tracking {candidate_id!r} — checking Hugging Face status...")
+        self.notify(f"tracking {target_model['id']!r} — checking Hugging Face status...")
         self._refresh_table()
 
     @work
