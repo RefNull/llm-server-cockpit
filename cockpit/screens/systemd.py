@@ -20,7 +20,7 @@ from rich.text import Text
 from textual import work
 from textual.app import ComposeResult
 from textual.containers import Horizontal, VerticalScroll
-from textual.widgets import Button, DataTable, Static
+from textual.widgets import Button, DataTable, Input, Static
 
 from cockpit.widgets import (
     CockpitScreenBase,
@@ -64,6 +64,9 @@ class SystemdScreen(CockpitScreenBase):
         self._units: dict[str, dict[str, Any]] = {}
         self._hidden: set[str] = self._load_hidden()
         self._show_hidden = False
+        self._filter = ""
+        # Last fetch, so typing re-filters in memory instead of re-running systemctl per keypress.
+        self._last_units: list[dict[str, Any]] = []
 
     # ------------------------------------------------------------------ hide list
 
@@ -92,6 +95,9 @@ class SystemdScreen(CockpitScreenBase):
 
     def compose(self) -> ComposeResult:
         with VerticalScroll():
+            # Filter above the table it filters, never inside an action row (DESIGN.md §3.2).
+            with Horizontal(classes="inline-row", id="systemd-filter-row"):
+                yield Input(placeholder="Filter units (substring, case-insensitive)", id="systemd-filter")
             table = SingleClickDataTable(id="systemd-table", zebra_stripes=True, classes="data-table")
             table.cursor_type = "row"
             yield table
@@ -144,9 +150,15 @@ class SystemdScreen(CockpitScreenBase):
         if not self.is_mounted:
             return
         self._units = {u["unit"]: u for u in units}
+        self._last_units = units
         table = self.query_one("#systemd-table", SingleClickDataTable)
         table.clear()
-        visible = [u for u in units if (u["unit"] in self._hidden) == self._show_hidden]
+        needle = self._filter.strip().lower()
+        visible = [
+            u for u in units
+            if (u["unit"] in self._hidden) == self._show_hidden
+            and (not needle or needle in u["unit"].lower() or needle in u.get("description", "").lower())
+        ]
         for unit in visible:
             name = unit["unit"]
             active = unit["active"]
@@ -169,7 +181,9 @@ class SystemdScreen(CockpitScreenBase):
         )
         scope = "hidden" if self._show_hidden else "visible"
         self.query_one("#systemd-status", Static).update(
-            f"{shown} {scope} unit(s) · {hidden_count} hidden of {total} loaded"
+            f"{shown} {scope} unit(s)"
+            + (f" matching {self._filter.strip()!r}" if self._filter.strip() else "")
+            + f" · {hidden_count} hidden of {total} loaded"
             if total
             else "no units loaded — is systemd available on this host?"
         )
@@ -216,6 +230,14 @@ class SystemdScreen(CockpitScreenBase):
         self.app.call_from_thread(self._refresh_table)
 
     # ------------------------------------------------------------------ buttons
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id != "systemd-filter":
+            return
+        # Re-render from the last fetch. `systemctl list-units` per keystroke would spawn a
+        # subprocess per character on a list this long.
+        self._filter = event.value
+        self._apply_rows(self._last_units)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         button_id = event.button.id or ""

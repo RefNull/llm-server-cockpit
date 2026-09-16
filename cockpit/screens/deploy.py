@@ -549,8 +549,13 @@ class DeployScreen(CockpitScreenBase):
 
     def compose(self) -> ComposeResult:
         with VerticalScroll():
-            table = SingleClickDataTable(id="models-table", classes="data-table")
-            yield table
+            # Split by what each row costs at rest, which is the question an operator actually
+            # has about a model catalogue: "what is pinned in my VRAM right now?" Both tables
+            # carry identical columns and actions — the split is the information.
+            yield Static("Resident — loaded on first request, never unloaded", classes="section-title")
+            yield SingleClickDataTable(id="models-resident", classes="data-table")
+            yield Static("Swappable — evicted after idle", classes="section-title")
+            yield SingleClickDataTable(id="models-swappable", classes="data-table")
             with Horizontal(classes="action-row-primary"):
                 yield Button("Apply & Restart Service", id="btn-apply", variant="primary", classes="thin-button")
                 yield Static("│", classes="action-row-divider")
@@ -560,24 +565,44 @@ class DeployScreen(CockpitScreenBase):
             yield Static("", id="status-message", classes="status-text")
 
     def on_mount(self) -> None:
-        table = self.query_one("#models-table", SingleClickDataTable)
-        table.cursor_type = "row"
-        table.add_column("ID", width=24)
-        table.add_column("Engine", width=12)
-        table.add_column("GPU", width=10)
-        table.add_column("Backend", width=10)
-        table.add_column("Group", width=12)
-        table.add_column("TTL", width=8)
-        table.add_action_column(TableAction("edit", "Edit"))
-        table.add_action_column(
-            TableAction("delete", "Delete", destructive=True, confirm="Delete model {row} from models.yaml?")
-        )
+        for table_id in ("#models-resident", "#models-swappable"):
+            table = self.query_one(table_id, SingleClickDataTable)
+            table.cursor_type = "row"
+            # Content 79 + actions 18 = 97, render 97 + 2*8 = 113 (DESIGN.md §4).
+            table.add_column("ID", width=24)
+            table.add_column("Engine", width=12)
+            table.add_column("GPU", width=10)
+            table.add_column("Backend", width=10)
+            table.add_column("Group", width=12)
+            table.add_column("TTL", width=11)
+            table.add_action_column(TableAction("edit", "Edit"))
+            table.add_action_column(
+                TableAction("delete", "Delete", destructive=True, confirm="Delete model {row} from models.yaml?")
+            )
         self._populate_table()
 
+    @staticmethod
+    def _is_resident(model: dict) -> bool:
+        """True when this model, once requested, stays in VRAM.
+
+        Two ways that happens, both from upstream llama-swap's own documentation:
+        `ttl: 0` is "a ttl of 0 will mean never unload", and group membership is resident here
+        because this repo only ever emits `swap: false` for a group
+        (provision/steps/swap.py::_generate_config), which upstream defines as "all members can
+        run together, no swapping".
+
+        An omitted ttl is NOT resident: upstream's default is "-1 (use global default)", and
+        swap.py now leaves it out rather than writing 0.
+        """
+        return model.get("ttl") == 0 or bool(model.get("group"))
+
     def _populate_table(self) -> None:
-        table = self.query_one("#models-table", SingleClickDataTable)
-        table.clear()
+        resident = self.query_one("#models-resident", SingleClickDataTable)
+        swappable = self.query_one("#models-swappable", SingleClickDataTable)
+        resident.clear()
+        swappable.clear()
         for m in self.models.get("models", []):
+            table = resident if self._is_resident(m) else swappable
             if m["engine"] == "llama-cpp":
                 gpu = m.get("bind", {}).get("gpu", "")
                 backend = m.get("bind", {}).get("backend", "")
@@ -592,7 +617,7 @@ class DeployScreen(CockpitScreenBase):
                 Text(gpu),
                 Text(backend),
                 Text(m.get("group", "")),
-                Text(str(m.get("ttl", ""))),
+                Text("0 (pinned)" if m.get("ttl") == 0 else str(m.get("ttl", "default"))),
                 *table.action_cells(m["id"]),
                 key=m["id"],
             )
