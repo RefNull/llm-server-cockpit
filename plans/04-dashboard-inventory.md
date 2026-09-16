@@ -1,7 +1,13 @@
 # Plan: Dashboard → Static System Inventory
 
-Baseline: HEAD `00e6a76`. Source: operator scope decision, 2026-09-16, after two fan-ramp
+Baseline: HEAD `0cb589f`. Source: operator scope decision, 2026-09-16, after two fan-ramp
 incidents (`5c986a4`, `b799d83`) traced to GPU telemetry.
+
+**Decisions taken 2026-09-16** (see the homestack/PiDeployment merge audit, same date):
+- **x86-64 only. Raspberry Pi is out of scope — it always was, structurally.** See §0c.
+- **No merge with homestack.** The two projects split by *workload*, not hardware: homestack
+  deploys home services (DNS, media, Samba, backups), this deploys LLM inference. Both run on
+  Debian. Nothing in this plan reaches for a shared abstraction with it.
 
 **Goal**: delete live system measurement from the cockpit. This toolkit deploys LLM services;
 monitoring the host belongs elsewhere. The Dashboard becomes a static inventory — left column
@@ -22,6 +28,8 @@ monitoring the host belongs elsewhere. The Dashboard becomes a static inventory 
    the glyph column is scannable.
 5. **What this deliberately gives up**: "is the GPU busy right now". `nvidia-smi`, `nvtop` and
    any real monitoring stack answer that better. Nothing in the deploy workflow reads it.
+6. **Single platform target: x86-64 Debian with a discrete GPU.** The left column reads DMI,
+   not device-tree. Adding a second platform is a schema change first (§0c), not a reader.
 
 ## Non-goals
 
@@ -84,15 +92,23 @@ at 6 operations. Phases 2 and 3 must reuse these, not add readers.
 
 ### 0c. Static identity sources — files (VERIFY ON TARGET)
 
+**Platform scope: x86-64 Debian only.** This is not a preference, it is what the code already
+enforces. `provision/schema.py:69-80` *requires* a non-empty `gpus` list where every entry has
+`vendor ∈ {nvidia, amd, intel}` and `backends ∈ {cuda, rocm, vulkan, sycl}`. There is no
+CPU-only backend in `manifest.yaml`. **A Raspberry Pi cannot be expressed in a host profile at
+all** — it would fail validation before any screen rendered. Supporting one is a schema and
+manifest change (a CPU-only backend, a relaxed vendor enum), not a device-tree reader, and it
+is not in this plan.
+
+So: **no `/proc/device-tree`, no Pi revision parsing.** Drop them; they were speculative.
+
 The dev machine is macOS; none of these could be read here. **Phase 1 must verify each on the
 real host before relying on it**, and every reader must degrade to `None` rather than raise.
 
 | Fact | Path | Notes |
 |---|---|---|
-| Board model (Pi, ARM) | `/proc/device-tree/model` | NUL-terminated; strip `\x00`. Also at `/sys/firmware/devicetree/base/model`. |
-| Board model (x86) | `/sys/class/dmi/id/product_name`, `sys_vendor`, `board_name` | World-readable, unlike `dmidecode`, which needs root — **do not use `dmidecode`**. |
-| CPU model | `/proc/cpuinfo` | Key is `model name` on x86 and `Model` on a Pi. Handle both. |
-| Pi board revision | `/proc/cpuinfo` `Revision` key | Pi-specific; absent on x86. |
+| Board model | `/sys/class/dmi/id/product_name`, `sys_vendor`, `board_name` | World-readable, unlike `dmidecode`, which needs root — **do not use `dmidecode`**. |
+| CPU model | `/proc/cpuinfo` | Key is `model name` on x86-64. |
 | RAM total | `/proc/meminfo` `MemTotal` (kB) | Existing reader: `provision/steps/metrics.py:66-70` (`read_mem`) — copy the parse, drop `MemAvailable`/used/percent. |
 
 **Negative result, verified by exhaustive repo-wide grep**: nothing in this repo reads
@@ -186,8 +202,9 @@ def read_all() -> dict         # the four above, one call for the screen
 - [ ] `.venv/bin/python -c "from provision.steps import sysinfo; print(sysinfo.read_all())"`
       runs on macOS without raising, returning `None`/`unknown` for everything.
 - [ ] A fixture-tree test (copy the shape of the `wol.list_interfaces` test written for
-      `_SYSFS_NET`) covers: Pi device-tree model with a trailing NUL, x86 DMI files,
-      `model name` vs `Model` in cpuinfo, and every file missing.
+      `_SYSFS_NET`) covers: DMI files present, DMI files absent, `model name` present and
+      absent in cpuinfo, a `MemTotal`-less meminfo, and `/etc/os-release` missing entirely
+      (`platform.freedesktop_os_release()` raises `OSError` — §0b).
 - [ ] Run it **on haupe-server** and paste the real output into the phase's completion note.
       This is the only way to confirm 0c.
 - [ ] `grep -rn "subprocess\|shutil.which" provision/steps/sysinfo.py` returns nothing.
@@ -203,17 +220,21 @@ def read_all() -> dict         # the four above, one call for the screen
 
 ```
 System
-  Model        Raspberry Pi 5 Model B Rev 1.0
-  CPU          4 × Cortex-A76
-  Memory       8.0 GB
-  OS           Debian GNU/Linux 12 (bookworm)
-  Kernel       6.6.51+rpt-rpi-2712 (aarch64)
+  Model        ASUS System Product Name (PRIME Z790-P)
+  CPU          24 × 13th Gen Intel(R) Core(TM) i9-13900K
+  Memory       64.0 GB
+  OS           Debian GNU/Linux 13 (trixie)
+  Kernel       6.12.9-amd64 (x86_64)
   Cockpit      v2026.09.01
 
 Accelerators
   gpu-nvidia   nvidia · cuda, vulkan · driver 550.127.05, CUDA 12.4
   gpu-intel    intel · vulkan, sycl · driver not checked
 ```
+
+Values above are illustrative. Phase 1's completion note must paste the **real** output from
+haupe-server — the DMI strings in particular are frequently vendor junk ("System Product Name"
+is a real, common value), and the panel has to look sane when they are.
 
 - Accelerator rows come from `host_profile["gpus"]` (declared) joined to
   `drivers.read_lockfile_status()` (captured). A GPU with no lockfile entry renders
@@ -330,6 +351,7 @@ launch" and then that `Sample GPUs` takes exactly one reading. Both halves chang
 .venv/bin/python smoke/verify_screens.py
 .venv/bin/python smoke/verify_no_gpu_wake.py
 .venv/bin/python smoke/verify_runner_sudo.py
+.venv/bin/python smoke/verify_rendered_units.py
 .venv/bin/python -c "from provision import schema; from pathlib import Path; r=Path('.'); m=schema.load_manifest(r/'manifest.yaml'); h=schema.load_host_profile(r/'hosts/example.yaml'); schema.load_models(r/'models.example.yaml',h,m); print('schema OK')"
 ```
 - [ ] Launch subprocess trace: **6 or fewer** operations, none duplicated (the `00e6a76`
@@ -367,7 +389,6 @@ but it belongs in its own commit, not this plan.
    Cost is one subprocess at launch (6 → 7) and a `bash -c` pipeline whose output shape has
    never been asserted by a test. **Recommendation: include it**, behind a reader that degrades
    to the declared id, and add a fixture test for the parse. Your call.
-5. **Raspberry Pi is the example you gave, but is it a real target?** `hosts/haupe-server.yaml`
-   is x86 with an NVIDIA + Intel GPU. Supporting Pi device-tree reads is cheap, but if no Pi is
-   ever going to run this, the x86 DMI path is the only one that needs verifying and the plan
-   gets shorter.
+5. ~~**Raspberry Pi — is it a real target?**~~ **RESOLVED 2026-09-16: no.** The host schema
+   cannot represent a Pi (§0c), and the Pi keeps running homestack, which is the tool for it.
+   Device-tree reading is dropped from Phase 1.
