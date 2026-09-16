@@ -401,7 +401,11 @@ class SettingsScreen(CockpitScreenBase):
                             yield Button("Check / Enable Tailscale", id="btn-check-tailscale", variant="warning", classes="thin-button")
 
     def on_mount(self) -> None:
-        self._populate_profile_form()
+        # prevent(): _populate_profile_form assigns #f-vpn-interface.value, which fires
+        # Input.Changed, which re-runs `ip -4 addr` — a shell-out nobody asked for, at launch,
+        # on a tab that isn't even visible.
+        with self.prevent(Input.Changed):
+            self._populate_profile_form()
         table = self.query_one("#gpu-table", CockpitDataTable)
         table.cursor_type = "row"
         table.add_column("GPU ID", width=16)
@@ -413,18 +417,19 @@ class SettingsScreen(CockpitScreenBase):
         if self.host_profile is None:
             self._populate_wizard_gpu_table()
         else:
+            # Form population is local and free; the three status reads shell out, so they wait
+            # for ensure_first_view() (see on_refresh_requested, which is what it calls).
             self._render_gpu_list()
-            self._populate_service_form()
-            self._refresh_wol_status()
-            self._refresh_drivers_status()
-            self._refresh_tailscale_status()
-
-        self._update_vpn_preview(self.query_one("#f-vpn-interface", Input).value)
+            with self.prevent(Input.Changed):
+                self._populate_service_form()
 
     def on_refresh_requested(self) -> None:
-        """Called by CockpitApp.action_refresh_all — re-reads WOL/driver/Tailscale status only."""
+        """Called by CockpitApp.action_refresh_all, and by ensure_first_view the first time
+        this tab is shown. Every read here shells out, which is exactly why none of it happens
+        at mount any more."""
         if self.host_profile is None:
             return
+        self._update_vpn_preview(self.query_one("#f-vpn-interface", Input).value)
         self._refresh_wol_status()
         self._refresh_drivers_status()
         self._refresh_tailscale_status()

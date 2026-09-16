@@ -199,8 +199,7 @@ class DownloadsScreen(CockpitScreenBase):
         table.add_column("Size", width=10)
         table.add_column("Release Date", width=12)
         table.add_action_column(TableAction("download", "Download", confirm="Download {row}?", available=self._can_download))
-        self._refresh_table()
-        self._refresh_disk_usage()
+        # No data read here — ensure_first_view() does it when this tab is first shown.
 
     # ------------------------------------------------------------------
     # Rendering

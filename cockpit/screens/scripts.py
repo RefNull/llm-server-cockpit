@@ -303,7 +303,7 @@ class ScriptsScreen(CockpitScreenBase):
         table.add_action_column(
             TableAction("remove", "Remove", destructive=True, confirm="Remove script {row} from scripts.yaml?")
         )
-        self._refresh_table()
+        # No data read here — ensure_first_view() does it when this tab is first shown.
 
     def on_refresh_requested(self) -> None:
         self.scripts = getattr(self.cockpit_app, "scripts", self.scripts)

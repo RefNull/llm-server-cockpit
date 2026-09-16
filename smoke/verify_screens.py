@@ -10,7 +10,9 @@ import asyncio
 import inspect
 import os
 import shutil
+import subprocess
 import tempfile
+import urllib.request
 from pathlib import Path
 import sys
 
@@ -109,6 +111,61 @@ def _assert_no_awaited_workers() -> None:
                 rel = path.relative_to(_REPO_ROOT)
                 offenders.append(f"{rel}:{node.lineno}: await self.{func.attr}() — {func.attr} is @work")
     assert not offenders, "awaited @work method(s):\n  " + "\n  ".join(offenders)
+
+
+async def _assert_launch_defers_hidden_tabs() -> None:
+    """A tab the operator cannot see must do no I/O until it is opened.
+
+    Textual mounts every TabPane's content up front, so each screen's initial load used to fire
+    at launch — seven screens' worth of subprocesses and four GitHub calls to render the one
+    tab on screen, with the same facts fetched two and three times over. Data reads therefore
+    live in on_first_view (CockpitScreenBase.ensure_first_view), never on_mount.
+
+    Probed with the upstream version check: the Dashboard's own upstream line legitimately
+    costs 2 GitHub calls at launch, and the Backends tab's check must add its 2 only when that
+    tab is actually opened.
+    """
+    calls: list[str] = []
+    real_urlopen = urllib.request.urlopen
+    real_popen = subprocess.Popen
+
+    class _Popen(real_popen):  # type: ignore[misc]
+        def __init__(self, cmd, *a, **k):
+            calls.append(cmd if isinstance(cmd, str) else " ".join(str(c) for c in cmd[:3]))
+            super().__init__(cmd, *a, **k)
+
+    def _urlopen(req, *a, **k):
+        calls.append("NET " + (req if isinstance(req, str) else req.full_url).split("?")[0])
+        return real_urlopen(req, *a, **k)
+
+    # run() funnels through Popen, so wrapping only Popen counts each spawn exactly once.
+    subprocess.Popen = _Popen
+    urllib.request.urlopen = _urlopen
+    try:
+        app = CockpitApp(host="example")
+        async with app.run_test(size=(121, 30)) as pilot:
+            await pilot.pause(2.5)
+            launch = list(calls)
+            duplicated = {c: launch.count(c) for c in set(launch) if launch.count(c) > 1}
+            assert not duplicated, f"launch repeats the same work: {duplicated}"
+            github = [c for c in launch if "api.github.com" in c]
+            assert len(github) <= 2, f"launch made {len(github)} GitHub calls, expected the Dashboard's 2: {github}"
+
+            # Opening Backends must now do the work that used to happen at launch.
+            app.query_one("#main-tabs", TabbedContent).active = "llm"
+            await pilot.pause(0.2)
+            app.query_one("#llm-tabs", TabbedContent).active = "backends"
+            await pilot.pause(2.0)
+            opened = [c for c in calls if "api.github.com" in c]
+            assert len(opened) > len(github), (
+                "opening Backends ran no upstream check — its first-view load never fired, so "
+                "this check cannot tell deferral from deletion"
+            )
+        print(f"launch: {len(launch)} operations, none duplicated, {len(github)} GitHub calls; "
+              f"Backends adds {len(opened) - len(github)} more only when opened")
+    finally:
+        subprocess.Popen = real_popen
+        urllib.request.urlopen = real_urlopen
 
 
 def _assert_apply_service_ignores_wol() -> None:
@@ -262,6 +319,7 @@ async def verify_geometry_and_export_screenshots() -> None:
     print("No awaited @work methods.")
     _assert_apply_service_ignores_wol()
     print("Apply Service Settings does not read the WOL fields.")
+    await _assert_launch_defers_hidden_tabs()
 
     out_dir = _REPO_ROOT / "screenshots" / "verification"
     out_dir.mkdir(parents=True, exist_ok=True)

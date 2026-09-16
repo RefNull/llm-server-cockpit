@@ -220,7 +220,7 @@ class DashboardScreen(CockpitScreenBase):
         # visible 0% bar next to "not sampled" would be a made-up reading (decision 0d.4).
         for row in self.query(".gpu-bar-row"):
             row.display = False
-        self._refresh_all()
+        # No data read here — ensure_first_view() does it when this tab is first shown.
 
     def on_refresh_requested(self) -> None:
         """Called by CockpitApp.action_refresh_all — same pattern every other screen follows."""

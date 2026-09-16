@@ -797,6 +797,7 @@ class CockpitScreenBase(Widget):
     """
 
     _privileged_runner: Runner | None = None
+    _first_view_done: bool = False
 
     def on_mount(self) -> None:
         if type(self).on_refresh_requested is CockpitScreenBase.on_refresh_requested:
@@ -818,6 +819,30 @@ class CockpitScreenBase(Widget):
     def on_refresh_requested(self) -> None:
         """Re-read this tab's state. Called by CockpitApp.action_refresh_all ('r')."""
         raise NotImplementedError
+
+    def on_first_view(self) -> None:
+        """This tab's initial data load, run the first time it is actually visible.
+
+        Defaults to the same work as a refresh, which is what most tabs want. Override only
+        when first view legitimately does more than a refresh does — BuildsScreen's upstream
+        version check is the one case (a network call that 'r' deliberately does not repeat).
+        """
+        self.on_refresh_requested()
+
+    def ensure_first_view(self) -> bool:
+        """Run on_first_view() once, the first time this tab becomes visible.
+
+        Textual mounts every TabPane's content up front, so without this every screen's initial
+        load fires at launch even though the operator can only see one of them — 20 subprocesses
+        and 4 GitHub calls to render the Dashboard. Data reads therefore belong here, not in
+        on_mount; on_mount stays for structure (table columns, form population) that costs
+        nothing.
+        """
+        if self._first_view_done:
+            return False
+        self._first_view_done = True
+        self.on_first_view()
+        return True
 
     @property
     def privileged_runner(self) -> Runner:

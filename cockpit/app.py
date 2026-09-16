@@ -229,6 +229,26 @@ class CockpitApp(App):
                     yield SettingsScreen(self.host_profile, self.manifest, self.models, self.runner, self.repo_root, self)
         yield Footer()
 
+    def on_mount(self) -> None:
+        # After the first layout pass, so is_on_screen is meaningful.
+        self.call_after_refresh(self._load_visible_screens)
+
+    def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
+        """Bubbles up from the outer tab bar and from every nested one, which is what makes a
+        two-level tab (LLM > Backends) load when both levels finally point at it."""
+        self.call_after_refresh(self._load_visible_screens)
+
+    def _load_visible_screens(self) -> None:
+        """Give every screen the operator can currently see its one-time initial load.
+
+        `is_on_screen` is false for anything in an inactive TabPane, so this is what defers the
+        other tabs' work instead of doing all seven at launch (see
+        CockpitScreenBase.ensure_first_view).
+        """
+        for screen in self.query(CockpitScreenBase):
+            if screen.is_on_screen:
+                screen.ensure_first_view()
+
     def action_refresh_all(self) -> None:
         self.reload_models()
         self.reload_scripts()

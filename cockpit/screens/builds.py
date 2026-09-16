@@ -422,15 +422,19 @@ class BuildsScreen(CockpitScreenBase):
             )
         )
 
-        self._refresh_backends_table()
-        # Initial check on mount so the panel isn't blank; the button below is for
-        # re-checking on demand afterwards — refresh (the 'r' binding) never re-hits it.
-        self._run_update_check(notify_result=False)
+        # No data read here — ensure_first_view() does it when this tab is first shown.
 
     def on_refresh_requested(self) -> None:
         """Called by the app's global 'r' binding. Re-reads local (manifest/check) state —
         never re-triggers the network update check."""
         self._refresh_backends_table()
+
+    def on_first_view(self) -> None:
+        """The one screen whose first view does more than a refresh: the upstream version
+        check is a network call, so it runs once when the tab is first opened and then only on
+        the explicit button — never on 'r'."""
+        self._refresh_backends_table()
+        self._run_update_check(notify_result=False)
 
     # ------------------------------------------------------------------ rendering
 

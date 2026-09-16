@@ -93,6 +93,12 @@ Textual's `Tabs` is `height: 2`, docked top, with no bottom margin, and `TabPane
 
 ## 3. Page Structure Rules
 
+0. **A hidden tab does no I/O**:
+   - Textual mounts every `TabPane`'s content up front, so every screen's `on_mount` fires at launch even though the operator can only see one tab. Left unmanaged that meant seven screens' initial loads to render the Dashboard — the same facts fetched two and three times over (`ip -4 addr` ×3, `docker ps` ×2, four GitHub calls).
+   - **`on_mount` is for structure only** — table columns, form population, anything free. **Every data read belongs in `on_first_view()`**, which `CockpitScreenBase.ensure_first_view` runs the first time the tab is actually visible (`CockpitApp._load_visible_screens`, driven by `TabbedContent.TabActivated` and keyed on `is_on_screen`). It defaults to `on_refresh_requested()`, which is what most tabs want; override it only when first view legitimately does more than a refresh (`BuildsScreen`'s upstream version check, which `r` deliberately never repeats).
+   - Beware self-inflicted reads: assigning to an `Input`'s `value` while populating a form fires `Input.Changed`, and a handler on it can shell out. Wrap form population in `self.prevent(Input.Changed)`.
+   - **Enforcement**: `smoke/verify_screens.py` asserts launch spawns no command twice and makes at most the Dashboard's own 2 GitHub calls, then that opening Backends adds its own — so the check can tell deferral from deletion.
+
 1. **Max Tables per Screen**:
    - **Ceiling**: Maximum of **3** `DataTable` widgets per screen.
    - **Precedent**: Established by [`cockpit/screens/builds.py`](file:///Users/nystrom/GitHub/llm-server-cockpit/cockpit/screens/builds.py) which renders 3 tables (`backends-table`, `builds-table`, and `history-table`, with `backends-table` added during upstream feature additions). Exceeding 3 tables requires splitting workflows into distinct sub-views or tab panes rather than stacking.

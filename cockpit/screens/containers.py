@@ -107,7 +107,7 @@ class ContainersScreen(CockpitScreenBase):
         # Not destructive (that's $error-styled, reserved for Remove/Delete, DESIGN.md §9) —
         # restarting a container is tier 2 (mutates_system), confirmed, but reversible.
         table.add_action_column(TableAction("restart", "Restart", confirm="Restart {row}?"))
-        self._refresh_table()
+        # No data read here — ensure_first_view() does it when this tab is first shown.
 
     def on_refresh_requested(self) -> None:
         self._refresh_table()
