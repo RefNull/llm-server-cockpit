@@ -163,9 +163,30 @@ def check_pci_gpus_domain_qualified() -> None:
         shutil.rmtree(stub, ignore_errors=True)
 
 
+def check_cpu_amd_core_suffix() -> None:
+    """AMD's model string carries the physical core count; the Dashboard already prints the
+    thread count beside it. Real string from haupe-server, 2026-09-16."""
+    root = pathlib.Path(tempfile.mkdtemp())
+    try:
+        (root / "cpuinfo").write_text(
+            "processor\t: 0\nvendor_id\t: AuthenticAMD\n"
+            "model name\t: AMD Ryzen 7 7800X3D 8-Core Processor\n"
+        )
+        original, sysinfo._PROC = sysinfo._PROC, root
+        try:
+            got = sysinfo.read_cpu()["model"]
+        finally:
+            sysinfo._PROC = original
+        assert got == "AMD Ryzen 7 7800X3D 8-Core Processor".replace(" 8-Core Processor", ""), got
+        print(f"read_cpu(): AMD core-count suffix stripped -> {got!r} — PASSED")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def main() -> None:
     _check_board()
     _check_cpu()
+    check_cpu_amd_core_suffix()
     _check_memory()
     _check_pci_gpus()
     check_pci_gpus_domain_qualified()

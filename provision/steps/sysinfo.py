@@ -48,6 +48,13 @@ def read_os() -> dict[str, Any]:
     return {"pretty_name": pretty_name, "kernel": kernel, "arch": arch}
 
 
+# AMD puts the physical core count inside the model string ("AMD Ryzen 7 7800X3D 8-Core
+# Processor"), Intel does not. Left in, the Dashboard renders "16 x AMD Ryzen 7 7800X3D 8-Core
+# Processor" — the 16 is threads and the 8 is cores, so the line states two different counts
+# and looks like a bug. Observed on haupe-server, 2026-09-16.
+_CORE_SUFFIX_RE = re.compile(r"\s+\d+-Core Processor\s*$", re.IGNORECASE)
+
+
 def read_cpu() -> dict[str, Any]:
     """`model name` from /proc/cpuinfo (x86-64 only — see plan §0c) and logical core count
     from os.cpu_count(), which works on every platform including macOS."""
@@ -57,7 +64,7 @@ def read_cpu() -> dict[str, Any]:
             for line in f:
                 key, sep, rest = line.partition(":")
                 if sep and key.strip() == "model name":
-                    model = rest.strip()
+                    model = _CORE_SUFFIX_RE.sub("", rest.strip()) or None
                     break
     except OSError:
         pass
