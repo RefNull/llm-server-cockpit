@@ -9,6 +9,7 @@ reload. A failed validation never touches the real file.
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Input, Label, Select, Static, TextArea
 
+from cockpit.screens.downloads import list_model_files
 from cockpit.widgets import (
     CockpitScreenBase,
     ConfirmModal,
@@ -140,6 +142,31 @@ class EditModelModal(ModalScreen[bool]):
             if editing_id
             else None
         )
+        # Filenames on disk, relative to models_dir — the same shape models.yaml stores in
+        # quant_file, so a selection can be written straight through.
+        self._files = [f["name"] for f in list_model_files(Path(host_profile["paths"]["models_dir"]))]
+
+    def _file_options(self) -> list[tuple[str, str]]:
+        return [(name, name) for name in self._files]
+
+    def _derived_id(self) -> str:
+        """The llama-swap route name, from the chosen filename.
+
+        Derived rather than typed (the id field was removed): the operator picks a file, and
+        two bindings of the same file are disambiguated with a numeric suffix the way the HF
+        Downloads scan used to do it.
+        """
+        selection = self.query_one("#f-quant-file", Select).value
+        if selection is Select.BLANK:
+            return ""
+        stem = Path(str(selection)).stem
+        clean = re.sub(r"[^a-zA-Z0-9_\.\-]", "-", stem).lower().strip("-") or "model"
+        taken = {m["id"] for m in self.models.get("models", []) if m["id"] != self.editing_id}
+        candidate, counter = clean, 2
+        while candidate in taken:
+            candidate = f"{clean}-{counter}"
+            counter += 1
+        return candidate
 
     def compose(self) -> ComposeResult:
         title = f"Edit Model: {self.editing_id}" if self.editing_id else "Add Model"
@@ -149,23 +176,27 @@ class EditModelModal(ModalScreen[bool]):
         with Vertical(id="edit-model-dialog"):
             yield Static(title, id="edit-model-title")
             with VerticalScroll(id="edit-model-scroll"):
-                yield Label("id")
-                yield Input(
-                    id="f-id",
-                    placeholder="model id",
-                    value=m["id"] if m else "",
-                    disabled=bool(self.editing_id),
-                )
+                # No id field: it is derived from the chosen filename (see _derived_id), which
+                # is what llama-swap routes on. Shown read-only so it is not a surprise.
+                yield Label("id (from the selected file)")
+                yield Static(m["id"] if m else "—", id="f-id-preview", classes="status-text")
                 yield Label("engine")
                 yield Select(_ENGINE_OPTIONS, id="f-engine", allow_blank=False, value=engine_val)
 
                 with Vertical(id="f-llamacpp-fields"):
-                    yield Label("repo_id")
-                    yield Input(id="f-repo-id", placeholder="huggingface repo id", value=m.get("repo_id", "") if m else "")
-                    yield Label("quant_file")
-                    yield Input(id="f-quant-file", placeholder="quant filename", value=m.get("quant_file", "") if m else "")
-                    yield Label("mmproj_file (optional)")
-                    yield Input(id="f-mmproj-file", placeholder="", value=m.get("mmproj_file", "") if m else "")
+                    # Dropdowns over what is actually in models_dir, not free text. repo_id is
+                    # gone from the form entirely: the weights are already on disk by the time
+                    # a binding is created (HF Downloads tab), so the Hub id is provenance
+                    # rather than something to retype. It is preserved when editing and
+                    # recorded as "local" for a new binding.
+                    # No value= here: Select.BLANK is literally `False` in Textual 8.2.8, and
+                    # passing it to the constructor trips _validate_value ("Illegal select
+                    # value False"). A blank Select is made by omitting value entirely; an
+                    # existing selection is assigned in on_mount, the same way f-gpu already is.
+                    yield Label("model file")
+                    yield Select(self._file_options(), id="f-quant-file", allow_blank=True)
+                    yield Label("mmproj file (optional — vision projector)")
+                    yield Select(self._file_options(), id="f-mmproj-file", allow_blank=True)
                     yield Label("bind.gpu")
                     yield Select(self._gpu_options(), id="f-gpu", allow_blank=False)
                     yield Label("bind.backend")
@@ -183,7 +214,10 @@ class EditModelModal(ModalScreen[bool]):
                 yield Label("env (one KEY=VALUE per line)")
                 yield TextArea("\n".join(m.get("env", [])) if m else "", id="f-env")
                 yield Label("ttl (seconds; 0 = never unload, blank = llama-swap default)")
-                yield Input(id="f-ttl", value=str(m.get("ttl", 0)) if m else "0")
+                # Blank for a new binding, not "0": 0 means never unload, so defaulting the
+                # box to it would make every model created here resident. Only an explicit ttl
+                # already in models.yaml is prefilled.
+                yield Input(id="f-ttl", value=("" if m is None or "ttl" not in m else str(m["ttl"])))
                 yield Label("group (optional)")
                 yield Input(id="f-group", placeholder="", value=m.get("group", "") if m else "")
 
@@ -197,6 +231,14 @@ class EditModelModal(ModalScreen[bool]):
         m = self._model
         engine_val = m.get("engine", "llama-cpp") if m else "llama-cpp"
         self._toggle_engine_fields(engine_val)
+
+        # Preselect the file(s) this model already names, but only when they still exist on
+        # disk — a models.yaml entry can outlive its weights, and Select rejects a value that
+        # is not among its options.
+        for field, key in (("#f-quant-file", "quant_file"), ("#f-mmproj-file", "mmproj_file")):
+            current = (m or {}).get(key)
+            if current and current in self._files:
+                self.query_one(field, Select).value = current
 
         gpus = self.host_profile.get("gpus", [])
         if gpus:
@@ -238,6 +280,10 @@ class EditModelModal(ModalScreen[bool]):
             self._toggle_engine_fields(str(event.value))
         elif event.select.id == "f-gpu":
             self._refresh_backend_options(str(event.value))
+        elif event.select.id == "f-quant-file" and self.editing_id is None:
+            # The id is derived from the filename, so the read-only preview has to follow the
+            # selection or it silently shows a stale route name.
+            self.query_one("#f-id-preview", Static).update(self._derived_id() or "—")
 
     def _set_form_error(self, text: str) -> None:
         self.query_one("#form-error", Static).update(text)
@@ -246,40 +292,47 @@ class EditModelModal(ModalScreen[bool]):
         self.dismiss(False)
 
     def _build_model_from_form(self) -> tuple[dict | None, str | None]:
-        model_id = self.query_one("#f-id", Input).value.strip()
-        if not model_id:
-            return None, "id is required"
         engine = self.query_one("#f-engine", Select).value
         if engine is Select.BLANK:
             return None, "engine is required"
 
+        # Blank means unspecified, NOT 0. Upstream llama-swap: "a ttl of 0 will mean never
+        # unload", default "-1 (use global default)" — so coercing an empty box to 0 silently
+        # pinned the model in VRAM (fixed in swap.py; this is the same trap on the input side).
         ttl_raw = self.query_one("#f-ttl", Input).value.strip()
-        try:
-            ttl = int(ttl_raw) if ttl_raw else 0
-        except ValueError:
-            return None, "ttl must be an integer"
-        if ttl < 0:
-            return None, "ttl must be >= 0"
+        ttl: int | None = None
+        if ttl_raw:
+            try:
+                ttl = int(ttl_raw)
+            except ValueError:
+                return None, "ttl must be an integer, or blank for llama-swap's default"
+            if ttl < 0:
+                return None, "ttl must be >= 0, or blank for llama-swap's default"
 
         group = self.query_one("#f-group", Input).value.strip()
         env_lines = [line.strip() for line in self.query_one("#f-env", TextArea).text.splitlines() if line.strip()]
 
+        model_id = self.editing_id or self._derived_id()
+        if not model_id:
+            return None, "could not derive an id — pick a model file"
         model: dict[str, Any] = {"id": model_id, "engine": str(engine)}
 
         if engine == "llama-cpp":
-            repo_id = self.query_one("#f-repo-id", Input).value.strip()
-            quant_file = self.query_one("#f-quant-file", Input).value.strip()
-            mmproj_file = self.query_one("#f-mmproj-file", Input).value.strip()
+            quant_sel = self.query_one("#f-quant-file", Select).value
+            mmproj_sel = self.query_one("#f-mmproj-file", Select).value
             gpu = self.query_one("#f-gpu", Select).value
             backend = self.query_one("#f-backend", Select).value
-            if not repo_id or not quant_file:
-                return None, "repo_id and quant_file are required for llama-cpp models"
+            if quant_sel is Select.BLANK:
+                return None, "pick a model file — download one on the HF Downloads tab first"
             if gpu is Select.BLANK or backend is Select.BLANK:
                 return None, "bind.gpu and bind.backend are required for llama-cpp models"
-            model["repo_id"] = repo_id
+            quant_file = str(quant_sel)
+            # repo_id stays required by the schema but is no longer typed: preserved when
+            # editing, "local" for a new binding whose weights are simply already on disk.
+            model["repo_id"] = (self._model or {}).get("repo_id") or "local"
             model["quant_file"] = quant_file
-            if mmproj_file:
-                model["mmproj_file"] = mmproj_file
+            if mmproj_sel is not Select.BLANK and str(mmproj_sel) != quant_file:
+                model["mmproj_file"] = str(mmproj_sel)
             model["bind"] = {"gpu": str(gpu), "backend": str(backend)}
             args_lines = [line for line in self.query_one("#f-args", TextArea).text.splitlines() if line.strip() != ""]
             if args_lines:
@@ -292,7 +345,8 @@ class EditModelModal(ModalScreen[bool]):
 
         if env_lines:
             model["env"] = env_lines
-        model["ttl"] = ttl
+        if ttl is not None:
+            model["ttl"] = ttl
         if group:
             model["group"] = group
         return model, None
