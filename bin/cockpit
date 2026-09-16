@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -42,7 +43,23 @@ except ImportError as e:
 def main() -> None:
     parser = argparse.ArgumentParser(prog="cockpit")
     parser.add_argument("--host", default=None, help="host profile to use (defaults to this machine's hostname)")
+    parser.add_argument(
+        "--sudo",
+        action="store_true",
+        help="re-exec the whole cockpit under sudo, instead of elevating per action",
+    )
     args = parser.parse_args()
+
+    if args.sudo and os.geteuid() != 0:
+        # Re-exec rather than elevate per action. The per-action gate
+        # (CockpitScreenBase.confirm(requires_root=True)) stays the default because it keeps
+        # unprivileged work unprivileged — an HF download running as root leaves root-owned
+        # files in models_dir. --sudo is for a session that is going to be mostly privileged
+        # work and does not want a prompt each time.
+        # The euid guard is what stops an exec loop: after sudo, euid is 0 and this is skipped
+        # even though --sudo is still in argv.
+        os.execvp("sudo", ["sudo", "-E", sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]])
+
     CockpitApp(host=args.host).run()
 
 

@@ -6,6 +6,7 @@ previews are available before deployment.
 """
 from __future__ import annotations
 
+import os
 import socket
 from pathlib import Path
 from typing import ClassVar
@@ -62,8 +63,12 @@ class CockpitHeader(Vertical):
     def compose(self) -> ComposeResult:
         yield Static(ASCII_BANNER, id="banner-art")
         yield Static("[bold #f5a623]LLM-SERVER-COCKPIT[/]", id="banner-compact")
+        # The badge reflects the process's ACTUAL euid, not a flag that was asked for: with
+        # --sudo the re-exec has already happened by the time this renders, so a badge driven
+        # by the flag would claim rights the process might not have if sudo failed.
+        sudo_badge = " [dim]·[/] [bold #000000 on #e5a93c] SUDO MODE [/]" if os.geteuid() == 0 else ""
         yield Static(
-            f"[bold #f5a623]v{__version__}[/] [dim]·[/] [dim]Host:[/] [bold #e5a93c]{self.host_name}[/]",
+            f"[bold #f5a623]v{__version__}[/] [dim]·[/] [dim]Host:[/] [bold #e5a93c]{self.host_name}[/]{sudo_badge}",
             id="banner-meta",
         )
 

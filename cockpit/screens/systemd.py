@@ -102,10 +102,12 @@ class SystemdScreen(CockpitScreenBase):
 
     def on_mount(self) -> None:
         table = self.query_one("#systemd-table", SingleClickDataTable)
-        # Column budget (DESIGN.md §4): content 95 + 2 padding x 8 columns = 111 <= 115.
-        table.add_column("Unit", width=30)
-        table.add_column("Active", width=9)
-        table.add_column("Sub", width=9)
+        # Column budget (DESIGN.md §4): content 99 + 2 padding x 8 columns = 115, exactly the
+        # ceiling. Unit takes the width because socket/path/mount names are long
+        # (systemd-fsck@dev-disk-by-uuid-...), and Active/Sub values are short words.
+        table.add_column("Unit", width=36)
+        table.add_column("Active", width=8)
+        table.add_column("Sub", width=8)
         table.add_action_column(TableAction("logs", "Logs", width=9, requires_root=True))
         table.add_action_column(TableAction("unitfile", "Unit", width=8))
         table.add_action_column(

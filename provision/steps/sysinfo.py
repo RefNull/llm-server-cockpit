@@ -51,7 +51,7 @@ def read_os() -> dict[str, Any]:
 # AMD puts the physical core count inside the model string ("AMD Ryzen 7 7800X3D 8-Core
 # Processor"), Intel does not. Left in, the Dashboard renders "16 x AMD Ryzen 7 7800X3D 8-Core
 # Processor" — the 16 is threads and the 8 is cores, so the line states two different counts
-# and looks like a bug. Observed on haupe-server, 2026-09-16.
+# and looks like a bug. Observed on llm-host, 2026-09-16.
 _CORE_SUFFIX_RE = re.compile(r"\s+\d+-Core Processor\s*$", re.IGNORECASE)
 
 

@@ -17,6 +17,12 @@ from provision.common import Runner
 
 _TIMEOUT_S = 15
 
+# Everything that runs or can trigger something running. Deliberately excludes `target`, `slice`
+# and `device`, which are grouping/topology units with nothing to start, stop or read a journal
+# from — listing them would pad the table without adding an actionable row. The hide list is
+# what handles the volume this still produces on a general-purpose host.
+_DEFAULT_KINDS = ("service", "timer", "socket", "path", "mount")
+
 
 def _systemctl(args: list[str], runner: Runner | None = None) -> tuple[int, str]:
     """Returns (returncode, combined output). Never raises — a host without systemd, or a unit
@@ -34,7 +40,7 @@ def _systemctl(args: list[str], runner: Runner | None = None) -> tuple[int, str]
         return 1, f"{type(e).__name__}: {e}"
 
 
-def list_units(kinds: tuple[str, ...] = ("service", "timer")) -> list[dict[str, Any]]:
+def list_units(kinds: tuple[str, ...] = _DEFAULT_KINDS) -> list[dict[str, Any]]:
     """Every loaded unit of the given kinds, as [{"unit","load","active","sub","description"}].
 
     `--plain --no-legend` strips the bullet column and the trailing summary so every line is a

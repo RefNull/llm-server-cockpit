@@ -115,7 +115,7 @@ real host before relying on it**, and every reader must degrade to `None` rather
 **Negative result, verified by exhaustive repo-wide grep**: nothing in this repo reads
 `/etc/os-release`, `/proc/cpuinfo`, device-tree, `dmidecode`, or `lscpu` today. Every row in
 this table except `MemTotal` is a **new** reader with **no existing precedent to copy**. That is
-exactly why Phase 1 must verify each one on haupe-server before the plan advances.
+exactly why Phase 1 must verify each one on llm-host before the plan advances.
 
 ### 0c-bis. GPU product names without waking anything
 
@@ -171,7 +171,7 @@ lookup is what `lspci` does.
 - **Reading driver versions live.** The lockfile is the source; if it is absent the row says
   "not checked — run Settings → Check Drivers". **Assume absent is the normal case**: the
   lockfile is gitignored (`.gitignore:13`), none exists in this checkout, and it is unknown
-  whether haupe-server has ever been baselined. The no-lockfile rendering is the default path,
+  whether llm-host has ever been baselined. The no-lockfile rendering is the default path,
   not the edge case.
 - **Re-adding a percentage anywhere on this screen.**
 
@@ -206,7 +206,7 @@ def read_all() -> dict         # the four above, one call for the screen
       `_SYSFS_NET`) covers: DMI files present, DMI files absent, `model name` present and
       absent in cpuinfo, a `MemTotal`-less meminfo, and `/etc/os-release` missing entirely
       (`platform.freedesktop_os_release()` raises `OSError` — §0b).
-- [ ] Run it **on haupe-server** and paste the real output into the phase's completion note.
+- [ ] Run it **on llm-host** and paste the real output into the phase's completion note.
       This is the only way to confirm 0c.
 - [ ] `grep -rn "subprocess\|shutil.which" provision/steps/sysinfo.py` returns nothing.
 
@@ -234,7 +234,7 @@ Accelerators
 ```
 
 Values above are illustrative. Phase 1's completion note must paste the **real** output from
-haupe-server — the DMI strings in particular are frequently vendor junk ("System Product Name"
+llm-host — the DMI strings in particular are frequently vendor junk ("System Product Name"
 is a real, common value), and the panel has to look sane when they are.
 
 - Accelerator rows come from `host_profile["gpus"]` (declared) joined to
@@ -357,9 +357,9 @@ launch" and then that `Sample GPUs` takes exactly one reading. Both halves chang
 ```
 - [ ] Launch subprocess trace: **6 or fewer** operations, none duplicated (the `00e6a76`
       baseline — this plan must not add any).
-- [ ] Run `bin/cockpit` on haupe-server and confirm the fans stay quiet. This is the
+- [ ] Run `bin/cockpit` on llm-host and confirm the fans stay quiet. This is the
       acceptance test the whole plan exists for.
-- [ ] Paste the real rendered Dashboard from haupe-server into the completion note.
+- [ ] Paste the real rendered Dashboard from llm-host into the completion note.
 
 ---
 

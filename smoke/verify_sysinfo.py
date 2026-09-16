@@ -165,7 +165,7 @@ def check_pci_gpus_domain_qualified() -> None:
 
 def check_cpu_amd_core_suffix() -> None:
     """AMD's model string carries the physical core count; the Dashboard already prints the
-    thread count beside it. Real string from haupe-server, 2026-09-16."""
+    thread count beside it. Real string from llm-host, 2026-09-16."""
     root = pathlib.Path(tempfile.mkdtemp())
     try:
         (root / "cpuinfo").write_text(

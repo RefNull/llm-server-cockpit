@@ -110,7 +110,12 @@ Launch the Textual management cockpit:
 ```bash
 bin/cockpit
 # Or target a specific host profile:
-bin/cockpit --host haupe-server
+bin/cockpit --host llm-host
+
+# Run the whole cockpit as root instead of elevating per action. The header then shows
+# a SUDO MODE badge. Default (no flag) keeps unprivileged work unprivileged — an HF
+# download under sudo leaves root-owned files in models_dir.
+sudo bin/cockpit          # or: bin/cockpit --sudo
 ```
 
 Cockpit starts in **dry-run mode** by default to prevent accidental mutations. Key controls:
@@ -187,7 +192,7 @@ backends:
 Gitignored machine profile specifying hardware topology, network bindings, and local filesystem layout:
 
 ```yaml
-hostname: haupe-server
+hostname: llm-host
 
 network:
   vpn:

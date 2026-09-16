@@ -280,7 +280,14 @@ class DownloadsScreen(CockpitScreenBase):
         widget = self.query_one("#disk-usage", Static)
         models_dir = Path(self.host_profile["paths"]["models_dir"])
         if not models_dir.exists():
-            widget.update(f"Disk usage: {models_dir} does not exist yet.")
+            # Name the setting, not just the path. This reads as a bug when the operator has a
+            # models directory somewhere else — the app is right that THIS path is absent, but
+            # says nothing about which config decides it or where to change it.
+            widget.update(
+                f"Disk usage: {models_dir} does not exist yet — it is created on first download. "
+                f"Wrong location? That is paths.models_dir, editable at "
+                f"Settings > Host Profile > Models Directory."
+            )
             return
         total_bytes = sum(f.stat().st_size for f in models_dir.rglob("*") if f.is_file())
         total_gb = total_bytes / (1024 ** 3)
