@@ -651,6 +651,11 @@ class DeployScreen(CockpitScreenBase):
         self.runner = runner
         self.repo_root = repo_root
         self.app_ref = app_ref
+        # model id -> llama-swap state, from GET /running. Empty when llama-swap is down, which
+        # renders as "—" rather than an error: not-running is a normal state for this table.
+        # NOT `_running`: Textual's MessagePump already owns that attribute as a bool, and
+        # shadowing it made _populate_table fail with "'bool' object has no attribute 'get'".
+        self._running_models: dict[str, str] = {}
 
     def compose(self) -> ComposeResult:
         with VerticalScroll():
@@ -679,20 +684,44 @@ class DeployScreen(CockpitScreenBase):
             yield Static("", id="status-message", classes="status-text")
 
     def on_mount(self) -> None:
-        for table_id in ("#models-resident", "#models-swappable"):
-            table = self.query_one(table_id, SingleClickDataTable)
-            table.cursor_type = "row"
-            # Content 79 + actions 18 = 97, render 97 + 2*8 = 113 (DESIGN.md §4).
-            table.add_column("ID", width=24)
-            table.add_column("Engine", width=12)
-            table.add_column("GPU", width=10)
-            table.add_column("Backend", width=10)
-            table.add_column("Group", width=12)
-            table.add_column("TTL", width=11)
-            table.add_action_column(TableAction("edit", "Edit"))
-            table.add_action_column(
-                TableAction("delete", "Delete", destructive=True, confirm="Delete model {row} from models.yaml?")
+        # The two tables carry different columns now. Resident drops TTL — it is 0 or group
+        # membership by definition — to pay for the Start/Stop toggle; Swappable keeps TTL
+        # because there the number is the whole point. Budgets: 96 + 2*8 = 112 and
+        # 97 + 2*8 = 113, both inside 115 (DESIGN.md §4).
+        resident = self.query_one("#models-resident", SingleClickDataTable)
+        resident.cursor_type = "row"
+        resident.add_column("ID", width=22)
+        resident.add_column("Engine", width=10)
+        resident.add_column("GPU", width=9)
+        resident.add_column("Backend", width=9)
+        resident.add_column("Group", width=10)
+        resident.add_column("Status", width=9)
+        resident.add_action_column(
+            TableAction(
+                "run",
+                lambda mid: "Stop" if self._running_models.get(mid) else "Start",
+                width=9,
+                confirm="{action} {row}?",
             )
+        )
+        resident.add_action_column(TableAction("edit", "Edit"))
+        resident.add_action_column(
+            TableAction("delete", "Delete", destructive=True, confirm="Delete model {row} from models.yaml?")
+        )
+
+        swappable = self.query_one("#models-swappable", SingleClickDataTable)
+        swappable.cursor_type = "row"
+        swappable.add_column("ID", width=22)
+        swappable.add_column("Engine", width=10)
+        swappable.add_column("GPU", width=9)
+        swappable.add_column("Backend", width=9)
+        swappable.add_column("Group", width=10)
+        swappable.add_column("TTL", width=10)
+        swappable.add_column("Status", width=9)
+        swappable.add_action_column(TableAction("edit", "Edit"))
+        swappable.add_action_column(
+            TableAction("delete", "Delete", destructive=True, confirm="Delete model {row} from models.yaml?")
+        )
         self._populate_table()
 
     @staticmethod
@@ -738,12 +767,15 @@ class DeployScreen(CockpitScreenBase):
         resident.clear()
         swappable.clear()
         for m in self.models.get("models", []):
-            table = resident if self._is_resident(m) else swappable
+            is_resident = self._is_resident(m)
+            table = resident if is_resident else swappable
             if m["engine"] == "llama-cpp":
                 gpu = m.get("bind", {}).get("gpu", "")
                 backend = m.get("bind", {}).get("backend", "")
             else:
                 gpu, backend = "", ""
+            state = self._running_models.get(m["id"])
+            status_cell = Text(state or "—", style="green" if state else "dim")
             # rich.text.Text, not raw str (DESIGN.md §4.6 / Phase 0a.6): the app console has
             # markup=True, so an operator-chosen model id or repo_id containing brackets would
             # have that span silently eaten by Rich as a markup tag.
@@ -753,15 +785,26 @@ class DeployScreen(CockpitScreenBase):
                 Text(gpu),
                 Text(backend),
                 Text(m.get("group", "")),
-                Text("0 (pinned)" if m.get("ttl") == 0 else str(m.get("ttl", "default"))),
+                *(
+                    (status_cell,)
+                    if is_resident
+                    else (
+                        Text("0 (pinned)" if m.get("ttl") == 0 else str(m.get("ttl", "default"))),
+                        status_cell,
+                    )
+                ),
                 *table.action_cells(m["id"]),
                 key=m["id"],
             )
+
+    def on_first_view(self) -> None:
+        self.on_refresh_requested()
 
     def on_refresh_requested(self) -> None:
         """Called by CockpitApp.action_refresh_all — pick up fresh models.yaml."""
         self.models = self.app_ref.models
         self._populate_table()
+        self._refresh_running()
 
     def _set_status(self, text: str) -> None:
         self.query_one("#status-message", Static).update(text)
@@ -878,8 +921,39 @@ class DeployScreen(CockpitScreenBase):
 
     # -- Per-row table actions --------------------------------------------------
 
+    @work(thread=True)
+    def _refresh_running(self) -> None:
+        """One GET /running, off the main thread. llama-swap owns the process lifecycle; this
+        only reports it."""
+        running = swap.running_models(self.host_profile)
+        self.app.call_from_thread(self._apply_running, running)
+
+    def _apply_running(self, running: dict[str, str]) -> None:
+        if not self.is_mounted:
+            return
+        self._running_models = running
+        self._populate_table()
+
+    @work(thread=True)
+    def _run_model_action(self, verb: str, model_id: str) -> None:
+        """Start warms via GET /upstream/<id>/ — llama-swap has no load endpoint, and this is
+        the same zero-token trick its own startup preload uses. Stop is the real
+        POST /api/models/unload/<id>."""
+        error = (
+            swap.unload_model(self.host_profile, model_id)
+            if verb == "stop"
+            else swap.load_model(self.host_profile, model_id)
+        )
+        if error:
+            self.app.call_from_thread(self.app.notify, f"{model_id}: {verb} failed — {error}", severity="error")
+        else:
+            self.app.call_from_thread(self.app.notify, f"{model_id}: {verb} complete")
+        self.app.call_from_thread(self._refresh_running)
+
     async def handle_table_action(self, action_id: str, row_key: str, table) -> None:
-        if action_id == "edit":
+        if action_id == "run":
+            self._run_model_action("stop" if self._running_models.get(row_key) else "start", row_key)
+        elif action_id == "edit":
             await self._edit_model(row_key)
         elif action_id == "delete":
             await self._delete_model(row_key)

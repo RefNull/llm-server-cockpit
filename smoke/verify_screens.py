@@ -22,11 +22,13 @@ sys.path.insert(0, str(_REPO_ROOT))
 import bootstrap  # noqa: E402
 bootstrap.add_venv_site_packages(_REPO_ROOT)
 
+from cockpit import update_check  # noqa: E402
 from cockpit.app import CockpitApp  # noqa: E402
+from cockpit.screens.builds import BuildsScreen  # noqa: E402
 from cockpit.screens.scripts import ScriptsScreen  # noqa: E402
 from cockpit.screens.settings import SettingsScreen  # noqa: E402
 from provision.steps import wol  # noqa: E402
-from cockpit.widgets import CockpitDataTable  # noqa: E402
+from cockpit.widgets import CockpitDataTable, CockpitScreenBase  # noqa: E402
 from textual.widgets import Button, TabbedContent  # noqa: E402
 
 USABLE_WIDTH = 115
@@ -141,6 +143,13 @@ async def _assert_launch_defers_hidden_tabs() -> None:
     # run() funnels through Popen, so wrapping only Popen counts each spawn exactly once.
     subprocess.Popen = _Popen
     urllib.request.urlopen = _urlopen
+    # Hermetic cache: update_check persists its 24h result beside the host profile, so a real
+    # cache file left by an earlier run would silently satisfy "launch made no GitHub calls"
+    # whether or not the deferral still works. Pointing it at a temp path makes each run
+    # answer the same question (contract.md — a check that depends on leftover state is not a
+    # check). Caught by breaking deferral on purpose and watching this pass anyway.
+    cache_dir = tempfile.mkdtemp()
+    real_cache, update_check._CACHE_PATH = update_check._CACHE_PATH, Path(cache_dir) / "update-cache.yaml"
     try:
         app = CockpitApp(host="example")
         async with app.run_test(size=(121, 30)) as pilot:
@@ -149,23 +158,35 @@ async def _assert_launch_defers_hidden_tabs() -> None:
             duplicated = {c: launch.count(c) for c in set(launch) if launch.count(c) > 1}
             assert not duplicated, f"launch repeats the same work: {duplicated}"
             github = [c for c in launch if "api.github.com" in c]
-            assert len(github) <= 2, f"launch made {len(github)} GitHub calls, expected the Dashboard's 2: {github}"
+            assert not github, f"launch made {len(github)} GitHub calls, expected none: {github}"
 
-            # Opening Backends must now do the work that used to happen at launch.
+            # Deferral is asserted on the mechanism, not on a side effect. It used to be probed
+            # by counting the GitHub calls Backends makes on first view — that stopped working
+            # when those calls gained a 24h cache, and a cached hit is indistinguishable from a
+            # first-view load that never fired. ensure_first_view's own flag cannot be faked.
+            hidden = [s for s in app.query(CockpitScreenBase) if not s.is_on_screen]
+            assert hidden, "every screen was on screen — this check proves nothing"
+            assert all(not s._first_view_done for s in hidden), (
+                "a screen the operator cannot see has already run its first-view load: "
+                + ", ".join(type(s).__name__ for s in hidden if s._first_view_done)
+            )
+            backends = app.query_one(BuildsScreen)
+            assert not backends._first_view_done, "Backends loaded before it was opened"
             app.query_one("#main-tabs", TabbedContent).active = "llm"
             await pilot.pause(0.2)
             app.query_one("#llm-tabs", TabbedContent).active = "backends"
-            await pilot.pause(2.0)
-            opened = [c for c in calls if "api.github.com" in c]
-            assert len(opened) > len(github), (
-                "opening Backends ran no upstream check — its first-view load never fired, so "
-                "this check cannot tell deferral from deletion"
+            await pilot.pause(1.0)
+            assert backends._first_view_done, (
+                "opening Backends did not run its first-view load — this check cannot tell "
+                "deferral from deletion"
             )
         print(f"launch: {len(launch)} operations, none duplicated, {len(github)} GitHub calls; "
-              f"Backends adds {len(opened) - len(github)} more only when opened")
+              f"{len(hidden)} hidden screens all unloaded until opened")
     finally:
         subprocess.Popen = real_popen
         urllib.request.urlopen = real_urlopen
+        update_check._CACHE_PATH = real_cache
+        shutil.rmtree(cache_dir, ignore_errors=True)
 
 
 async def _assert_markup_escaping_survives_textual() -> None:

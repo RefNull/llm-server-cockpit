@@ -3,10 +3,13 @@ systemd unit install/refresh.
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 import shlex
+import shutil
 import subprocess
+import urllib.request
 import sys
 from pathlib import Path
 from string import Template
@@ -76,11 +79,78 @@ def resolve_vpn_ip(interface: str) -> str | None:
     none yet. Public so the cockpit's Settings tab can show a live preview of what an
     interface name actually resolves to — the field takes a NIC name, not an IP, precisely
     because that address can change (DHCP/overlay-assigned) while the interface name doesn't."""
+    # Guarded like wol._read_iface_mac: iproute2 is not guaranteed present, and this is
+    # documented as returning None rather than raising — it did raise FileNotFoundError, which
+    # every caller then had to wrap.
+    if shutil.which("ip") is None:
+        return None
     result = subprocess.run(["ip", "-4", "addr", "show", "dev", interface], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     if result.returncode != 0:
         return None
     m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)/\d+", result.stdout)
     return m.group(1) if m else None
+
+
+def endpoint(host_profile: dict[str, Any]) -> str | None:
+    """`host:port` llama-swap is listening on, or None when the VPN address has no IP yet."""
+    iface = host_profile["network"]["vpn"]["interface"]
+    port = host_profile["network"]["gateway"]["port"]
+    ip = resolve_vpn_ip(iface)
+    return f"{ip}:{port}" if ip else None
+
+
+def _api(host_profile: dict[str, Any], path: str, *, method: str = "GET", timeout: float = 5.0):
+    """One request against llama-swap's own HTTP API. Never raises — this feeds a status column
+    and a pair of buttons, and llama-swap being down is a normal state for both."""
+    base = endpoint(host_profile)
+    if base is None:
+        return None, "llama-swap endpoint not resolvable (VPN interface has no IP)"
+    req = urllib.request.Request(f"http://{base}{path}", method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read(), None
+    except Exception as e:
+        return None, str(e)
+
+
+def running_models(host_profile: dict[str, Any]) -> dict[str, str]:
+    """model id -> state, from `GET /running`.
+
+    Response shape is `{"running": [{"model": ..., "state": ..., ...}]}` — read from
+    llama-swap's own `runningModel` struct tags (internal/server/api.go), not guessed. A model
+    absent from the list is simply not loaded.
+    """
+    body, error = _api(host_profile, "/running")
+    if body is None:
+        return {}
+    try:
+        data = json.loads(body)
+    except (ValueError, TypeError):
+        return {}
+    return {
+        entry.get("model"): entry.get("state", "")
+        for entry in data.get("running", [])
+        if isinstance(entry, dict) and entry.get("model")
+    }
+
+
+def load_model(host_profile: dict[str, Any], model_id: str) -> str | None:
+    """Warm a model. Returns an error string, or None on success.
+
+    `GET /upstream/<id>/` — llama-swap has NO load endpoint; loading is a side effect of a
+    request arriving for a model. This is the same trick llama-swap's own startup preload uses
+    ("fires a background GET / at every model named in Hooks.OnStartup.Preload so they are warm
+    before the first real request", internal/server/api.go::startPreload), so it costs no
+    tokens and runs no inference. Generous timeout: loading a large quant into VRAM is slow.
+    """
+    _, error = _api(host_profile, f"/upstream/{model_id}/", timeout=300.0)
+    return error
+
+
+def unload_model(host_profile: dict[str, Any], model_id: str) -> str | None:
+    """`POST /api/models/unload/<id>`. Returns an error string, or None on success."""
+    _, error = _api(host_profile, f"/api/models/unload/{model_id}", method="POST", timeout=30.0)
+    return error
 
 
 def _resolve_listen_addr(host_profile: dict[str, Any]) -> str:
