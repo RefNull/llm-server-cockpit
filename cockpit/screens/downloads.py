@@ -58,7 +58,14 @@ def _hf_api_lookup(repo_id: str, token: str | None) -> tuple[int, dict | None]:
 
 
 def _fmt_bytes(num_bytes: float) -> str:
-    return f"{num_bytes / (1024 ** 3):.1f} GB" if num_bytes >= 1024**3 else f"{num_bytes / (1024 ** 2):.0f} MB"
+    """Three ranges, not two. With only GB/MB a sub-megabyte file rendered as "0 MB", which
+    reads as "empty" rather than "small" — surfaced by a 512 KB fixture once local files got
+    their size from disk rather than from the HF API."""
+    if num_bytes >= 1024**3:
+        return f"{num_bytes / (1024 ** 3):.1f} GB"
+    if num_bytes >= 1024**2:
+        return f"{num_bytes / (1024 ** 2):.0f} MB"
+    return f"{num_bytes / 1024:.0f} KB"
 
 
 class HFTokenModal(ModalScreen[str | None]):
@@ -190,15 +197,18 @@ class DownloadsScreen(CockpitScreenBase):
     def on_mount(self) -> None:
         table = self.query_one("#model-table", SingleClickDataTable)
         # Column budget (DESIGN.md §4): render width is content width + 2*cell_padding per
-        # column (Textual _data_table.py Column.get_render_width) against a 115-cell usable
-        # viewport at 121x30 (121 - 2*$space-edge). Dropping the tick column returned its 3
-        # content cells + 2 padding to the data columns and put ID flush left. Content sum
-        # 88, render sum 88 + 2*6 = 100 <= 115.
-        table.add_column("ID", width=20)
-        table.add_column("Repo ID", width=26)
+        # column against a 115-cell usable viewport at 121x30 (121 - 2*$space-edge).
+        # Content 98, render 98 + 2*5 = 108.
+        #
+        # "Release Date" was dropped to pay for a wider ID. It only ever carried a value for a
+        # model the HF API reported as ready-to-download — it was blank for every model already
+        # on disk, i.e. the whole table once you have your weights. ID takes the space because
+        # quant filenames are long ("qwen3.8-27b-gsq-rco-iq3_s-mtp" is 29 characters) and the
+        # id is how the operator identifies the row.
+        table.add_column("ID", width=34)
+        table.add_column("Repo ID", width=24)
         table.add_column("Status", width=20)
         table.add_column("Size", width=10)
-        table.add_column("Release Date", width=12)
         table.add_action_column(TableAction("download", "Download", confirm="Download {row}?", available=self._can_download))
         # No data read here — ensure_first_view() does it when this tab is first shown.
 
@@ -226,7 +236,16 @@ class DownloadsScreen(CockpitScreenBase):
     def _compute_row_info(self, model: dict, token: str | None) -> dict:
         local = hf.model_status(model, self.host_profile)
         if local in ("downloaded", "placeholder", "unmanaged"):
-            return {"status": local, "size": None, "date": None}
+            # A downloaded model's size is on disk — stat it rather than leaving the column
+            # blank. Previously only the HF API populated size, so it was "—" for every model
+            # the operator actually had, which is exactly the set where the number is useful.
+            size = None
+            if local == "downloaded":
+                try:
+                    size = (Path(self.host_profile["paths"]["models_dir"]) / model["quant_file"]).stat().st_size
+                except OSError:
+                    pass
+            return {"status": local, "size": size, "date": None}
 
         # local == "missing" — ask HF whether it actually exists / is downloadable.
         code, data = _hf_api_lookup(model["repo_id"], token)
@@ -260,7 +279,6 @@ class DownloadsScreen(CockpitScreenBase):
             status = info["status"]
             status_label = _LOCAL_STATUS_LABELS.get(status, status)
             size_label = _fmt_bytes(info["size"]) if info.get("size") else "—"
-            date_label = (info.get("date") or "—")[:10]
             repo_display = "PLACEHOLDER — edit models.yaml" if status == "placeholder" else model["repo_id"]
             # rich.text.Text, not raw str (DESIGN.md §4.6 / Phase 0a.6): the app console has
             # markup=True, so an operator-chosen repo_id containing brackets would have that
@@ -270,7 +288,6 @@ class DownloadsScreen(CockpitScreenBase):
                 Text(repo_display),
                 Text(status_label),
                 Text(size_label),
-                Text(date_label),
                 *table.action_cells(model["id"]),
                 key=model["id"],
             )
