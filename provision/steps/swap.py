@@ -121,7 +121,14 @@ def _build_model_entry(model: dict[str, Any], host_profile: dict[str, Any]) -> d
 
     if model.get("env"):
         entry["env"] = list(model["env"])
-    entry["ttl"] = model.get("ttl", 0)  # ttl is optional in the schema; don't assume it's there
+    # Only written when models.yaml actually specifies it. `ttl` is optional in this repo's
+    # schema, and it was defaulted to 0 here — but upstream llama-swap documents "a ttl of 0
+    # will mean never unload", with its own default being "-1 (use global default)". So an
+    # entry that simply omitted ttl was silently rewritten as "pin this model in VRAM forever",
+    # which is the opposite of unspecified and the one field that costs VRAM at rest. Omitting
+    # it hands the decision back to llama-swap's global default, where it belongs.
+    if "ttl" in model:
+        entry["ttl"] = model["ttl"]
     return entry
 
 
@@ -156,7 +163,9 @@ def parse_config_for_import(yaml_text: str) -> list[dict[str, Any]]:
         model: dict[str, Any] = {"id": model_id, "engine": "unmanaged", "cmd": entry["cmd"]}
         if entry.get("env"):
             model["env"] = list(entry["env"])
-        if entry.get("ttl"):
+        # `in`, not truthiness: ttl 0 is meaningful ("never unload"), so a falsy check dropped
+        # exactly the setting an operator was most deliberate about when importing a config.
+        if "ttl" in entry:
             model["ttl"] = entry["ttl"]
         if model_id in group_of:
             model["group"] = group_of[model_id]

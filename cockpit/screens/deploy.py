@@ -182,7 +182,7 @@ class EditModelModal(ModalScreen[bool]):
 
                 yield Label("env (one KEY=VALUE per line)")
                 yield TextArea("\n".join(m.get("env", [])) if m else "", id="f-env")
-                yield Label("ttl (seconds, 0 = never evict)")
+                yield Label("ttl (seconds; 0 = never unload, blank = llama-swap default)")
                 yield Input(id="f-ttl", value=str(m.get("ttl", 0)) if m else "0")
                 yield Label("group (optional)")
                 yield Input(id="f-group", placeholder="", value=m.get("group", "") if m else "")
