@@ -23,7 +23,7 @@ import bootstrap  # noqa: E402
 bootstrap.add_venv_site_packages(_REPO_ROOT)
 
 from cockpit.app import CockpitApp  # noqa: E402
-from cockpit.screens.scripts import ScriptsScreen  # noqa: E402
+from cockpit.screens.scripts import ScriptsScreen, UnitRow  # noqa: E402
 from cockpit.screens.settings import SettingsScreen  # noqa: E402
 from provision.steps import wol  # noqa: E402
 from cockpit.widgets import CockpitDataTable  # noqa: E402
@@ -54,28 +54,59 @@ def _assert_table_widths_in_budget(app: CockpitApp, context: str) -> None:
         )
 
 
-def _assert_script_toggle_labels(app: CockpitApp, context: str) -> None:
-    """The two toggle columns on scripts-table resolve their label per row (DESIGN.md §9). A
-    static label would silently offer "Start" on an already-running unit."""
+def _assert_unit_toggle_labels(app: CockpitApp, context: str) -> None:
+    """The run toggle column on scripts-table resolves its label per row (DESIGN.md §9). A
+    static label would silently offer "Start" on an already-running unit. Also covers the
+    Edit/Remove `available=` split between script-backed and non-script (llama-swap/timer/WOL)
+    rows — those two columns must render blank, inert cells on a unit with no script id."""
     screen = app.query_one(ScriptsScreen)
     screen._apply_rows(
         [
-            ({"id": "running", "path": "/opt/a.py"}, {"unit_active": True, "unit_enabled": True}, "active, enabled"),
-            ({"id": "stopped", "path": "/opt/b.py"}, {"unit_active": False, "unit_enabled": False}, "stopped, disabled"),
+            (
+                UnitRow("cockpit-script-running.service", "running", "service", "running"),
+                {"unit_active": True, "unit_enabled": True},
+                "active, enabled",
+            ),
+            (
+                UnitRow("cockpit-script-stopped.service", "stopped", "service", "stopped"),
+                {"unit_active": False, "unit_enabled": False},
+                "stopped, disabled",
+            ),
+            (
+                UnitRow("llama-swap.service", "llama-swap", "service", None),
+                {"unit_active": True, "unit_enabled": True},
+                "active, enabled",
+            ),
         ]
     )
     table = app.query_one("#scripts-table", CockpitDataTable)
     expected = {
-        ("run", "running"): "Stop",
-        ("run", "stopped"): "Start",
-        ("boot", "running"): "Disable",
-        ("boot", "stopped"): "Enable",
+        ("run", "cockpit-script-running.service"): "Stop",
+        ("run", "cockpit-script-stopped.service"): "Start",
+        ("run", "llama-swap.service"): "Stop",
     }
     for (action_id, row_key), want in expected.items():
         got = table._actions[action_id].resolve_label(row_key)
         assert got == want, f"[{context}] {action_id} on {row_key}: expected {want!r}, got {got!r}"
     # The prompt must name the verb the operator actually clicked, not a fixed one.
-    assert table._actions["run"].confirm_message("running") == "Stop script running?"
+    assert (
+        table._actions["run"].confirm_message("cockpit-script-running.service")
+        == "Stop cockpit-script-running.service?"
+    )
+    # Edit/Remove are script-only: available on the two script rows, blank (and inert) on
+    # llama-swap. `TableAction.cell()` is what add_row actually renders through action_cells(),
+    # so asserting on it (not just the raw predicate) proves the blank cell, not only the intent.
+    for action_id in ("edit", "remove"):
+        action = table._actions[action_id]
+        assert action.available("cockpit-script-running.service"), (
+            f"[{context}] {action_id} unavailable on a script unit"
+        )
+        assert not action.available("llama-swap.service"), (
+            f"[{context}] {action_id} available on a non-script unit"
+        )
+        assert action.cell("llama-swap.service").plain == "", (
+            f"[{context}] {action_id} cell not blank on llama-swap.service"
+        )
 
 
 def _assert_no_awaited_workers() -> None:
@@ -423,7 +454,7 @@ async def verify_geometry_and_export_screenshots() -> None:
                 _assert_buttons_in_bounds(app, f"{name} @ {w}x{h}")
                 _assert_table_widths_in_budget(app, f"{name} @ {w}x{h}")
                 if name == "scripts":
-                    _assert_script_toggle_labels(app, f"{name} @ {w}x{h}")
+                    _assert_unit_toggle_labels(app, f"{name} @ {w}x{h}")
                     await pilot.pause(0.1)
                 if name == "settings_services":
                     await _assert_wol_form_wiring(app, pilot, f"{name} @ {w}x{h}")

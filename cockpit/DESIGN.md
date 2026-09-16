@@ -152,7 +152,7 @@ Textual's `DataTable` is a scroll container (`overflow-x: auto`) that scrolls ho
      - `models-table` (`deploy.py`): 8 columns ("ID" w=24, "Engine" w=12, "GPU" w=10, "Backend" w=10, "Group" w=12, "TTL" w=8, `Edit` action w=8, `Remove` action w=10). Render 110.
      - `model-table` (`downloads.py`): 6 columns ("ID" w=20, "Repo ID" w=26, "Status" w=20, "Size" w=10, "Release Date" w=12, `Download` action w=12). Render 112.
      - `containers-table` (`containers.py`): 6 columns ("Name" w=22, "Image" w=24, "Status" w=20, "Ports" w=18, "Compose" w=8, `Restart` action w=11). Render 115.
-     - `scripts-table` (`scripts.py`): 7 columns ("ID" w=16, "Path" w=27, "Status" w=20, `run` toggle w=9, `boot` toggle w=11, `Edit` action w=8, `Remove` action w=10). Render 115.
+     - `scripts-table` (`scripts.py`, tab labelled "Units" — TabPane id stays "scripts"): 8 columns ("Unit" w=26, "Type" w=8, "Status" w=20, `Logs` action w=9, `Unit` action w=8 — the rendered unit file, distinct from the "Unit" data column, `run` toggle w=9, `Edit` action w=8, `Remove` action w=10). Render 114. Lists every systemd unit this toolkit installs (llama-swap.service, its two optional timers, the WOL unit, one row per registered script) — `Edit`/`Remove` are `available=` only on script-backed rows. No `boot` (enable/disable) toggle: it fit the old 7-column budget but doesn't fit alongside `Logs`/`Unit` inside 115 cells — llama-swap and its timers are enabled declaratively from `host_profile` via Settings, and a script's boot-enable state is set in `EditScriptModal`'s switch, both reachable without this column.
      - `gpu-table` (`settings.py`): 4 columns ("GPU ID" w=16, "Vendor" w=16, "Backends" w=30, "Driver Status" w=40). Render 110. Composed in both the first-run wizard and the normal-mode GPU Topology sub-tab — only one branch is ever mounted, with identical columns.
      - `history-table` (`builds.py` `BuildHistoryModal`, 90%-width dialog): 4 columns ("Backend" w=12, "Timestamp (UTC)" w=22, "Outcome" w=16, "Detail" w=40). Render 98.
      - `retained-table` (`builds.py` `RetainedBuildsModal`, 90%-width dialog): 6 columns ("Backend" w=12, "Ref" w=14, "Status" w=12, "Integrity" w=12, `Rollback` action w=12, `Remove` action w=10). Render 84.
@@ -215,10 +215,12 @@ All 20 modal confirmation call sites across the 6 mutating screens (Dashboard is
   - `_handle_restart_press`: `mutates_system=True` (tier 2 — restarts a running background service on the host).
   - `_handle_restart_all_press`: `mutates_system=True` (tier 2 — restarts every container service at once).
   - Exec shell, view logs, view compose: no modal — read-only, or a terminal handover the operator initiated explicitly.
-- **Scripts** (`scripts.py`):
-  - `run` / `boot` `TableAction`s (start↔stop, enable↔disable — two toggle columns, four verbs): confirmed with `mutates_system=True` by `CockpitScreenBase._on_table_action_invoked` (tier 2 — all four act on generated systemd units). Each prompt names the verb via the `{action}` substitution, so the toggle's current meaning reaches the modal.
+- **Units** (`scripts.py`, tab labelled "Units"):
+  - `run` `TableAction` (start↔stop toggle): `requires_root=True`, confirmed with `mutates_system=True` by `CockpitScreenBase._on_table_action_invoked` (tier 2 — acts on a generated or installed systemd unit). The prompt names the verb via the `{action}` substitution.
+  - `logs` `TableAction`: `requires_root=True` — no `confirm=`, so `_on_table_action_invoked` falls back to its default root-gate prompt. Read-only (`journalctl`), but every unit here can be root-owned and unreadable to an unprivileged operator, so the tier follows the same root gate as `run` rather than being exempted as read-only.
+  - `unitfile` `TableAction` (label "Unit"): no confirm, no root — reads `/etc/systemd/system/<unit>`, world-readable like every other unit file this toolkit installs.
   - `EditScriptModal.on_button_pressed`: `ConfirmModal(danger=True)` (declarative `scripts.yaml` write).
-  - `remove` `TableAction` (`destructive=True`): confirmed by the same gate (declarative `scripts.yaml` write; the systemd unit is deliberately left in place).
+  - `remove` `TableAction` (`destructive=True`, `available=` script rows only): confirmed by the same gate (declarative `scripts.yaml` write; the systemd unit is deliberately left in place).
 - **Settings** (`settings.py`):
   - `_real_deploy` (first-setup): `ConfirmModal(danger=True)` (writes a new `hosts/<hostname>.yaml`).
   - `_confirm_and_save_profile`: `ConfirmModal(danger=True)` (mutates an existing `hosts/<hostname>.yaml`).
@@ -288,7 +290,7 @@ Every screen in `llm-server-cockpit` conforms to one of three structural archety
 - **Per-service rows, not roll-ups.** One row per container, per script, per backend. A `4/4 healthy` summary hides which one is down, which is the only thing the row exists to show.
 - **Interaction Contract**: read-only display, **zero controls**. Passive background workers fill the panels; toasts on error only. Zero modal triggers. A control on this screen is the smell that measurement is creeping back.
 
-### Archetype B: Table-Driven Inventory (`Builds`, `Deploy`, `Downloads`, `Containers`, `Scripts`)
+### Archetype B: Table-Driven Inventory (`Builds`, `Deploy`, `Downloads`, `Containers`, `Units`)
 - **Role**: Collection browsing, status inspection, and lifecycle operations over system items.
 - **Layout**: Strict `CockpitDataTable` containment (maximum 3 tables per screen), no `fixed_columns` (§4.2), every table budgeted to fit the 115-cell usable viewport. Dedicated filter/search input row placed immediately above table if present.
 - **Per-row before bulk**: an operation that acts on *one* row is an in-table action column (§9), never a tick-box column plus a "… selected" button. An action row holds only operations that have no single-row meaning (`New Script`, `Download all missing`). This is what keeps column 0 the identifier, flush left.

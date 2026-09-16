@@ -18,6 +18,9 @@ log = logging.getLogger("provision")
 
 _UNIT_DIR = Path("/etc/systemd/system")
 _TIMEOUT_S = 10
+_JOURNAL_TIMEOUT_S = 15
+"""journalctl -n 200 outruns the 10s budget used for the quick is-active/is-enabled probes —
+matches provision/steps/docker.py::read_logs's own 15s for the same reason (a bigger read)."""
 
 
 def _unit_name(script_id: str) -> str:
@@ -78,10 +81,40 @@ def _is_enabled(unit: str) -> bool:
     return result.returncode == 0 and result.stdout.strip() == "enabled"
 
 
-def status(script_id: str) -> dict[str, Any]:
-    """Read-only status for display (the cockpit's Scripts/Dashboard tabs)."""
-    unit = _unit_name(script_id)
+def unit_status(unit: str) -> dict[str, bool]:
+    """Read-only active/enabled state for any systemd unit — not script-specific. The cockpit's
+    Units tab uses this directly for llama-swap.service, its timers and the WOL unit; `status`
+    below is the script-specific wrapper kept for callers that only have a script id."""
     return {"unit_active": _is_active(unit), "unit_enabled": _is_enabled(unit)}
+
+
+def status(script_id: str) -> dict[str, Any]:
+    """Read-only status for display (the cockpit's Units/Dashboard tabs)."""
+    return unit_status(_unit_name(script_id))
+
+
+def journal_tail(unit: str, lines: int = 200, runner: Runner | None = None) -> str:
+    """Recent journal for `unit` — feeds the cockpit Units tab's "Logs" action for llama-swap,
+    its timers, the WOL unit and every script unit alike. Scoped like
+    provision/steps/docker.py::read_logs (a snapshot, not a live tail), but unlike it this
+    never raises: callers here have no docker_available()-style precheck to lean on first, and
+    a unit that doesn't exist yet is a normal state for this tab, not an error to propagate."""
+    cmd = ["journalctl", "-u", unit, "-n", str(lines), "--no-pager"]
+    try:
+        if runner is not None:
+            # Routed through Runner so an elevated one actually applies: a system unit's journal
+            # is root-readable only, so an unprivileged read returns an empty log that looks
+            # exactly like "this unit has never run". check=False — journalctl exits non-zero
+            # for a unit that does not exist, which is a normal state for this tab.
+            result = runner.run(cmd, check=False, capture=True)
+            return (result.stdout if result is not None else "") or "(no output)"
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=_JOURNAL_TIMEOUT_S,
+        )
+    except Exception as e:
+        return f"error running journalctl: {e}"
+    return result.stdout or "(no output)"
 
 
 def start(script_id: str, runner: Runner) -> None:
