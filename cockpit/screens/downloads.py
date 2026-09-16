@@ -14,6 +14,7 @@ import json
 import os
 import re
 import shutil
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -162,7 +163,7 @@ class DownloadsScreen(CockpitScreenBase):
         self.cockpit_app = app_ref
         # id -> model dict, for the llama-cpp models currently shown in the table.
         self._downloadable: dict[str, dict[str, Any]] = {}
-        # id -> {"status": str, "size": int|None, "date": str|None} from the last refresh.
+        # id -> {"status": str, "size": int|None, "added": str|None} from the last refresh.
         self._row_info: dict[str, dict[str, Any]] = {}
         self._downloading = False
 
@@ -198,17 +199,18 @@ class DownloadsScreen(CockpitScreenBase):
         table = self.query_one("#model-table", SingleClickDataTable)
         # Column budget (DESIGN.md §4): render width is content width + 2*cell_padding per
         # column against a 115-cell usable viewport at 121x30 (121 - 2*$space-edge).
-        # Content 98, render 98 + 2*5 = 108.
+        # Content 103, render 103 + 2*6 = 115 — exactly the ceiling.
         #
-        # "Release Date" was dropped to pay for a wider ID. It only ever carried a value for a
-        # model the HF API reported as ready-to-download — it was blank for every model already
-        # on disk, i.e. the whole table once you have your weights. ID takes the space because
+        # "Added" replaced "Release Date": the release date was blank for every model already
+        # on disk, i.e. the whole table once you have your weights, whereas the date the file
+        # landed here is a fact about every one of them. ID takes the remaining space because
         # quant filenames are long ("qwen3.8-27b-gsq-rco-iq3_s-mtp" is 29 characters) and the
         # id is how the operator identifies the row.
-        table.add_column("ID", width=34)
-        table.add_column("Repo ID", width=24)
-        table.add_column("Status", width=20)
+        table.add_column("ID", width=31)
+        table.add_column("Repo ID", width=21)
+        table.add_column("Status", width=19)
         table.add_column("Size", width=10)
+        table.add_column("Added", width=10)
         table.add_action_column(TableAction("download", "Download", confirm="Download {row}?", available=self._can_download))
         # No data read here — ensure_first_view() does it when this tab is first shown.
 
@@ -239,33 +241,38 @@ class DownloadsScreen(CockpitScreenBase):
             # A downloaded model's size is on disk — stat it rather than leaving the column
             # blank. Previously only the HF API populated size, so it was "—" for every model
             # the operator actually had, which is exactly the set where the number is useful.
-            size = None
+            size = added = None
             if local == "downloaded":
                 try:
-                    size = (Path(self.host_profile["paths"]["models_dir"]) / model["quant_file"]).stat().st_size
+                    stat = (Path(self.host_profile["paths"]["models_dir"]) / model["quant_file"]).stat()
                 except OSError:
                     pass
-            return {"status": local, "size": size, "date": None}
+                else:
+                    size = stat.st_size
+                    # mtime, not an HF release date: when the weights landed on THIS host is
+                    # the fact an operator acts on ("which of these did I pull last week"),
+                    # and it is the only date available for a file that never came from a Hub.
+                    added = time.strftime("%Y-%m-%d", time.localtime(stat.st_mtime))
+            return {"status": local, "size": size, "added": added}
 
         # local == "missing" — ask HF whether it actually exists / is downloadable.
         code, data = _hf_api_lookup(model["repo_id"], token)
         if code == 200:
-            size = date = None
+            size = None
             if data:
                 sibling = next(
                     (s for s in data.get("siblings", []) if s.get("rfilename") == model.get("quant_file")),
                     None,
                 )
                 size = sibling.get("size") if sibling else None
-                date = data.get("createdAt")
-            return {"status": "ready for download", "size": size, "date": date}
+            return {"status": "ready for download", "size": size, "added": None}
         if code == 404:
             # Only reachable with a token — unauthenticated HF returns 401 for a nonexistent
             # repo too (anti-enumeration), so "not found" is never reported without one.
-            return {"status": "not found", "size": None, "date": None}
+            return {"status": "not found", "size": None, "added": None}
         if code == 401:
-            return {"status": "needs auth to verify", "size": None, "date": None}
-        return {"status": "check failed", "size": None, "date": None}
+            return {"status": "needs auth to verify", "size": None, "added": None}
+        return {"status": "check failed", "size": None, "added": None}
 
     def _apply_rows(self, models: list[dict], rows: list[tuple[dict, dict]]) -> None:
         if not self.is_mounted:
@@ -279,6 +286,7 @@ class DownloadsScreen(CockpitScreenBase):
             status = info["status"]
             status_label = _LOCAL_STATUS_LABELS.get(status, status)
             size_label = _fmt_bytes(info["size"]) if info.get("size") else "—"
+            added_label = info.get("added") or "—"
             repo_display = "PLACEHOLDER — edit models.yaml" if status == "placeholder" else model["repo_id"]
             # rich.text.Text, not raw str (DESIGN.md §4.6 / Phase 0a.6): the app console has
             # markup=True, so an operator-chosen repo_id containing brackets would have that
@@ -288,6 +296,7 @@ class DownloadsScreen(CockpitScreenBase):
                 Text(repo_display),
                 Text(status_label),
                 Text(size_label),
+                Text(added_label),
                 *table.action_cells(model["id"]),
                 key=model["id"],
             )
