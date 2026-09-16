@@ -59,6 +59,10 @@ below, never mixed into the routing above.
   ```bash
   python3 -m py_compile cockpit/*.py cockpit/screens/*.py provision/*.py provision/steps/*.py
   ```
+- **GPU fan-ramp non-regression** (launch must not wake any GPU):
+  ```bash
+  .venv/bin/python smoke/verify_no_gpu_wake.py
+  ```
 - **Runner privilege-escalation verification**:
   ```bash
   .venv/bin/python smoke/verify_runner_sudo.py

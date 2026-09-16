@@ -3,6 +3,12 @@ provisioning logic, only provision.steps.* read paths already used by the other 
 (list_builds, model_status, swap.status, wol.status, drivers.read_lockfile_status). Landing tab;
 every mutating/checking action stays on its own tab, this only answers "what's the state of my
 stack right now".
+
+GPU telemetry is the one reading this tab does NOT take on its own — see _sample_gpus. Reading
+it wakes the device, and this is the landing tab, so doing it automatically means every launch
+of the cockpit pokes every GPU. That is the fan-ramp defect twice over (commit 5c986a4 removed
+a 1Hz sampler for the same reason; this removes the remaining automatic read). Everything else
+here is /proc, systemd and file reads, which cost nothing and stay automatic.
 """
 from __future__ import annotations
 
@@ -14,7 +20,7 @@ from pathlib import Path
 from textual import work
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.widgets import ProgressBar, Static
+from textual.widgets import Button, ProgressBar, Static
 
 from cockpit import update_check
 from cockpit.widgets import CockpitScreenBase
@@ -33,6 +39,8 @@ def _fmt_mb(num_mb: float) -> str:
 
 class DashboardScreen(CockpitScreenBase):
     """Mounted as the app's default tab by cockpit/app.py — not a Textual Screen."""
+
+    BINDINGS = [("g", "sample_gpus", "Sample GPUs")]
 
     DEFAULT_CSS = """
     DashboardScreen {
@@ -100,6 +108,9 @@ class DashboardScreen(CockpitScreenBase):
         self.cockpit_app = app_ref
         self.scripts = getattr(app_ref, "scripts", {"scripts": []})
         self.backends = self._compute_backends()
+        # Last operator-requested GPU reading, or [] when none has been taken this session.
+        # Never populated automatically — see _sample_gpus.
+        self._last_gpu_sample: list[dict] = []
         # Static at construction time (host_profile is declarative, no hardware probe): one
         # slot per configured GPU, ordinal position within its own vendor — metrics.read_gpus()
         # has no shared identifier with a hosts/*.yaml gpu entry (metrics.py module docstring),
@@ -138,18 +149,21 @@ class DashboardScreen(CockpitScreenBase):
             yield Static("no AMD telemetry", id=f"res-gpu-{i}-unavail", classes="gpu-unavailable")
             return
         if vendor == "nvidia":
-            with Horizontal(classes="res-row", id=f"res-gpu-{i}-util-row"):
+            # Bars start hidden, not at 0%: nothing has been read yet, and a 0% bar would be a
+            # made-up reading (decision 0d.4). The -unavail line carries "not sampled" until
+            # the operator asks for a reading.
+            with Horizontal(classes="res-row gpu-bar-row", id=f"res-gpu-{i}-util-row"):
                 yield Static("Util", classes="res-label")
                 yield ProgressBar(total=100, show_eta=False, id=f"res-gpu-{i}-util-bar")
                 yield Static("", id=f"res-gpu-{i}-util-extra", classes="res-val")
-            yield Static("", id=f"res-gpu-{i}-util-unavail", classes="gpu-unavailable")
+            yield Static("Util: not sampled", id=f"res-gpu-{i}-util-unavail", classes="gpu-unavailable")
         else:  # intel — utilization_pct is always None, never composed as a bar
             yield Static("Util: not reported by xpu-smi", classes="gpu-unavailable")
-        with Horizontal(classes="res-row", id=f"res-gpu-{i}-mem-row"):
+        with Horizontal(classes="res-row gpu-bar-row", id=f"res-gpu-{i}-mem-row"):
             yield Static("Mem", classes="res-label")
             yield ProgressBar(total=100, show_eta=False, id=f"res-gpu-{i}-mem-bar")
             yield Static("", id=f"res-gpu-{i}-mem-text", classes="res-val")
-        yield Static("", id=f"res-gpu-{i}-mem-unavail", classes="gpu-unavailable")
+        yield Static("Mem: not sampled", id=f"res-gpu-{i}-mem-unavail", classes="gpu-unavailable")
 
     def compose(self) -> ComposeResult:
         with VerticalScroll():
@@ -172,6 +186,18 @@ class DashboardScreen(CockpitScreenBase):
                     for i, slot in enumerate(self._gpu_slots):
                         yield from self._compose_gpu_slot(i, slot)
 
+                    if self._gpu_slots:
+                        # The only control on this tab. Reading GPU telemetry wakes the device
+                        # (nvidia-smi/xpu-smi), so it is an explicit act, not something the
+                        # landing tab does to every GPU on every launch.
+                        with Horizontal(classes="action-row-secondary"):
+                            yield Button("Sample GPUs", id="btn-sample-gpus", classes="thin-button")
+                        yield Static(
+                            "GPU readings are on demand — sampling wakes the device.",
+                            id="gpu-sample-status",
+                            classes="status-text",
+                        )
+
                 with Vertical(id="dashboard-right", classes="panel"):
                     yield Static("Stack & Services", classes="panel-title")
 
@@ -189,6 +215,11 @@ class DashboardScreen(CockpitScreenBase):
 
     def on_mount(self) -> None:
         super().on_mount()
+        # Hidden until a reading exists. Composed-but-hidden rather than composed-on-demand so
+        # _apply_gpu_sample can keep toggling .display per row exactly as it already does; a
+        # visible 0% bar next to "not sampled" would be a made-up reading (decision 0d.4).
+        for row in self.query(".gpu-bar-row"):
+            row.display = False
         self._refresh_all()
 
     def on_refresh_requested(self) -> None:
@@ -205,7 +236,7 @@ class DashboardScreen(CockpitScreenBase):
         try:
             metrics_data = self._compute_metrics()
             texts = {
-                "db-hardware": self._compute_hardware_text(metrics_data.get("gpus", [])),
+                "db-hardware": self._compute_hardware_text(self._last_gpu_sample),
                 "db-llm-services": self._compute_llm_services_text(),
                 "db-system-services": self._compute_system_services_text(),
                 "db-docker-containers": self._compute_containers_text(),
@@ -239,12 +270,10 @@ class DashboardScreen(CockpitScreenBase):
         except Exception:
             mem = {"used_bytes": 0, "total_bytes": 0, "percent": 0.0}
 
-        try:
-            gpus = metrics.read_gpus()
-        except Exception:
-            gpus = []
-
-        return {"cpu_pct": cpu_pct, "mem": mem, "gpus": gpus}
+        # Deliberately no metrics.read_gpus() here. This runs on mount and on every global
+        # refresh; nvidia-smi/xpu-smi wake the device, which is the fan ramp. GPU readings come
+        # from _sample_gpus only, when the operator asks.
+        return {"cpu_pct": cpu_pct, "mem": mem}
 
     def _match_live_gpu(self, slot: dict, live_gpus: list[dict]) -> dict | None:
         """Pair a configured GPU slot with its live reading by (vendor, ordinal position) —
@@ -272,9 +301,14 @@ class DashboardScreen(CockpitScreenBase):
         else:
             self.query_one("#res-mem-text", Static).update("n/a")
 
-        # GPU — one section per configured slot (decision 0d.4: mark gaps explicitly, never a
-        # 0% bar for a stat that isn't real).
-        live_gpus = data.get("gpus", [])
+    def _apply_gpu_sample(self, live_gpus: list[dict]) -> None:
+        """Render one operator-requested GPU reading. Split out of _apply_metrics because the
+        two now run on completely different triggers: CPU/RAM on mount and refresh, GPU only
+        on demand (decision 0d.4 still holds — mark gaps explicitly, never a 0% bar for a stat
+        that isn't real)."""
+        if not self.is_mounted:
+            return
+        self._last_gpu_sample = live_gpus
         for i, slot in enumerate(self._gpu_slots):
             live = self._match_live_gpu(slot, live_gpus)
             # Header shows the live device name when a reading was matched (Defect 4:
@@ -331,6 +365,36 @@ class DashboardScreen(CockpitScreenBase):
                     f"{_fmt_mb(mem_used)} / {_fmt_mb(mem_total)}"
                 )
 
+    # ------------------------------------------------------------------ GPU sampling (on demand)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if (event.button.id or "") == "btn-sample-gpus":
+            self.action_sample_gpus()
+
+    def action_sample_gpus(self) -> None:
+        self.query_one("#gpu-sample-status", Static).update("sampling...")
+        self._sample_gpus()
+
+    @work(thread=True)
+    def _sample_gpus(self) -> None:
+        """The ONLY path that runs nvidia-smi/xpu-smi. Operator-triggered, one shot, never on
+        mount, never on the global 'r' refresh, never on a timer."""
+        try:
+            gpus = metrics.read_gpus()
+            error = None
+        except Exception as e:
+            gpus, error = [], str(e)
+        self.app.call_from_thread(self._apply_gpu_sample, gpus)
+        stamp = time.strftime("%H:%M:%S")
+        self.app.call_from_thread(
+            self.query_one("#gpu-sample-status", Static).update,
+            f"sample failed: {error}" if error else f"sampled at {stamp} — readings are a snapshot, not live.",
+        )
+        # The hardware line names GPUs from the live reading when there is one.
+        self.app.call_from_thread(
+            self.query_one("#db-hardware", Static).update, self._compute_hardware_text(gpus)
+        )
+
     # ------------------------------------------------------------------ Panel text computation
 
     def _compute_hardware_text(self, live_gpus: list[dict]) -> str:
@@ -343,6 +407,7 @@ class DashboardScreen(CockpitScreenBase):
             lines.append(f"GPU: {', '.join(names)}")
         else:
             cfg_count = len(self.host_profile.get("gpus", []))
+            # Not an error: no GPU has been sampled yet, which is the default state.
             lines.append(f"GPU: {cfg_count} configured in profile" if cfg_count else "GPU: none configured")
 
         try:

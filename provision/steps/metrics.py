@@ -1,12 +1,18 @@
 """Live host/GPU utilization reads for the cockpit's Dashboard tab — pure sampling, no
-mutating actions, so unlike every other provision/steps/*.py module there's no run(). Every
-function here is meant to be called as a one-shot read triggered by mounting or refreshing the
-Dashboard tab (see cockpit/screens/dashboard.py's @work(thread=True) _refresh_all), never from
-a recurring UI timer — commit 5c986a4 removed a 1Hz set_interval sampler after it kept an Intel
-Arc GPU's sysman telemetry active continuously and was observed to ramp its fans to 100% within
-moments of opening the app. Each function here is a single, fast, best-effort read that
-degrades to "not available" rather than raising, since a transient failure here should never
-interrupt a caller working through several of these in one pass.
+mutating actions, so unlike every other provision/steps/*.py module there's no run(). Each
+function here is a single, fast, best-effort read that degrades to "not available" rather than
+raising, since a transient failure here should never interrupt a caller working through several
+of these in one pass.
+
+**read_gpus() must only ever run when the operator explicitly asks for a reading.** Not on a
+timer, not on mount, not on the global refresh. Reading GPU telemetry wakes the device, and on
+an Intel Arc it keeps sysman telemetry active; the fans ramp to 100% within moments. This has
+been fixed twice — commit 5c986a4 removed a 1Hz set_interval sampler, and the Dashboard's
+remaining mount-time read was removed after QA saw the ramp again on plain launch, the
+Dashboard being the landing tab. Its only caller is now dashboard.py's _sample_gpus, behind a
+button. `smoke/verify_no_gpu_wake.py` holds the line.
+
+The CPU/memory/disk readers have no such constraint — /proc and statvfs wake nothing.
 
 GPU coverage: nvidia via `nvidia-smi` (full utilization+memory+power). Intel via `xpu-smi`:
 memory/power/frequency only — as of the xpu-smi version this was written against (2.1.0,
