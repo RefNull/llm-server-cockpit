@@ -5,6 +5,7 @@ incidents (`5c986a4`, `b799d83`) traced to GPU telemetry.
 
 **Decisions taken 2026-09-16** (see the homestack/PiDeployment merge audit, same date):
 - **x86-64 only. Raspberry Pi is out of scope — it always was, structurally.** See §0c.
+- **Open questions 1-4 settled** (Lead's call, reversible UI choices — see Open questions).
 - **No merge with homestack.** The two projects split by *workload*, not hardware: homestack
   deploys home services (DNS, media, Samba, backups), this deploys LLM inference. Both run on
   Debian. Nothing in this plan reaches for a shared abstraction with it.
@@ -373,22 +374,21 @@ but it belongs in its own commit, not this plan.
 
 ## Open questions for the operator
 
-1. **Container rows**: one row per running container, or a single `Docker  ✔  4/4 healthy`
-   summary? Per-container matches "list the services"; the summary stays short on a busy host.
-   Plan currently assumes **per-container**.
-2. **Endpoint line**: it is a fact, not a service, so it has no meaningful ✔/✖. Plan currently
-   renders it in the Services panel with a blank glyph column. It could equally sit in the left
-   column under System.
-3. **Upstream update check**: the Dashboard's "Upstream Updates" line is the only network call
-   at launch (2 GitHub requests). It is not a service and not system identity. Keep it on the
-   Dashboard, move it to Backends (which already has its own check), or drop it?
-4. **GPU product names — is one `lspci` worth it?** Without it the accelerator rows can only
-   show what `hosts/<hostname>.yaml` declares (`gpu-nvidia · nvidia · cuda, vulkan`) plus
-   whatever the lockfile holds. With it they can show "NVIDIA GeForce RTX 5090" — which is
-   much closer to the "exact hardware revision" you asked for, and `lspci` does not wake a GPU.
-   Cost is one subprocess at launch (6 → 7) and a `bash -c` pipeline whose output shape has
-   never been asserted by a test. **Recommendation: include it**, behind a reader that degrades
-   to the declared id, and add a fixture test for the parse. Your call.
+1. ~~**Container rows**~~ **SETTLED: one row per container.** "List the services and whether
+   they are enabled" is per-service; a `4/4 healthy` roll-up hides which one is down, which is
+   the only thing the row is for.
+2. ~~**Endpoint line**~~ **SETTLED: it becomes llama-swap's detail, not its own row.**
+   `llama-swap  ✔  running · v255 · 100.95.76.0:8090`. It is a property of that service, so it
+   needs no glyph of its own and no glyph-less row breaking the column.
+3. ~~**Upstream update check**~~ **SETTLED: removed from the Dashboard.** It is neither system
+   identity nor a service, so it fits neither column, and LLM > Backends already runs the same
+   check on its own first view. Removing it takes launch to **zero network calls**. Reversible
+   in ~10 lines if the at-a-glance value turns out to be missed.
+4. ~~**GPU product names — is one `lspci` worth it?**~~ **SETTLED by the Principal: yes,
+   include it.** `lspci` is not a GPU vendor tool and does not wake a device. It replaces the
+   `bash -c` pipeline at `settings.py:64-68` with an argv-list `subprocess.run` + Python parse,
+   so the parse becomes fixture-testable. Degrades to the declared `gpus[].id` when `lspci` is
+   absent or unparseable. Net launch cost: +1 subprocess, -2 network calls (question 3).
 5. ~~**Raspberry Pi — is it a real target?**~~ **RESOLVED 2026-09-16: no.** The host schema
    cannot represent a Pi (§0c), and the Pi keeps running homestack, which is the tool for it.
    Device-tree reading is dropped from Phase 1.
