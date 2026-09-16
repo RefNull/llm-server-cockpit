@@ -265,7 +265,7 @@ class ScriptsScreen(CockpitScreenBase):
             with Horizontal(classes="action-row-primary"):
                 # The only screen-level action left: every per-script operation is an in-table
                 # action column on its own row, so there is no selection to act on.
-                yield Button("New Script", id="btn-new-script", variant="primary", classes="thin-button")
+                yield Button("Add Script", id="btn-new-script", variant="primary", classes="thin-button")
             yield Static("", id="status-message", classes="status-text")
 
     def on_mount(self) -> None:

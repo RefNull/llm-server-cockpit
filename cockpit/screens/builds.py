@@ -411,7 +411,10 @@ class BuildsScreen(CockpitScreenBase):
         backends_table.zebra_stripes = True
         backends_table.add_column("Component", width=22)
         backends_table.add_column("Pinned ref", width=14)
-        backends_table.add_column("Status", width=34)
+        # 22 + 14 + 55 + 10 = 101 content, render 101 + 2*4 = 109 (DESIGN.md §4). Status was 34,
+        # which truncated both the useful case ("update available (latest d1d3c33)") and the
+        # failure case ("couldn't check (HTTP Error 403: rate limit exceeded)") to noise.
+        backends_table.add_column("Status", width=55)
         backends_table.add_action_column(
             TableAction(
                 "update",
@@ -434,7 +437,7 @@ class BuildsScreen(CockpitScreenBase):
         check is a network call, so it runs once when the tab is first opened and then only on
         the explicit button — never on 'r'."""
         self._refresh_backends_table()
-        self._run_update_check(notify_result=False)
+        self._run_update_check(notify_result=False, force=False)
 
     # ------------------------------------------------------------------ rendering
 
@@ -542,11 +545,15 @@ class BuildsScreen(CockpitScreenBase):
     # ------------------------------------------------------------------ upstream version check (network, off main thread)
 
     @work(thread=True)
-    def _run_update_check(self, *, notify_result: bool = True) -> None:
+    def _run_update_check(self, *, notify_result: bool = True, force: bool = True) -> None:
+        """`force=False` is served from update_check's 24h cache. Opening this tab used to fire
+        two GitHub calls every time, against a 60/hour unauthenticated budget — enough to start
+        returning 403s that rendered as "couldn't check" and read like a network fault. The
+        button below always forces, because that is what pressing it means."""
         self.app.call_from_thread(self._set_checking_status, True)
         try:
-            result_cpp = update_check.check_llama_cpp(self.manifest)
-            result_swap = update_check.check_llama_swap(self.manifest)
+            results = update_check.check_all(self.manifest, force=force)
+            result_cpp, result_swap = results["llama_cpp"], results["llama_swap"]
         except Exception as e:
             self.app.call_from_thread(self.app.notify, f"version check failed: {e}", severity="error")
             self.app.call_from_thread(self._set_checking_status, False)

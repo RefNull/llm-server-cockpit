@@ -40,6 +40,9 @@ class SystemdScreen(CockpitScreenBase):
     SystemdScreen {
         height: 1fr;
     }
+    SystemdScreen #systemd-filter-row {
+        margin-bottom: $space-section;
+    }
     SystemdScreen #systemd-table {
         height: 1fr;
         max-height: 100%;

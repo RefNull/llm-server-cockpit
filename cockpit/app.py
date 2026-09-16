@@ -87,7 +87,7 @@ class CockpitApp(App):
 
     Normal mode's tabs are grouped two levels deep via nested TabbedContent — Dashboard is the
     default/landing tab, "LLM" groups Backends/Models/HF Downloads (BuildsScreen/DeployScreen/
-    DownloadsScreen — renamed labels only, same screen classes), "Deployments" groups
+    DownloadsScreen — renamed labels only, same screen classes), "System" groups
     Containers/Scripts/Systemd, Settings groups its own sub-tabs internally (see
     SettingsScreen._compose_normal). Nesting doesn't change how
     action_refresh_all's DOM query below finds screens: Textual mounts every TabPane's content
@@ -214,19 +214,19 @@ class CockpitApp(App):
                 with TabPane("Dashboard", id="dashboard"):
                     yield DashboardScreen(self.host_profile, self.manifest, self.models, self.runner, self.repo_root, self)
                 with TabPane("LLM", id="llm"):
-                    with TabbedContent(initial="backends", id="llm-tabs"):
+                    # Deployments first: it is the tab an operator opens to see what is served.
+                    with TabbedContent(initial="models", id="llm-tabs"):
+                        with TabPane("Deployments", id="models"):
+                            yield DeployScreen(self.host_profile, self.manifest, self.models, self.runner, self.repo_root, self)
                         with TabPane("Backends", id="backends"):
                             yield BuildsScreen(self.host_profile, self.manifest, self.models, self.runner, self.repo_root, self)
-                        with TabPane("Models", id="models"):
-                            yield DeployScreen(self.host_profile, self.manifest, self.models, self.runner, self.repo_root, self)
-                        with TabPane("HF Downloads", id="hf-downloads"):
+                        with TabPane("Model Files", id="hf-downloads"):
                             yield DownloadsScreen(self.host_profile, self.manifest, self.models, self.runner, self.repo_root, self)
-                with TabPane("Deployments", id="deployments"):
-                    # Containers and Scripts are the same job seen twice — supervised
-                    # long-running processes this host owns — so they group the way
-                    # Backends/Models/HF Downloads already do rather than each taking a
-                    # top-level tab.
-                    with TabbedContent(initial="containers", id="deployment-tabs"):
+                with TabPane("System", id="system"):
+                    # Host-level surfaces: containers, the toolkit's own script units, and
+                    # every systemd unit. Named "System" because "Deployments" now belongs to
+                    # the LLM sub-tab that lists what llama-swap serves — one name, one place.
+                    with TabbedContent(initial="containers", id="system-tabs"):
                         with TabPane("Containers", id="containers"):
                             yield ContainersScreen(self.host_profile, self.manifest, self.models, self.runner, self.repo_root, self)
                         with TabPane("Scripts", id="scripts"):

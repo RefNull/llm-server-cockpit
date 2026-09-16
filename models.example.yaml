@@ -46,7 +46,6 @@ models:
       - "--flash-attn"
     env:
       - "VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/intel_icd.x86_64.json"
-    ttl: 0
 
   - id: bge-m3
     engine: llama-cpp
@@ -63,7 +62,6 @@ models:
       - "8192"
     env:
       - "CUDA_VISIBLE_DEVICES=0"
-    ttl: 0
     group: always-on
 
   - id: qwen3-reranker-4b
@@ -80,7 +78,6 @@ models:
       - "--embedding"
     env:
       - "CUDA_VISIBLE_DEVICES=0"
-    ttl: 0
     group: always-on
 
   # Not built/pinned/version-checked by this repo — it's a pre-existing
@@ -93,5 +90,4 @@ models:
       --gpus device=0
       -v /srv/models/speaches-cache:/home/ubuntu/.cache/huggingface/hub
       speaches-ai/speaches:latest-cuda
-    ttl: 0
     group: always-on

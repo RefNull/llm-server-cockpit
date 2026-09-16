@@ -22,6 +22,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Input, Label, Select, Static, TextArea
 
 from cockpit.screens.downloads import list_model_files
+from provision.steps import sysinfo
 from cockpit.widgets import (
     CockpitScreenBase,
     ConfirmModal,
@@ -93,9 +94,27 @@ class EditModelModal(ModalScreen[bool]):
     EditModelModal {
         align: center middle;
     }
+    #edit-model-columns {
+        height: 1fr;
+    }
+    #edit-model-scroll {
+        width: 3fr;
+        padding-right: $space-section;
+    }
+    /* env only. A model can carry 15-20 KEY=VALUE lines and the single-column form gave it a
+       box a few rows tall at the bottom of a scroll — the one field most likely to be long was
+       the one hardest to edit. */
+    #edit-model-right {
+        width: 2fr;
+        height: 1fr;
+    }
+    #f-env {
+        height: 1fr;
+        min-height: 18;
+    }
     #edit-model-dialog {
-        width: 80;
-        height: 85%;
+        width: 110;
+        height: 90%;
         border: thick $background 80%;
         background: $surface;
         padding: $space-normal $space-section;
@@ -129,8 +148,13 @@ class EditModelModal(ModalScreen[bool]):
         editing_id: str | None,
         repo_root: Path,
         app_ref: Any,
+        resident: bool = False,
     ) -> None:
         super().__init__()
+        # Seeds the ttl field for a NEW binding: 0 is "never unload" (upstream llama-swap), so
+        # "Add Resident Model" prefills 0 and "Add Swappable" leaves it blank, which means
+        # llama-swap's own default. Editing never re-seeds — the stored value wins.
+        self.resident_seed = resident
         self.host_profile = host_profile
         self.manifest = manifest
         self.models = models
@@ -175,7 +199,8 @@ class EditModelModal(ModalScreen[bool]):
 
         with Vertical(id="edit-model-dialog"):
             yield Static(title, id="edit-model-title")
-            with VerticalScroll(id="edit-model-scroll"):
+            with Horizontal(id="edit-model-columns"):
+              with VerticalScroll(id="edit-model-scroll"):
                 # No id field: it is derived from the chosen filename (see _derived_id), which
                 # is what llama-swap routes on. Shown read-only so it is not a surprise.
                 yield Label("id (from the selected file)")
@@ -211,17 +236,22 @@ class EditModelModal(ModalScreen[bool]):
                     yield Label("cmd (raw shell command, ${PORT} available)")
                     yield TextArea(m.get("cmd", "") if m else "", id="f-cmd")
 
-                yield Label("env (one KEY=VALUE per line)")
-                yield TextArea("\n".join(m.get("env", [])) if m else "", id="f-env")
                 yield Label("ttl (seconds; 0 = never unload, blank = llama-swap default)")
                 # Blank for a new binding, not "0": 0 means never unload, so defaulting the
                 # box to it would make every model created here resident. Only an explicit ttl
                 # already in models.yaml is prefilled.
-                yield Input(id="f-ttl", value=("" if m is None or "ttl" not in m else str(m["ttl"])))
+                yield Input(
+                    id="f-ttl",
+                    value=("0" if m is None and self.resident_seed else "" if m is None or "ttl" not in m else str(m["ttl"])),
+                )
                 yield Label("group (optional)")
                 yield Input(id="f-group", placeholder="", value=m.get("group", "") if m else "")
 
                 yield Static("", id="form-error", classes="error-text")
+
+              with Vertical(id="edit-model-right"):
+                  yield Label("env (one KEY=VALUE per line)")
+                  yield TextArea("\n".join(m.get("env", [])) if m else "", id="f-env")
 
             with Horizontal(classes="action-row-primary"):
                 yield Button("Save", id="btn-save", variant="primary", classes="thin-button")
@@ -251,7 +281,26 @@ class EditModelModal(ModalScreen[bool]):
             self._refresh_backend_options(str(self.query_one("#f-gpu", Select).value), selected=selected_backend)
 
     def _gpu_options(self) -> list[tuple[str, str]]:
-        return [(g["id"], g["id"]) for g in self.host_profile.get("gpus", [])]
+        """Label carries the product name, value stays the configured id.
+
+        Only the id is ever written to models.yaml — bind.gpu must match hosts/*.yaml. The name
+        is there so "gpu-nvidia" is not the only thing distinguishing two accelerators at the
+        moment you choose one. Names come from lspci, which does not wake a device.
+        """
+        try:
+            pci = sysinfo.read_pci_gpus()
+        except Exception:
+            pci = []
+        seen: dict[str, int] = {}
+        options: list[tuple[str, str]] = []
+        for gpu in self.host_profile.get("gpus", []):
+            vendor = gpu.get("vendor", "")
+            ordinal = seen.get(vendor, 0)
+            seen[vendor] = ordinal + 1
+            matches = [n for n in pci if vendor and vendor.lower() in n.lower()]
+            name = matches[ordinal] if ordinal < len(matches) else None
+            options.append((f"{gpu['id']} — {name}" if name else gpu["id"], gpu["id"]))
+        return options
 
     def _backend_options_for_gpu(self, gpu_id: str) -> list[tuple[str, str]]:
         for g in self.host_profile.get("gpus", []):
@@ -568,6 +617,8 @@ class ImportModelsModal(ModalScreen[bool]):
 
 
 class DeployScreen(CockpitScreenBase):
+    BINDINGS = [("i", "open_swap_repo", "llama-swap install page")]
+
     """Cockpit "Deploy" tab conforming to Archetype B (Table-Driven Inventory)."""
 
     DEFAULT_CSS = """
@@ -606,16 +657,25 @@ class DeployScreen(CockpitScreenBase):
             # Split by what each row costs at rest, which is the question an operator actually
             # has about a model catalogue: "what is pinned in my VRAM right now?" Both tables
             # carry identical columns and actions — the split is the information.
-            yield Static("Resident — loaded on first request, never unloaded", classes="section-title")
+            # Shown only when llama-swap is absent: every row in both tables is a route it
+            # serves, so without it this whole tab describes something that cannot run.
+            yield Static("", id="swap-missing", classes="error-text")
+
+            yield Static("Resident (never unloaded from vRAM)", classes="section-title")
             yield SingleClickDataTable(id="models-resident", classes="data-table")
-            yield Static("Swappable — evicted after idle", classes="section-title")
+            with Horizontal(classes="action-row-secondary"):
+                yield Button("Add Resident Model", id="btn-add-resident", classes="thin-button")
+
+            yield Static("Swappable (evicted when idle)", classes="section-title")
             yield SingleClickDataTable(id="models-swappable", classes="data-table")
+            with Horizontal(classes="action-row-secondary"):
+                yield Button("Add Swappable Model", id="btn-add-swappable", classes="thin-button")
+
             with Horizontal(classes="action-row-primary"):
-                yield Button("Apply & Restart Service", id="btn-apply", variant="primary", classes="thin-button")
+                yield Button("Apply & Restart llama-swap", id="btn-apply", variant="primary", classes="thin-button")
                 yield Static("│", classes="action-row-divider")
-                yield Button("Add Model", id="btn-add-model", classes="thin-button")
-                yield Button("Import from Llama-Swap", id="btn-import-toggle", classes="thin-button")
-                yield Button("Preview YAML", id="btn-preview-yaml", classes="thin-button")
+                yield Button("Import from llama-swap", id="btn-import-toggle", classes="thin-button")
+                yield Button("Preview llama-swap YAML", id="btn-preview-yaml", classes="thin-button")
             yield Static("", id="status-message", classes="status-text")
 
     def on_mount(self) -> None:
@@ -650,7 +710,29 @@ class DeployScreen(CockpitScreenBase):
         """
         return model.get("ttl") == 0 or bool(model.get("group"))
 
+    def action_open_swap_repo(self) -> None:
+        self.app.open_url(self.manifest.get("llama_swap", {}).get("repo", "https://github.com/mostlygeek/llama-swap"))
+
+    def _refresh_swap_notice(self) -> None:
+        """Every row here is a llama-swap route, so say plainly when llama-swap is missing.
+
+        `App.open_url` rather than printing a URL to copy — README's own multi-surface rule
+        (§7) routes external links through it so this still works under textual-serve.
+        """
+        notice = self.query_one("#swap-missing", Static)
+        if Path("/usr/local/bin/llama-swap").exists():
+            notice.update("")
+            notice.display = False
+            return
+        notice.display = True
+        notice.update(
+            "REQUIRES LLAMA-SWAP — not installed at /usr/local/bin/llama-swap. "
+            "Nothing below can be served until it is. Press 'i' to open the install page, "
+            "or deploy it from Settings > System Services > Apply Service Settings."
+        )
+
     def _populate_table(self) -> None:
+        self._refresh_swap_notice()
         resident = self.query_one("#models-resident", SingleClickDataTable)
         swappable = self.query_one("#models-swappable", SingleClickDataTable)
         resident.clear()
@@ -687,7 +769,7 @@ class DeployScreen(CockpitScreenBase):
     # -- Actions ---------------------------------------------------------------
 
     @work
-    async def _on_add_model(self) -> None:
+    async def _on_add_model(self, resident: bool = False) -> None:
         saved = await self.app.push_screen_wait(
             EditModelModal(
                 host_profile=self.host_profile,
@@ -696,6 +778,7 @@ class DeployScreen(CockpitScreenBase):
                 editing_id=None,
                 repo_root=self.repo_root,
                 app_ref=self.app_ref,
+                resident=resident,
             )
         )
         if saved:
@@ -810,8 +893,10 @@ class DeployScreen(CockpitScreenBase):
         bid = event.button.id
         if bid == "btn-apply":
             self._confirm_and_apply()
-        elif bid == "btn-add-model":
-            self._on_add_model()
+        elif bid in ("btn-add-resident", "btn-add-swappable"):
+            # Which button was pressed seeds the new binding's residency, so "Add" under a
+            # table puts the model in that table rather than wherever the ttl default lands.
+            self._on_add_model(resident=bid == "btn-add-resident")
         elif bid == "btn-import-toggle":
             self._on_import_toggle()
         elif bid == "btn-preview-yaml":

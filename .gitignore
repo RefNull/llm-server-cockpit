@@ -12,5 +12,6 @@ screenshots/
 !/hosts/example.yaml
 /hosts/*.lock.yaml
 /hosts/*.hidden-units.yaml
+/hosts/*.update-cache.yaml
 /models.yaml
 /scripts.yaml
