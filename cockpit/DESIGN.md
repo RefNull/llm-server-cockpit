@@ -148,7 +148,7 @@ Textual's `DataTable` is a scroll container (`overflow-x: auto`) that scrolls ho
    - A **tick-able** table's column 0 is the `[ ]`/`[x]` `selection_marker`. Only `import-table` is still tick-able; `backends-table`, `model-table` and `scripts-table` dropped theirs when their bulk "act on selected" buttons became per-row action columns, which is also what put their `ID` flush against the left edge.
    - **Render width** = content width + 2 cells of padding per column (`Column.get_render_width`). Budget: **≤ 115**, the usable viewport at 121×30 (121 − 2 × `$space-edge`). Modal-hosted tables are budgeted against their dialog width, not this.
    - The 8 tables (Dashboard renders no table; `builds-table` no longer exists — retained builds moved into `RetainedBuildsModal`):
-     - `backends-table` (`builds.py`): 4 columns ("Component" w=22, "Pinned ref" w=14, "Status" w=34, `Update` action w=10). Render 88.
+     - `backends-table` (`builds.py`): 5 columns ("Component" w=22, "Version" w=14, "Installed" w=14, "Status" w=35, `Build`/`Rebuild` action w=11). Render 106. Three separate facts, deliberately not one column: **Version** is the `manifest.yaml` pin (global — the same value on every backend row), **Installed** is what `prefix_root/<backend>/current` actually points at (per backend, styled green when it equals Version, yellow when it differs, dim when absent), and **Status** is the upstream comparison. Collapsing them is what let a QA build report "update available" after a successful build. The action column is w=11, not `len("Build")+4=9`, because a callable label must fit its *widest* resolved value — `"Rebuild"` (DESIGN.md §9, state toggles).
      - `models-table` (`deploy.py`): 8 columns ("ID" w=24, "Engine" w=12, "GPU" w=10, "Backend" w=10, "Group" w=12, "TTL" w=8, `Edit` action w=8, `Remove` action w=10). Render 110.
      - `model-table` (`downloads.py`): 6 columns ("ID" w=20, "Repo ID" w=26, "Status" w=20, "Size" w=10, "Release Date" w=12, `Download` action w=12). Render 112.
      - `containers-table` (`containers.py`): 6 columns ("Name" w=22, "Image" w=24, "Status" w=20, "Ports" w=18, "Compose" w=8, `Restart` action w=11). Render 115.
@@ -198,13 +198,17 @@ raw `install ... returned non-zero exit status 1`.
 ### Expressing the Tier
 Two idioms, split on which fact the call site actually knows:
 - An action meeting one of the three clauses above calls `self.confirm(..., mutates_system=True)` (`CockpitScreenBase.confirm`), which derives `danger=True`. The call site declares *what the action does*, not how the button should look.
-- A write confined to this repo's declarative files (`models.yaml`, `scripts.yaml`, `hosts/<hostname>.yaml`) is not tier-1 by the clause above, but is still confirmed with `ConfirmModal(..., danger=True)` directly — established precedent across this project: a config write is the thing a later `Deploy` turns into a system change, and operators treat it as consequential.
+- A write confined to this repo's declarative files (`models.yaml`, `scripts.yaml`, `hosts/<hostname>.yaml`, `manifest.yaml`) is not tier-1 by the clause above, but is still confirmed with `ConfirmModal(..., danger=True)` directly — established precedent across this project: a config write is the thing a later `Deploy` turns into a system change, and operators treat it as consequential.
+  - **`manifest.yaml` differs from the other three in being tracked by git.** That is why its confirm shows the old ref → the new one rather than just naming the file: the pin is auditable in history, and the confirm is the operator's last look before it moves. It is written by a targeted line rewrite, never `yaml.safe_dump`, which would destroy the header comment block and the `# bNNNNN` build-number comment on the `ref:` line.
 
 ### Call-Site Audit & Enforcement
 All 20 modal confirmation call sites across the 6 mutating screens (Dashboard is read-only and opens no modal):
 - **Builds** (`builds.py`):
-  - `_handle_update_selected_press`: `mutates_system=True` (tier 3 — compiles and swaps the backend runtime binary `current` points at).
-  - `_handle_rollback_press`: `mutates_system=True` (tier 3 — repoints `current` at a different runtime binary).
+  - `handle_table_action` → `_run_build`: `mutates_system=True`, `requires_root=True` via the `build` `TableAction` (tier 3 — compiles and swaps the backend runtime binary `current` points at). The prompt names the resolved verb through `{action}`, so a row whose prefix already exists reads "Rebuild".
+  - `RetainedBuildsModal._run_rollback`: `mutates_system=True` (tier 3 — repoints `current` at a different runtime binary).
+  - `_confirm_and_update_to_latest`: `ConfirmModal(danger=True)` (declarative `manifest.yaml` write, showing old → new).
+  - `_confirm_and_change_version`: `ConfirmModal(danger=True)` (same write, from the `ChangeVersionModal` picker).
+  - **Selecting a version and building it are separate acts**, and the two confirms above are the version half — neither compiles anything. Rollback is a third thing again: it repoints `current` without touching the pin. Do not merge them.
 - **Deploy** (`deploy.py`):
   - `_confirm_and_save`: `ConfirmModal(danger=True)` (declarative `models.yaml` write).
   - `_delete_selected`: `ConfirmModal(danger=True)` (declarative `models.yaml` write).
@@ -364,7 +368,7 @@ revert to always-wrapping.
 `.close-button` (the `×` glyph docked top-right of `InfoModal` / `BuildHistoryModal`) is a modal close affordance, not an action button: `width: 4; height: 1; border: none; dock: right`. It is exempt because it carries a glyph rather than a label, and it must not be used for anything else.
 
 ### Enforcement
-- Every `Button(` in `cockpit/screens/` is action-row (`classes="thin-button"`), `.close-button` (not an archetype, see above), or inline — and an inline site is marked with a trailing `# inline archetype (DESIGN.md §9)` comment, because the `.inline-row` class sits on the enclosing `Horizontal` and is not visible on the `Button(` line itself. So this command must print **nothing**:
+- Every `Button(` in `cockpit/screens/` is action-row (`classes="thin-button"`), `.close-button` (not an archetype, see above), or inline — and an inline site is marked with a trailing `# inline archetype (DESIGN.md §9): bare Button inside .inline-row` comment, because the `.inline-row` class sits on the enclosing `Horizontal` and is not visible on the `Button(` line itself. **The trailing `.inline-row` in that comment is load-bearing, not decoration**: the check below filters on `inline-row`, so the shorter `# inline archetype (DESIGN.md §9)` does not satisfy it. This paragraph used to give exactly that shorter form, and a compliant button at `downloads.py:178` failed the check for years because of it — the marker and the grep must be read as one contract. So this command must print **nothing**:
   ```bash
   grep -rn 'Button(' cockpit/screens/ | grep -vE 'thin-button|close-button|inline-row'
   ```
