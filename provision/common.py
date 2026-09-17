@@ -18,7 +18,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 log = logging.getLogger("provision")
 
@@ -35,13 +35,23 @@ _ATOMIC_SYMLINK = (
 
 
 class Runner:
-    def __init__(self, dry_run: bool = False, sudo: bool = False):
+    def __init__(
+        self,
+        dry_run: bool = False,
+        sudo: bool = False,
+        on_output: Callable[[str], None] | None = None,
+    ):
         self.dry_run = dry_run
         # Set by the cockpit once the operator has authenticated (see
         # cockpit.widgets.ensure_root). `-n` throughout: this never prompts for a password
         # from inside a running TUI — the credential is cached before the flag is set, and an
         # expired cache fails loudly rather than blocking on a hidden prompt.
         self.sudo = sudo
+        # When set, run()/shell() stream subprocess output line-by-line through this callback
+        # instead of inheriting stdout/stderr — the mechanism that stops build output (or any
+        # other long-running command) from painting over the TUI's own tty. None reproduces the
+        # exact behaviour this class had before on_output existed.
+        self.on_output = on_output
 
     def _announce(self, action: str) -> None:
         log.info("%s%s%s", "[dry-run] " if self.dry_run else "", "[sudo] " if self.sudo else "", action)
@@ -61,6 +71,8 @@ class Runner:
         self._announce(f"run: {' '.join(str(c) for c in cmd)}" + (f"  (cwd={cwd})" if cwd else ""))
         if self.dry_run:
             return None
+        if self.on_output is not None:
+            return self._run_streaming(self._elevate(cmd), check=check, env=env, cwd=cwd)
         return subprocess.run(
             self._elevate(cmd),
             check=check,
@@ -71,12 +83,48 @@ class Runner:
             text=True,
         )
 
+    def _run_streaming(
+        self,
+        argv: list[str],
+        *,
+        check: bool,
+        env: dict | None,
+        cwd: str | Path | None,
+    ) -> subprocess.CompletedProcess:
+        """Feed self.on_output one line at a time as the child produces it, instead of capturing
+        to completion and dumping a finished string — the whole point being that a multi-minute
+        build's output is visible while it runs, not after.
+        """
+        proc = subprocess.Popen(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            env=env,
+            cwd=cwd,
+        )
+        lines: list[str] = []
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            line = line.rstrip("\n")
+            lines.append(line)
+            self.on_output(line)
+        proc.wait()
+        output = "\n".join(lines)
+        if check and proc.returncode != 0:
+            raise subprocess.CalledProcessError(proc.returncode, argv, output=output)
+        return subprocess.CompletedProcess(argv, proc.returncode, stdout=output, stderr=None)
+
     def shell(self, script: str, *, check: bool = True, cwd: str | Path | None = None) -> subprocess.CompletedProcess | None:
         """For steps that must `source` a vendor env script (e.g. oneAPI setvars.sh) before a build."""
         self._announce(f"shell: {script}" + (f"  (cwd={cwd})" if cwd else ""))
         if self.dry_run:
             return None
-        return subprocess.run(self._elevate(["bash", "-c", script]), check=check, cwd=cwd)
+        argv = self._elevate(["bash", "-c", script])
+        if self.on_output is not None:
+            return self._run_streaming(argv, check=check, env=None, cwd=cwd)
+        return subprocess.run(argv, check=check, cwd=cwd)
 
     def write_file(self, path: str | Path, content: str, *, mode: int | None = None) -> None:
         path = Path(path)
@@ -143,10 +191,7 @@ class Runner:
         if not missing:
             log.info("apt packages already present: %s", ", ".join(packages))
             return
-        self._announce(f"apt-get install -y {' '.join(missing)}")
-        if self.dry_run:
-            return
-        subprocess.run(self._elevate(["apt-get", "install", "-y", *missing]), check=True)
+        self.run(["apt-get", "install", "-y", *missing])
 
 
 def unit_value(value: str) -> str:

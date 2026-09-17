@@ -13,6 +13,7 @@ from rich.text import Text
 from textual import work
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.css.query import NoMatches
 from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, RichLog, Static
 
@@ -62,6 +63,80 @@ class _BuildLogHandler(logging.Handler):
             self._screen.app.call_from_thread(self._screen._append_build_log, msg)
         except Exception:
             pass  # app shutting down or no longer running in a thread context — drop it
+
+
+class BuildLogModal(ModalScreen[None]):
+    """A view over BuildsScreen's build-log buffer, not the buffer itself.
+
+    The buffer (`BuildsScreen._log_buffer`) survives independently of whether this modal is
+    open — closing it (escape or ×, both live at all times, even mid-build: DESIGN.md §6.1
+    explicitly anticipates the operator switching away from a long-running build, and a
+    completion toast is how they learn it finished without this view open) loses nothing.
+    Reopening via the 'Build log' button replays the buffer, then keeps receiving live appends.
+    """
+
+    BINDINGS = [("escape", "dismiss_modal", "Close")]
+
+    DEFAULT_CSS = """
+    BuildLogModal {
+        align: center middle;
+    }
+    #build-log-dialog {
+        width: 90%;
+        height: 80%;
+        border: thick $background 80%;
+        background: $surface;
+        padding: $space-normal $space-section;
+    }
+    #build-log-header {
+        height: auto;
+        margin-bottom: $space-normal;
+    }
+    #build-log-title {
+        width: 1fr;
+        text-style: bold;
+    }
+    #build-log-body {
+        height: 1fr;
+    }
+    """
+
+    def __init__(self, title: str, buffer: list[str]) -> None:
+        super().__init__()
+        self.log_title = title
+        self._buffer = buffer
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="build-log-dialog"):
+            with Horizontal(id="build-log-header"):
+                yield Static(self.log_title, id="build-log-title")
+                yield Button("×", id="build-log-close", classes="close-button", variant="error")
+            yield RichLog(id="build-log-body", highlight=False, markup=False, max_lines=400)
+            with Horizontal(classes="action-row-secondary"):
+                yield Button("Close", id="btn-build-log-close-bottom", classes="thin-button")
+
+    def on_mount(self) -> None:
+        body = self.query_one("#build-log-body", RichLog)
+        for line in self._buffer:
+            body.write(line)
+
+    def append(self, msg: str) -> None:
+        # A line can arrive between push_screen and on_mount — measured: a build whose first
+        # log line lands in that window raised NoMatches straight into the build worker, where
+        # `except Exception` would have reported a perfectly good build as failed. Dropping it
+        # here costs nothing: BuildsScreen._log_buffer is the source of truth and is appended
+        # to before this call, so on_mount replays the line in full.
+        try:
+            self.query_one("#build-log-body", RichLog).write(msg)
+        except NoMatches:
+            pass
+
+    def action_dismiss_modal(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id in ("build-log-close", "btn-build-log-close-bottom"):
+            self.dismiss(None)
 
 
 class BuildHistoryModal(ModalScreen[None]):
@@ -330,17 +405,6 @@ class BuildsScreen(CockpitScreenBase):
     BuildsScreen {
         height: 1fr;
     }
-    BuildsScreen #build-log {
-        height: 10;
-        border: round $accent;
-        margin-top: $space-normal;
-        display: none;
-    }
-    BuildsScreen #build-status {
-        text-style: italic;
-        margin-top: $space-normal;
-        margin-bottom: $space-normal;
-    }
     """
 
     def __init__(
@@ -364,6 +428,10 @@ class BuildsScreen(CockpitScreenBase):
         self._build_in_progress = False
         self._llama_cpp_check: dict | None = None
         self._llama_swap_check: dict | None = None
+        # Owned by the screen, not the modal: the log survives a closed/reopened BuildLogModal
+        # and a build the operator has switched tabs away from (DESIGN.md §6.1).
+        self._log_buffer: list[str] = []
+        self._log_modal: BuildLogModal | None = None
 
     def _compute_backends(self) -> list[str]:
         seen: list[str] = []
@@ -401,9 +469,7 @@ class BuildsScreen(CockpitScreenBase):
                 yield Button("Retained Builds", id="btn-retained-builds", classes="thin-button")
                 yield Button("Build History", id="btn-build-history", classes="thin-button")
                 yield Button("Check for Updates", id="btn-check-updates", classes="thin-button")
-
-            yield Static("", id="build-status")
-            yield RichLog(id="build-log", highlight=False, markup=False, max_lines=400)
+                yield Button("Build log", id="btn-build-log", classes="thin-button")
 
     def on_mount(self) -> None:
         backends_table = self.query_one("#backends-table", SingleClickDataTable)
@@ -491,6 +557,8 @@ class BuildsScreen(CockpitScreenBase):
         if self._build_in_progress:
             self.notify("a build is already in progress", severity="warning")
             return
+        self._log_buffer = []
+        self._open_log_modal(f"Build log — {row_key}")
         self._run_build([row_key])
 
     # ------------------------------------------------------------------ button dispatch
@@ -503,6 +571,17 @@ class BuildsScreen(CockpitScreenBase):
             self.app.push_screen(BuildHistoryModal(self.host_profile, self.backends))
         elif button_id == "btn-retained-builds":
             self.app.push_screen(RetainedBuildsModal(self.host_profile, self.backends, self.runner))
+        elif button_id == "btn-build-log":
+            self._open_log_modal("Build log")
+
+    def _open_log_modal(self, title: str) -> None:
+        modal = BuildLogModal(title, self._log_buffer)
+        self._log_modal = modal
+        self.app.push_screen(modal, callback=lambda _: self._clear_log_modal(modal))
+
+    def _clear_log_modal(self, modal: "BuildLogModal") -> None:
+        if self._log_modal is modal:
+            self._log_modal = None
 
     # ------------------------------------------------------------------ build (blocking, off main thread)
 
@@ -517,8 +596,17 @@ class BuildsScreen(CockpitScreenBase):
             provision_logger.setLevel(logging.INFO)
         provision_logger.addHandler(handler)
 
+        # A fresh Runner, not a mutation of self.privileged_runner: that property can fall back
+        # to self.runner, which is shared app-wide (widgets.py:862-870) — setting on_output on
+        # it would leak this build's subprocess lines into every other screen's use of the
+        # shared Runner. sudo is only a bool; the credential lives in the OS sudo timestamp
+        # cache, not on the Runner object, so a new instance carrying the same flags is
+        # equivalent and cannot leak.
+        pr = self.privileged_runner
+        runner = Runner(dry_run=pr.dry_run, sudo=pr.sudo, on_output=self._on_build_output)
+
         try:
-            build_step.run(self.host_profile, self.manifest, self.models, self.privileged_runner, self.repo_root, backends=backends)
+            build_step.run(self.host_profile, self.manifest, self.models, runner, self.repo_root, backends=backends)
         except SystemExit as e:
             self.app.call_from_thread(self.app.notify, f"build failed: {e}", severity="error")
         except Exception as e:  # never let a build-time exception crash the whole TUI
@@ -531,16 +619,18 @@ class BuildsScreen(CockpitScreenBase):
             self.app.call_from_thread(self._set_building, False)
             self.app.call_from_thread(self._refresh_backends_table)
 
+    def _on_build_output(self, line: str) -> None:
+        """Runs on the build's worker thread (called from Runner._run_streaming) — bridge to
+        the main thread exactly as _BuildLogHandler.emit does."""
+        self.app.call_from_thread(self._append_build_log, f"$ {line}")
+
     def _set_building(self, active: bool) -> None:
         self._build_in_progress = active
-        self.query_one("#build-status", Static).update("building... (see log below)" if active else "")
-        if active:
-            log_widget = self.query_one("#build-log", RichLog)
-            log_widget.clear()
-            log_widget.display = True
 
     def _append_build_log(self, msg: str) -> None:
-        self.query_one("#build-log", RichLog).write(msg)
+        self._log_buffer.append(msg)
+        if self._log_modal is not None:
+            self._log_modal.append(msg)
 
     # ------------------------------------------------------------------ upstream version check (network, off main thread)
 
