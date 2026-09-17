@@ -164,7 +164,7 @@ sudo bin/provision swap      # llama-swap install, config generation, systemd un
 
 ### 1. Software Manifest (`manifest.yaml`)
 
-Defines immutable upstream release pins and per-backend compilation recipes. Bumping a version here is the only sanctioned path to update inference binaries:
+Defines upstream release pins and per-backend compilation recipes. Bumping a version here is the only sanctioned path to update inference binaries — by hand, or from the cockpit's Installs tab ("Update to latest" / "Change version…"), which write this same file through a targeted, comment-preserving line rewrite (never a full YAML re-dump) and are themselves confirmed before they touch it. Either way the pin stays tracked by git, so a version change has an author and a diff:
 
 ```yaml
 llama_cpp:

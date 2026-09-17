@@ -258,6 +258,7 @@ class CockpitApp(App):
                 screen.ensure_first_view()
 
     def action_refresh_all(self) -> None:
+        self.reload_manifest()
         self.reload_models()
         self.reload_scripts()
         # Every tab subclasses CockpitScreenBase, which makes on_refresh_requested() abstract —
@@ -265,6 +266,20 @@ class CockpitApp(App):
         # guard that silently skipped any tab that forgot to implement it.
         for screen in self.query(CockpitScreenBase):
             screen.on_refresh_requested()
+
+    def reload_manifest(self) -> None:
+        """Re-read manifest.yaml — the third sibling to reload_models()/reload_scripts().
+
+        A screen that writes the llama_cpp pin (BuildsScreen's "Update to latest"/"Change
+        version…") calls this instead of loading its own copy: self.manifest here is the one
+        object every screen's constructor was handed (cockpit/app.py compose()), so rebinding
+        it only on the writing screen would leave every other tab holding the pre-write dict
+        until the app restarts.
+        """
+        try:
+            self.manifest = schema.load_manifest(self.repo_root / "manifest.yaml")
+        except schema.ValidationError as e:
+            self.notify(f"manifest.yaml error: {e}", severity="error")
 
     def reload_models(self) -> None:
         if self.host_profile is None:

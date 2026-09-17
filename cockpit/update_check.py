@@ -25,15 +25,32 @@ _CACHE_TTL_S = 24 * 60 * 60
 _CACHE_PATH = Path(__file__).resolve().parent.parent / "hosts" / "upstream.update-cache.yaml"
 
 
+def _read_full_cache() -> dict[str, Any]:
+    """The whole cache file as a dict — check_all's "checked_at"/"results" plus, since Phase 2,
+    a "releases" section keyed by repo path. One file, one TTL constant, shared by both;
+    _write_cache used to overwrite the file wholesale, which would have silently dropped
+    whichever section it didn't know about."""
+    try:
+        data = yaml.safe_load(_CACHE_PATH.read_text()) or {}
+    except (OSError, yaml.YAMLError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_full_cache(data: dict[str, Any]) -> None:
+    try:
+        _CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _CACHE_PATH.write_text(yaml.safe_dump(data, sort_keys=False))
+    except OSError:
+        pass  # a cache that cannot be written is a slower app, not a broken one
+
+
 def _read_cache() -> dict[str, Any] | None:
     """Last result, if it is still fresh. Unauthenticated GitHub allows 60 requests/hour/IP and
     this repo makes two calls per check — opening the Backends tab a few times in a session was
     enough to start getting 403s, which then rendered as "couldn't check" and looked like a
     network fault rather than a self-inflicted rate limit."""
-    try:
-        data = yaml.safe_load(_CACHE_PATH.read_text()) or {}
-    except (OSError, yaml.YAMLError):
-        return None
+    data = _read_full_cache()
     checked_at = data.get("checked_at")
     if not isinstance(checked_at, (int, float)) or time.time() - checked_at > _CACHE_TTL_S:
         return None
@@ -42,11 +59,12 @@ def _read_cache() -> dict[str, Any] | None:
 
 
 def _write_cache(results: dict[str, Any]) -> None:
-    try:
-        _CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _CACHE_PATH.write_text(yaml.safe_dump({"checked_at": time.time(), "results": results}, sort_keys=False))
-    except OSError:
-        pass  # a cache that cannot be written is a slower app, not a broken one
+    # Merge, not overwrite: a bare {"checked_at", "results"} write would clobber the
+    # "releases" section on the very next version check.
+    data = _read_full_cache()
+    data["checked_at"] = time.time()
+    data["results"] = results
+    _write_full_cache(data)
 
 
 def cache_age_seconds() -> float | None:
@@ -70,6 +88,63 @@ def _get_json(url: str) -> Any:
 
 def _repo_path(repo_url: str) -> str:
     return repo_url.rstrip("/").removeprefix("https://github.com/")
+
+
+def _read_releases_cache(repo_path: str) -> list[dict[str, Any]] | None:
+    entry = (_read_full_cache().get("releases") or {}).get(repo_path)
+    if not isinstance(entry, dict):
+        return None
+    checked_at = entry.get("checked_at")
+    if not isinstance(checked_at, (int, float)) or time.time() - checked_at > _CACHE_TTL_S:
+        return None
+    items = entry.get("items")
+    return items if isinstance(items, list) else None
+
+
+def _write_releases_cache(repo_path: str, items: list[dict[str, Any]]) -> None:
+    data = _read_full_cache()
+    releases = data.get("releases")
+    if not isinstance(releases, dict):
+        releases = {}
+    releases[repo_path] = {"checked_at": time.time(), "items": items}
+    data["releases"] = releases
+    _write_full_cache(data)
+
+
+def check_releases(repo_url: str, *, force: bool = False, limit: int = 20) -> dict[str, Any]:
+    """Recent GitHub releases for `repo_url` — the "upstream releases" source for BuildsScreen's
+    Change version… picker (plans/05 Phase 2 item 4). Same 24h cache and TTL as check_all,
+    same never-raise contract: {"ok": True, "releases": [...]} or {"ok": False, "error": ...}.
+    Each release item is {"tag_name", "published_at"}.
+    """
+    repo = _repo_path(repo_url)
+    if not force:
+        cached = _read_releases_cache(repo)
+        if cached is not None:
+            return {"ok": True, "releases": cached}
+    try:
+        data = _get_json(f"https://api.github.com/repos/{repo}/releases?per_page={limit}")
+    except Exception as e:  # network down, rate-limited, VPN-only host — never crash the UI
+        return {"ok": False, "error": str(e)}
+    releases = [
+        {"tag_name": r.get("tag_name"), "published_at": r.get("published_at")}
+        for r in data if isinstance(r, dict)
+    ]
+    _write_releases_cache(repo, releases)
+    return {"ok": True, "releases": releases}
+
+
+def resolve_ref_sha(repo_url: str, ref: str) -> str:
+    """Resolve any git ref (branch, tag, short/long SHA) to its full commit SHA.
+
+    Raises on failure, unlike check_llama_cpp/check_llama_swap/check_releases — those back a
+    passive background check that must never crash the UI, this backs one operator-initiated
+    lookup (BuildsScreen's Change version… picker resolving a chosen release tag) whose caller
+    is already inside a try/except and reports the failure itself.
+    """
+    repo = _repo_path(repo_url)
+    data = _get_json(f"https://api.github.com/repos/{repo}/commits/{ref}")
+    return data["sha"]
 
 
 def check_llama_cpp(manifest: dict[str, Any]) -> dict[str, Any]:

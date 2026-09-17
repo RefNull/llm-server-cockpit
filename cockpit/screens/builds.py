@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from pathlib import Path
 
 from rich.text import Text
@@ -15,7 +16,7 @@ from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.css.query import NoMatches
 from textual.screen import ModalScreen
-from textual.widgets import Button, DataTable, RichLog, Static
+from textual.widgets import Button, DataTable, Input, RichLog, Static
 
 from cockpit import update_check
 from cockpit.widgets import (
@@ -38,6 +39,29 @@ def _short(ref: str | None) -> str:
     if not ref:
         return ""
     return ref[:10]
+
+
+# Matches only the `ref:` line under `llama_cpp:` — manifest.yaml has exactly one `ref:` key
+# today, so anchoring on the key name (rather than tracking YAML section nesting) is sufficient
+# and keeps this a plain line rewrite, not a parser. Preserves indentation and any trailing
+# `# bNNNNN` comment unless a new one is supplied — never `yaml.safe_dump`, which would destroy
+# both the header comment block above this line and this line's own trailing comment (plans/05
+# Phase 2 item 8).
+_MANIFEST_REF_RE = re.compile(r"^(\s*ref:\s*)([0-9a-fA-F]{7,40})(\s*#.*)?$", re.MULTILINE)
+
+
+def _write_manifest_ref(path: Path, new_ref: str, new_comment: str | None = None) -> None:
+    """Rewrite manifest.yaml's `llama_cpp.ref` line in place, byte-identical otherwise."""
+    text = path.read_text()
+
+    def _sub(m: re.Match[str]) -> str:
+        comment = f"  # {new_comment}" if new_comment else (m.group(3) or "")
+        return f"{m.group(1)}{new_ref}{comment}"
+
+    new_text, count = _MANIFEST_REF_RE.subn(_sub, text, count=1)
+    if count != 1:
+        raise RuntimeError(f"manifest.yaml: could not find a llama_cpp.ref line to rewrite in {path}")
+    path.write_text(new_text)
 
 
 class _BuildLogHandler(logging.Handler):
@@ -396,6 +420,186 @@ class RetainedBuildsModal(ModalScreen[None]):
         self.app.call_from_thread(self._refresh)
 
 
+class ChangeVersionModal(ModalScreen[str | None]):
+    """Version picker for BuildsScreen's "Change version…" action (plans/05 Phase 2 item 4).
+
+    Always dismisses with a resolved commit SHA (or None on cancel) — never a bare tag — so the
+    caller can write it straight into manifest.yaml's `ref:` line. Sources, in the order the
+    operator asked for ("go back" first): build-history outcomes and on-disk retained builds
+    (both already carry real SHAs), then upstream releases (network, backgrounded so opening the
+    modal never blocks on it — a release's tag is resolved to a SHA lazily, only if it's the one
+    picked), plus a manual SHA entry for anything not already known locally.
+
+    Not a CockpitScreenBase — a ModalScreen is a different widget-tree root, same reason
+    RetainedBuildsModal implements its own confirm-free select-and-dismiss dispatch here. The
+    confirm step belongs to the caller (BuildsScreen._confirm_and_change_version): it is the
+    same confirm §3's "Update to latest" already uses, and this modal's only job is to return a
+    ref.
+    """
+
+    BINDINGS = [("escape", "dismiss_modal", "Close")]
+
+    DEFAULT_CSS = """
+    ChangeVersionModal {
+        align: center middle;
+    }
+    #version-dialog {
+        width: 90%;
+        height: 80%;
+        border: thick $background 80%;
+        background: $surface;
+        padding: $space-normal $space-section;
+    }
+    #version-header {
+        height: auto;
+        margin-bottom: $space-normal;
+    }
+    #version-title {
+        width: 1fr;
+        text-style: bold;
+    }
+    #version-table {
+        height: 1fr;
+        margin-bottom: $space-normal;
+    }
+    #version-manual-row {
+        margin-bottom: $space-normal;
+    }
+    #version-error {
+        color: $error;
+        height: auto;
+        margin-bottom: $space-normal;
+    }
+    """
+
+    def __init__(self, host_profile: dict, manifest: dict, backends: list[str]) -> None:
+        super().__init__()
+        self.host_profile = host_profile
+        self.manifest = manifest
+        self.backends = backends
+        # row key (a real SHA, or an unresolved release tag) -> {"kind", "sources", "details"}
+        self._rows: dict[str, dict] = {}
+        # resolved SHA -> the release tag it came from — read by the caller after dismiss so
+        # manifest.yaml's trailing comment can record it (item 8's "when known").
+        self.resolved_tags: dict[str, str] = {}
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="version-dialog"):
+            with Horizontal(id="version-header"):
+                yield Static("Change Version", id="version-title")
+                yield Button("×", id="version-close", classes="close-button", variant="error")
+            table = SingleClickDataTable(id="version-table", zebra_stripes=True)
+            table.cursor_type = "row"
+            yield table
+            yield Static("", id="version-error")
+            with Horizontal(id="version-manual-row", classes="inline-row"):
+                yield Input(placeholder="or paste a full SHA", id="f-manual-ref")
+                yield Button("Use this SHA", id="btn-manual-select")  # inline archetype (DESIGN.md §9): bare Button inside .inline-row
+            with Horizontal(classes="action-row-secondary"):
+                yield Button("Cancel", id="btn-version-cancel", classes="thin-button")
+
+    def on_mount(self) -> None:
+        table = self.query_one("#version-table", SingleClickDataTable)
+        table.add_column("Source", width=12)
+        table.add_column("Ref", width=14)
+        table.add_column("Detail", width=44)
+        table.add_action_column(TableAction("select", "Select"))
+        self._populate_local(table)
+        self._fetch_releases(table)
+
+    def _add_row(self, key: str, source: str, detail: str, *, kind: str) -> None:
+        row = self._rows.setdefault(key, {"kind": kind, "sources": set(), "details": []})
+        row["sources"].add(source)
+        row["details"].append(detail)
+        if kind == "sha":  # a real SHA always wins over a same-string tag coincidence
+            row["kind"] = "sha"
+
+    def _refresh_table(self, table: SingleClickDataTable) -> None:
+        if not self.is_mounted:
+            return
+        table.clear()
+        for key, row in self._rows.items():
+            display_ref = _short(key) if row["kind"] == "sha" else key
+            table.add_row(
+                Text("/".join(sorted(row["sources"]))),
+                Text(display_ref),
+                Text("; ".join(row["details"])[:200]),
+                *table.action_cells(key),
+                key=key,
+            )
+
+    def _populate_local(self, table: SingleClickDataTable) -> None:
+        for backend in self.backends:
+            for h in build_step.read_build_history(self.host_profile, backend, limit=10):
+                ref = h.get("ref") or ""
+                if ref:
+                    self._add_row(ref, "history", f"{backend}: {h.get('outcome', '')}", kind="sha")
+            for b in build_step.list_builds(self.host_profile, backend):
+                ref = b.get("ref") or ""
+                if not ref:
+                    continue
+                state = "current" if b.get("current") else "retained"
+                if not b.get("sane"):
+                    state += " NOT SANE"
+                self._add_row(ref, "installed", f"{backend}: {state}", kind="sha")
+        self._refresh_table(table)
+
+    @work(thread=True)
+    def _fetch_releases(self, table: SingleClickDataTable) -> None:
+        repo = self.manifest.get("llama_cpp", {}).get("repo", "")
+        if not repo:
+            return
+        result = update_check.check_releases(repo)
+        if not result.get("ok"):
+            return
+        for r in result["releases"]:
+            tag = r.get("tag_name") or ""
+            if tag:
+                self._add_row(tag, "upstream", f"released {(r.get('published_at') or '')[:10]}", kind="tag")
+        self.app.call_from_thread(self._refresh_table, table)
+
+    def _set_error(self, message: str) -> None:
+        if self.is_mounted:
+            self.query_one("#version-error", Static).update(message)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id in ("version-close", "btn-version-cancel"):
+            self.dismiss(None)
+        elif event.button.id == "btn-manual-select":
+            self._select_manual()
+
+    def _select_manual(self) -> None:
+        value = self.query_one("#f-manual-ref", Input).value.strip()
+        if not re.fullmatch(r"[0-9a-fA-F]{7,40}", value):
+            self._set_error("not a SHA — paste the full (or a >=7-char short) commit hash")
+            return
+        self.dismiss(value)
+
+    def action_dismiss_modal(self) -> None:
+        self.dismiss(None)
+
+    @work
+    async def _on_table_action_invoked(self, event: TableActionInvoked) -> None:
+        event.stop()
+        row = self._rows.get(event.row_key)
+        if row is None:
+            return
+        if row["kind"] == "sha":
+            self.dismiss(event.row_key)
+            return
+        self._resolve_tag_and_dismiss(event.row_key)
+
+    @work(thread=True)
+    def _resolve_tag_and_dismiss(self, tag: str) -> None:
+        try:
+            sha = update_check.resolve_ref_sha(self.manifest["llama_cpp"]["repo"], tag)
+        except Exception as e:
+            self.app.call_from_thread(self.app.notify, f"could not resolve {tag}: {e}", severity="error")
+            return
+        self.resolved_tags[sha] = tag
+        self.app.call_from_thread(self.dismiss, sha)
+
+
 class BuildsScreen(CockpitScreenBase):
     """The 'Installs' tab. One panel per backend the host's GPUs actually use (cuda, vulkan,
     etc. per hosts/<hostname>.yaml), plus one upstream-version-check panel.
@@ -425,7 +629,12 @@ class BuildsScreen(CockpitScreenBase):
         self.app_ref = app_ref
         self.backends = self._compute_backends()
 
-        self._build_in_progress = False
+        # Which backends currently have a build worker running — a set, not a bool: the guard
+        # in handle_table_action derives "a build is already in progress" from non-emptiness,
+        # and it stays a hard guard (never widened to allow concurrent builds) because every
+        # backend's build shares one source checkout (state_dir/src/llama.cpp, build.py:235)
+        # that a second, concurrent build would race on.
+        self._building_backends: set[str] = set()
         self._llama_cpp_check: dict | None = None
         self._llama_swap_check: dict | None = None
         # Owned by the screen, not the modal: the log survives a closed/reopened BuildLogModal
@@ -465,10 +674,18 @@ class BuildsScreen(CockpitScreenBase):
                     classes="panel",
                 )
 
+            # Two rows, split by what the operator is deciding, not by width — both rows fit
+            # one line at normal widths and both stack under Screen.-narrow (SHARED_CSS,
+            # DESIGN.md §9 "Action-row overflow at narrow widths"). Row 1 is the decision
+            # (which version); row 2 is the record (what has actually been built). Build itself
+            # is deliberately not here — it's per-backend, so it lives in the table.
+            with Horizontal(classes="action-row-secondary"):
+                yield Button("Update to latest", id="btn-update-to-latest", classes="thin-button", disabled=True)
+                yield Button("Change version…", id="btn-change-version", classes="thin-button")
+                yield Button("Check for Updates", id="btn-check-updates", classes="thin-button")
             with Horizontal(classes="action-row-secondary"):
                 yield Button("Retained Builds", id="btn-retained-builds", classes="thin-button")
                 yield Button("Build History", id="btn-build-history", classes="thin-button")
-                yield Button("Check for Updates", id="btn-check-updates", classes="thin-button")
                 yield Button("Build log", id="btn-build-log", classes="thin-button")
 
     def on_mount(self) -> None:
@@ -476,18 +693,22 @@ class BuildsScreen(CockpitScreenBase):
         backends_table.cursor_type = "row"
         backends_table.zebra_stripes = True
         backends_table.add_column("Component", width=22)
-        backends_table.add_column("Pinned ref", width=14)
-        # 22 + 14 + 55 + 10 = 101 content, render 101 + 2*4 = 109 (DESIGN.md §4). Status was 34,
-        # which truncated both the useful case ("update available (latest d1d3c33)") and the
-        # failure case ("couldn't check (HTTP Error 403: rate limit exceeded)") to noise.
-        backends_table.add_column("Status", width=55)
+        backends_table.add_column("Version", width=14)
+        backends_table.add_column("Installed", width=14)
+        # 22 + 14 + 14 + 35 + 11 = 96 content, render 96 + 2*5 = 106 (DESIGN.md §4, updated for
+        # the Phase 2 5-column shape — Version/Installed replace the old single manifest-pin
+        # column). Status keeps enough room for both the useful case ("update available (latest
+        # d1d3c33)") and the failure case ("couldn't check (HTTP Error 403: rate limit
+        # exceeded)").
+        backends_table.add_column("Status", width=35)
         backends_table.add_action_column(
             TableAction(
-                "update",
-                "Update",
-                confirm="Build/update {row}? This can take several minutes.",
+                "build",
+                self._build_label,
+                width=11,  # fits "[ Rebuild ]" (7+4); "[ Build ]" (9) fits the same column
+                confirm="{action} llama.cpp ({row})? This can take several minutes.",
                 requires_root=True,
-                available=self._backend_has_update,
+                available=lambda row_key: row_key in self.backends,
             )
         )
 
@@ -496,7 +717,11 @@ class BuildsScreen(CockpitScreenBase):
     def on_refresh_requested(self) -> None:
         """Called by the app's global 'r' binding. Re-reads local (manifest/check) state —
         never re-triggers the network update check."""
+        # The one place BuildsScreen picks up a manifest.yaml pin change made from any screen —
+        # dashboard.py:147 is the precedent for this getattr shape.
+        self.manifest = getattr(self.app_ref, "manifest", self.manifest)
         self._refresh_backends_table()
+        self._update_action_buttons_state()
 
     def on_first_view(self) -> None:
         """The one screen whose first view does more than a refresh: the upstream version
@@ -507,23 +732,47 @@ class BuildsScreen(CockpitScreenBase):
 
     # ------------------------------------------------------------------ rendering
 
-    def _backend_has_update(self, row_key: str) -> bool:
-        return (
-            row_key in self.backends
-            and self._llama_cpp_check is not None
-            and self._llama_cpp_check.get("ok")
-            and self._llama_cpp_check.get("update_available")
-        )
+    def _build_label(self, row_key: str) -> str:
+        """Rebuild when the selected version is already built and sane for this backend —
+        pressing Build on the current version then literally is a rebuild (plans/05 Phase 2
+        item 5), rather than the old silent no-op _prefix_ready used to produce."""
+        ref = self.manifest.get("llama_cpp", {}).get("ref", "")
+        for b in build_step.list_builds(self.host_profile, row_key):
+            if b.get("ref") == ref and b.get("sane"):
+                return "Rebuild"
+        return "Build"
+
+    def _installed_ref(self, backend: str) -> str | None:
+        for b in build_step.list_builds(self.host_profile, backend):
+            if b.get("current"):
+                return b.get("ref")
+        return None
+
+    def _installed_cell(self, backend: str, selected_ref: str) -> Text:
+        """§0b: `current` is a per-backend symlink target, independent of the (global) pin —
+        this is the cell that would have told QA the truth immediately."""
+        current_ref = self._installed_ref(backend)
+        if current_ref is None:
+            return Text("not built", style="dim")
+        if current_ref == selected_ref:
+            return Text(_short(current_ref), style="green")
+        return Text(_short(current_ref), style="bold yellow")
 
     def _refresh_backends_table(self) -> None:
         table = self.query_one("#backends-table", SingleClickDataTable)
         table.clear()
         cpp_ref = self.manifest.get("llama_cpp", {}).get("ref", "")
         for backend in self.backends:
+            status_cell = (
+                Text("building…", style="dim")
+                if backend in self._building_backends
+                else self._format_update_cell(self._llama_cpp_check, shorten=True)
+            )
             table.add_row(
                 Text(f"llama.cpp ({backend})"),
                 Text(_short(cpp_ref)),
-                self._format_update_cell(self._llama_cpp_check, shorten=True),
+                self._installed_cell(backend, cpp_ref),
+                status_cell,
                 *table.action_cells(backend),
                 key=backend,
             )
@@ -531,10 +780,11 @@ class BuildsScreen(CockpitScreenBase):
         table.add_row(
             Text("llama-swap"),
             Text(swap_version),
+            Text("—", style="dim"),
             self._format_update_cell(self._llama_swap_check, shorten=False),
             # The llama-swap row is informational only — updated from the Deploy tab's deploy
-            # action, not from here — so its Update cell is always blank (_backend_has_update
-            # is False for any key not in self.backends).
+            # action, not from here — so its Build cell is always blank ("llama-swap" is never
+            # in self.backends).
             *table.action_cells("llama-swap"),
             key="llama-swap",
         )
@@ -549,17 +799,30 @@ class BuildsScreen(CockpitScreenBase):
         latest = _short(result["latest"]) if shorten else result["latest"]
         return Text(f"update available (latest {latest})", style="bold yellow")
 
+    def _update_action_buttons_state(self) -> None:
+        if not self.is_mounted:
+            return
+        can_update = bool(
+            self._llama_cpp_check
+            and self._llama_cpp_check.get("ok")
+            and self._llama_cpp_check.get("update_available")
+        )
+        btn = self.query("#btn-update-to-latest")
+        if btn:
+            btn.first(Button).disabled = not can_update
+
     # ------------------------------------------------------------------ per-row action dispatch
 
     async def handle_table_action(self, action_id: str, row_key: str, table: DataTable) -> None:
-        if action_id != "update":
+        if action_id != "build":
             return
-        if self._build_in_progress:
+        if self._building_backends:
             self.notify("a build is already in progress", severity="warning")
             return
+        force = self._build_label(row_key) == "Rebuild"
         self._log_buffer = []
         self._open_log_modal(f"Build log — {row_key}")
-        self._run_build([row_key])
+        self._run_build([row_key], force=force)
 
     # ------------------------------------------------------------------ button dispatch
 
@@ -567,6 +830,10 @@ class BuildsScreen(CockpitScreenBase):
         button_id = event.button.id or ""
         if button_id == "btn-check-updates":
             self._run_update_check()
+        elif button_id == "btn-update-to-latest":
+            self._confirm_and_update_to_latest()
+        elif button_id == "btn-change-version":
+            self._confirm_and_change_version()
         elif button_id == "btn-build-history":
             self.app.push_screen(BuildHistoryModal(self.host_profile, self.backends))
         elif button_id == "btn-retained-builds":
@@ -583,11 +850,76 @@ class BuildsScreen(CockpitScreenBase):
         if self._log_modal is modal:
             self._log_modal = None
 
+    # ------------------------------------------------------------------ version selection (writes manifest.yaml, never builds)
+
+    @work
+    async def _confirm_and_update_to_latest(self) -> None:
+        """Writes llama_cpp.ref to the SHA the last check found upstream. Does not build —
+        that is a separate act the operator takes per backend from the table (plans/05 Phase 2
+        item 3)."""
+        check = self._llama_cpp_check
+        if not check or not check.get("ok") or not check.get("update_available"):
+            self.notify("no update to apply — run 'Check for Updates' first", severity="warning")
+            return
+        old_ref = self.manifest.get("llama_cpp", {}).get("ref", "")
+        new_ref = check["latest"]
+        message = (
+            f"Update llama.cpp version {_short(old_ref)} → {_short(new_ref)} "
+            f"(latest as of {check.get('latest_date', 'unknown date')})? "
+            "Writes manifest.yaml; does not build."
+        )
+        confirmed = await self.app.push_screen_wait(ConfirmModal(message, confirm_label="Update Version", danger=True))
+        if not confirmed:
+            return
+        self._write_pin(new_ref)
+        # We know the relationship without a network call: the pin now equals what the last
+        # check called "latest", so update_available flips locally — on_refresh_requested's
+        # no-network contract stays intact, this is just reflecting what we already learned.
+        self._llama_cpp_check = {**check, "pinned": new_ref, "update_available": False}
+        self._refresh_backends_table()
+        self._update_action_buttons_state()
+        self.notify(f"llama.cpp pin updated to {_short(new_ref)}")
+
+    @work
+    async def _confirm_and_change_version(self) -> None:
+        """Opens the version picker and writes whatever it returns. Does not build."""
+        modal = ChangeVersionModal(self.host_profile, self.manifest, self.backends)
+        new_ref = await self.app.push_screen_wait(modal)
+        if new_ref is None:
+            return
+        old_ref = self.manifest.get("llama_cpp", {}).get("ref", "")
+        already_built = sorted(
+            backend for backend in self.backends
+            for b in build_step.list_builds(self.host_profile, backend)
+            if b.get("ref") == new_ref and b.get("sane")
+        )
+        message = f"Update llama.cpp version {_short(old_ref)} → {_short(new_ref)}? Writes manifest.yaml; does not build."
+        if already_built:
+            message += (
+                f" Already built and sane for {', '.join(already_built)} — use Retained Builds "
+                "to activate it there instead of building again."
+            )
+        confirmed = await self.app.push_screen_wait(ConfirmModal(message, confirm_label="Update Version", danger=True))
+        if not confirmed:
+            return
+        self._write_pin(new_ref, new_comment=modal.resolved_tags.get(new_ref))
+        self._refresh_backends_table()
+
+    def _write_pin(self, new_ref: str, *, new_comment: str | None = None) -> None:
+        _write_manifest_ref(self.repo_root / "manifest.yaml", new_ref, new_comment)
+        # Reload through the app, not a private load here: cockpit/app.py hands the same
+        # manifest dict to every screen's constructor, so rebinding only self.manifest would
+        # leave every other tab holding the pre-write dict until the app restarts. reload_manifest
+        # is the third sibling to reload_models()/reload_scripts() (cockpit/app.py).
+        self.app_ref.reload_manifest()
+        self.manifest = getattr(self.app_ref, "manifest", self.manifest)
+
     # ------------------------------------------------------------------ build (blocking, off main thread)
 
     @work(thread=True)
-    def _run_build(self, backends: list[str]) -> None:
-        self.app.call_from_thread(self._set_building, True)
+    def _run_build(self, backends: list[str], *, force: bool = False) -> None:
+        self.app.call_from_thread(self._set_building, backends, True)
+        self.app.call_from_thread(self._refresh_backends_table)
 
         handler = _BuildLogHandler(self)
         provision_logger = logging.getLogger("provision")
@@ -606,7 +938,10 @@ class BuildsScreen(CockpitScreenBase):
         runner = Runner(dry_run=pr.dry_run, sudo=pr.sudo, on_output=self._on_build_output)
 
         try:
-            build_step.run(self.host_profile, self.manifest, self.models, runner, self.repo_root, backends=backends)
+            build_step.run(
+                self.host_profile, self.manifest, self.models, runner, self.repo_root,
+                backends=backends, force=force,
+            )
         except SystemExit as e:
             self.app.call_from_thread(self.app.notify, f"build failed: {e}", severity="error")
         except Exception as e:  # never let a build-time exception crash the whole TUI
@@ -616,7 +951,10 @@ class BuildsScreen(CockpitScreenBase):
         finally:
             provision_logger.removeHandler(handler)
             provision_logger.setLevel(prior_level)
-            self.app.call_from_thread(self._set_building, False)
+            self.app.call_from_thread(self._set_building, backends, False)
+            # Re-reads list_builds() for these backends (via _refresh_backends_table's Installed
+            # column), never the network check — on_refresh_requested's no-network contract
+            # stands (plans/05 Phase 2 item 6).
             self.app.call_from_thread(self._refresh_backends_table)
 
     def _on_build_output(self, line: str) -> None:
@@ -624,8 +962,11 @@ class BuildsScreen(CockpitScreenBase):
         the main thread exactly as _BuildLogHandler.emit does."""
         self.app.call_from_thread(self._append_build_log, f"$ {line}")
 
-    def _set_building(self, active: bool) -> None:
-        self._build_in_progress = active
+    def _set_building(self, backends: list[str], active: bool) -> None:
+        if active:
+            self._building_backends.update(backends)
+        else:
+            self._building_backends.difference_update(backends)
 
     def _append_build_log(self, msg: str) -> None:
         self._log_buffer.append(msg)
@@ -670,6 +1011,7 @@ class BuildsScreen(CockpitScreenBase):
             self._llama_cpp_check = None
             self._llama_swap_check = None
             self._refresh_backends_table()
+            self._update_action_buttons_state()
 
     def _apply_update_check_results(self, result_cpp: dict, result_swap: dict) -> None:
         if not self.is_mounted:
@@ -677,3 +1019,4 @@ class BuildsScreen(CockpitScreenBase):
         self._llama_cpp_check = result_cpp
         self._llama_swap_check = result_swap
         self._refresh_backends_table()
+        self._update_action_buttons_state()

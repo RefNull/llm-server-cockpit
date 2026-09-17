@@ -213,11 +213,18 @@ def run(
     runner: Runner,
     repo_root: Path,
     backends: list[str] | None = None,
+    force: bool = False,
 ) -> None:
     """`backends`, when given, restricts the build to that subset (e.g. the cockpit's Installs
     tab building only the ticked rows) instead of every backend the host needs — everything
     else (checkout, smoke test, retained-build pruning, history) is unchanged. Defaults to
-    every needed backend, matching every existing caller (CLI, bin/provision)."""
+    every needed backend, matching every existing caller (CLI, bin/provision).
+
+    `force=True` skips the "prefix already built and sane" shortcut and rebuilds even a
+    prefix that already exists — the cockpit's "Rebuild" action (plans/05 Phase 2 item 5).
+    Every existing caller defaults to False, so the already-pinned-SHA idempotence CLI callers
+    rely on is unchanged.
+    """
     needed = _needed_backends(host_profile)
     if backends is None:
         backends = needed
@@ -252,7 +259,7 @@ def run(
 
         prefix = prefix_root / backend / ref
         try:
-            if _prefix_ready(prefix):
+            if _prefix_ready(prefix) and not force:
                 log.info("build[%s]: prefix %s already built and sane, skipping build", backend, prefix)
             else:
                 _build_backend(backend, recipe, checkout_dir, prefix, runner)
