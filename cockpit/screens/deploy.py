@@ -38,6 +38,111 @@ from provision.steps import swap
 _ENGINE_OPTIONS = [("llama-cpp", "llama-cpp"), ("unmanaged", "unmanaged")]
 
 
+class ExamplesModal(ModalScreen[str | None]):
+    """Copy-in snippets for the arguments/env fields (QA item c.4 + d).
+
+    Rows are (label, snippet, description) — the label is a short human name, never the
+    snippet itself: `--chat-template-kwargs '{"reasoning_effort":"medium",...}'` as a Button
+    label would blow past the dialog width, and DESIGN.md §9 forbids fixing that with
+    per-button CSS. Clicking a row's "Insert" button dismisses with the snippet; the caller
+    appends it as a new line rather than overwriting whatever is already typed.
+
+    Every snippet below is copied verbatim from models.example.yaml or from the upstream docs
+    cited in plans/05-qa-remediation-pass.md §0g — none invented.
+    """
+
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    DEFAULT_CSS = """
+    ExamplesModal {
+        align: center middle;
+    }
+    #examples-dialog {
+        width: 80%;
+        height: 80%;
+        border: thick $background 80%;
+        background: $surface;
+        padding: $space-normal $space-section;
+    }
+    #examples-title {
+        text-style: bold;
+        color: $accent;
+        margin-bottom: $space-normal;
+    }
+    #examples-intro {
+        color: $text-muted;
+        margin-bottom: $space-normal;
+    }
+    #examples-scroll {
+        height: 1fr;
+    }
+    .examples-row {
+        height: auto;
+        margin-bottom: $space-normal;
+    }
+    .examples-snippet {
+        color: $text-muted;
+        width: 1fr;
+    }
+    """
+
+    # (label, snippet, description) — arguments from models.example.yaml:26-46,57-62.
+    ARG_EXAMPLES: list[tuple[str, str, str]] = [
+        ("Large context", "--ctx-size 262144", "context window size, in tokens"),
+        ("Quantize KV cache", "--cache-type-k q4_0", "quantize the K side of the KV cache (pair with --cache-type-v)"),
+        ("Flash attention", "--flash-attn", "enable flash attention"),
+        ("Chat template", "--jinja", "use the model's own chat template via jinja"),
+        ("Embedding model", "--embedding --pooling cls", "serve this model for embeddings, not chat"),
+    ]
+    # env from models.example.yaml:47-48,63-64.
+    ENV_EXAMPLES: list[tuple[str, str, str]] = [
+        (
+            "Intel Vulkan ICD",
+            "VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/intel_icd.x86_64.json",
+            "Intel GPU via Vulkan — required on hosts where the Intel ICD is not the default",
+        ),
+        ("CUDA device pin", "CUDA_VISIBLE_DEVICES=0", "restrict this model to one CUDA device"),
+    ]
+
+    def __init__(self, kind: str) -> None:
+        super().__init__()
+        self.kind = kind
+        self._examples = self.ARG_EXAMPLES if kind == "args" else self.ENV_EXAMPLES
+
+    def compose(self) -> ComposeResult:
+        title = "llama-server argument examples" if self.kind == "args" else "env examples"
+        with Vertical(id="examples-dialog"):
+            yield Static(title, id="examples-title")
+            if self.kind == "args":
+                yield Static(
+                    "Three naming spaces collide in this form: this field takes llama-server "
+                    "CLI flags (below, appended to the generated cmd:); llama-swap's own cmd: "
+                    "key (used for engine: unmanaged) is a whole shell command; llama.cpp preset "
+                    "files use hyphenated bare keys like ctx-size with no --. Preset keys are "
+                    "NOT accepted here.",
+                    id="examples-intro",
+                )
+            with VerticalScroll(id="examples-scroll"):
+                for i, (label, snippet, desc) in enumerate(self._examples):
+                    with Horizontal(classes="examples-row"):
+                        yield Button(f"Insert: {label}", id=f"ex-insert-{i}", classes="thin-button")
+                        yield Static(f"{snippet}\n{desc}", classes="examples-snippet")
+            with Horizontal(classes="action-row-primary"):
+                yield Button("Close", id="btn-examples-close", classes="thin-button")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        bid = event.button.id or ""
+        if bid == "btn-examples-close":
+            self.dismiss(None)
+            return
+        if bid.startswith("ex-insert-"):
+            idx = int(bid.removeprefix("ex-insert-"))
+            self.dismiss(self._examples[idx][1])
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class ConfigPasteModal(ModalScreen[str | None]):
     """Paste-a-llama-swap-config.yaml modal for importing models."""
 
@@ -98,22 +203,25 @@ class EditModelModal(ModalScreen[bool]):
         height: 1fr;
     }
     #edit-model-scroll {
-        width: 3fr;
+        width: 1fr;
         padding-right: $space-section;
     }
-    /* env only. A model can carry 15-20 KEY=VALUE lines and the single-column form gave it a
-       box a few rows tall at the bottom of a scroll — the one field most likely to be long was
-       the one hardest to edit. */
+    /* Now holds args/cmd (whichever the engine needs) above env, not env alone — a model can
+       carry 15-20 KEY=VALUE lines and the single-column form gave it a box a few rows tall at
+       the bottom of a scroll, the one field most likely to be long was the one hardest to
+       edit. VerticalScroll, not a plain Vertical: stacking args/cmd above a min-height: 18 env
+       box is more content than a non-scrolling height: 1fr column can hold at the 80x24 floor
+       — the same clipping mechanism §0f found on the left, reproduced here if this stayed a
+       plain Vertical (plans/05-qa-remediation-pass.md Phase 5, coordinator correction). */
     #edit-model-right {
-        width: 2fr;
+        width: 1fr;
         height: 1fr;
     }
     #f-env {
-        height: 1fr;
         min-height: 18;
     }
     #edit-model-dialog {
-        width: 110;
+        width: 90%;
         height: 90%;
         border: thick $background 80%;
         background: $surface;
@@ -127,12 +235,21 @@ class EditModelModal(ModalScreen[bool]):
     #edit-model-scroll {
         height: 1fr;
     }
-    #edit-model-scroll Label {
+    /* Both columns now carry Labels (args/cmd moved into the right column, above env) so this
+       is scoped to the shared columns container, not just the left scroll. */
+    #edit-model-columns Label {
         margin-top: $space-normal;
         color: $text-muted;
     }
     #f-args, #f-cmd, #f-env {
         height: 5;
+    }
+    /* Plain Vertical, not VerticalScroll: these hold a handful of Selects/a TextArea each and
+       must size to their own content inside a VerticalScroll parent, the same c.3 fix as
+       #f-llamacpp-fields (§0f) — a plain Vertical's framework default of height: 1fr resolves
+       against the viewport, not the content, and clips. */
+    #f-llamacpp-fields, #f-args-group, #f-cmd-group {
+        height: auto;
     }
     #form-error {
         color: $error;
@@ -199,12 +316,11 @@ class EditModelModal(ModalScreen[bool]):
 
         with Vertical(id="edit-model-dialog"):
             yield Static(title, id="edit-model-title")
-            with Horizontal(id="edit-model-columns"):
+            with Horizontal(id="edit-model-columns", classes="columns-responsive"):
               with VerticalScroll(id="edit-model-scroll"):
                 # No id field: it is derived from the chosen filename (see _derived_id), which
-                # is what llama-swap routes on. Shown read-only so it is not a surprise.
-                yield Label("id (from the selected file)")
-                yield Static(m["id"] if m else "—", id="f-id-preview", classes="status-text")
+                # is what llama-swap routes on. The route name is still surfaced — in the save
+                # confirmation ("Save changes to model <id> in models.yaml?", below), not here.
                 yield Label("engine")
                 yield Select(_ENGINE_OPTIONS, id="f-engine", allow_blank=False, value=engine_val)
 
@@ -226,15 +342,6 @@ class EditModelModal(ModalScreen[bool]):
                     yield Select(self._gpu_options(), id="f-gpu", allow_blank=False)
                     yield Label("bind.backend")
                     yield Select([], id="f-backend", allow_blank=True)
-                    yield Label("llama_server_args (one flag/value per line)")
-                    yield TextArea(
-                        "\n".join(m.get("llama_server_args", [])) if m else "",
-                        id="f-args",
-                    )
-
-                with Vertical(id="f-unmanaged-fields"):
-                    yield Label("cmd (raw shell command, ${PORT} available)")
-                    yield TextArea(m.get("cmd", "") if m else "", id="f-cmd")
 
                 yield Label("ttl (seconds; 0 = never unload, blank = llama-swap default)")
                 # Blank for a new binding, not "0": 0 means never unload, so defaulting the
@@ -249,8 +356,29 @@ class EditModelModal(ModalScreen[bool]):
 
                 yield Static("", id="form-error", classes="error-text")
 
-              with Vertical(id="edit-model-right"):
-                  yield Label("env (one KEY=VALUE per line)")
+              with VerticalScroll(id="edit-model-right"):
+                  # llama_server_args and cmd are mutually exclusive by engine
+                  # (_toggle_engine_fields) and share this slot, above env — both are
+                  # multi-line and both deserve the width (QA item c.4).
+                  with Vertical(id="f-args-group"):
+                      yield Label(
+                          "llama-server arguments — one flag or value per line. Appended to "
+                          "the generated llama-swap cmd: after --model and --port."
+                      )
+                      yield Button("Examples", id="btn-args-examples", classes="thin-button")
+                      yield TextArea(
+                          "\n".join(m.get("llama_server_args", [])) if m else "",
+                          id="f-args",
+                      )
+                  with Vertical(id="f-cmd-group"):
+                      yield Label(
+                          "cmd — the complete command llama-swap runs. ${PORT} and "
+                          "${MODEL_ID} are substituted."
+                      )
+                      yield TextArea(m.get("cmd", "") if m else "", id="f-cmd")
+
+                  yield Label("env — one KEY=VALUE per line. Injected into the command's environment.")
+                  yield Button("Examples", id="btn-env-examples", classes="thin-button")
                   yield TextArea("\n".join(m.get("env", [])) if m else "", id="f-env")
 
             with Horizontal(classes="action-row-primary"):
@@ -322,17 +450,14 @@ class EditModelModal(ModalScreen[bool]):
     def _toggle_engine_fields(self, engine: str) -> None:
         is_llama = engine == "llama-cpp"
         self.query_one("#f-llamacpp-fields").display = is_llama
-        self.query_one("#f-unmanaged-fields").display = not is_llama
+        self.query_one("#f-args-group").display = is_llama
+        self.query_one("#f-cmd-group").display = not is_llama
 
     def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id == "f-engine":
             self._toggle_engine_fields(str(event.value))
         elif event.select.id == "f-gpu":
             self._refresh_backend_options(str(event.value))
-        elif event.select.id == "f-quant-file" and self.editing_id is None:
-            # The id is derived from the filename, so the read-only preview has to follow the
-            # selection or it silently shows a stale route name.
-            self.query_one("#f-id-preview", Static).update(self._derived_id() or "—")
 
     def _set_form_error(self, text: str) -> None:
         self.query_one("#form-error", Static).update(text)
@@ -400,10 +525,23 @@ class EditModelModal(ModalScreen[bool]):
             model["group"] = group
         return model, None
 
+    async def _insert_example(self, kind: str, target_id: str) -> None:
+        chosen = await self.app.push_screen_wait(ExamplesModal(kind))
+        if not chosen:
+            return
+        ta = self.query_one(target_id, TextArea)
+        ta.text = f"{ta.text.rstrip()}\n{chosen}" if ta.text.strip() else chosen
+
     @work
     async def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "btn-cancel":
             self.dismiss(False)
+            return
+        if event.button.id == "btn-args-examples":
+            await self._insert_example("args", "#f-args")
+            return
+        if event.button.id == "btn-env-examples":
+            await self._insert_example("env", "#f-env")
             return
         if event.button.id != "btn-save":
             return

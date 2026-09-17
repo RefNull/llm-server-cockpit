@@ -149,6 +149,16 @@ def validate_models_dict(data: dict, host_profile: dict, manifest: dict, source:
         else:
             raise ValidationError(f"{source}.models[{i}] ({mid}): unknown engine {engine!r} (allowed: 'llama-cpp', 'unmanaged')")
 
+        # env is passed straight through to llama-swap's env: (provision/steps/swap.py
+        # _build_model_entry) as a list of "KEY=VALUE" strings — a dict passes no check here
+        # today and mis-serializes downstream (plans/05-qa-remediation-pass.md §0h).
+        if "env" in m:
+            env = m["env"]
+            if not isinstance(env, list) or not all(isinstance(e, str) and "=" in e for e in env):
+                raise ValidationError(
+                    f"{source}.models[{i}] ({mid}).env: must be a list of 'KEY=VALUE' strings"
+                )
+
     return data
 
 

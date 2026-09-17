@@ -374,6 +374,92 @@ def _assert_buttons_in_bounds(app: CockpitApp, context: str) -> None:
         )
 
 
+async def _assert_edit_model_modal(app: CockpitApp, pilot, context: str) -> None:
+    """Phase 5 (plans/05-qa-remediation-pass.md §0f/Phase 5) — smoke/verify_screens.py had zero
+    modal coverage, which is how a 110-cell dialog on an 80-cell floor and a 1-cell field group
+    holding 27 cells of content both shipped. Pushes EditModelModal directly (bypassing the
+    Deploy screen's "Add Model" button, which would need real host state to click) and checks
+    the geometry facts that regressed: the dialog fits the screen, every field is inside the
+    dialog, and neither field-group Vertical (left or right column) clips its own content.
+    """
+    from cockpit.screens.deploy import EditModelModal
+
+    modal = EditModelModal(
+        host_profile=app.host_profile,
+        manifest=app.manifest,
+        models=app.models,
+        editing_id=None,
+        repo_root=app.repo_root,
+        app_ref=app,
+    )
+    app.push_screen(modal)
+    await pilot.pause(0.2)
+
+    dialog = app.screen.query_one("#edit-model-dialog")
+    assert app.screen.region.contains_region(dialog.region), (
+        f"[{context}] EditModelModal dialog {dialog.region} is not fully inside the screen "
+        f"{app.screen.region} — this is the check that fails against the old width: 110 literal"
+    )
+
+    field_ids = (
+        "#f-engine", "#f-quant-file", "#f-mmproj-file", "#f-gpu", "#f-backend",
+        "#f-args", "#f-cmd", "#f-ttl", "#f-group", "#f-env",
+        "#btn-args-examples", "#btn-env-examples", "#btn-save", "#btn-cancel",
+    )
+    # Horizontal containment only, not vertical: #f-quant-file..#f-group sit inside
+    # #edit-model-scroll (a VerticalScroll), so a field further down the form legitimately has
+    # a logical y past the dialog's visible bottom before anything has scrolled — that is
+    # scrolling working as designed, not the c.2 defect. c.2 (width: 110 hanging the right
+    # column off an 80-cell screen) is a HORIZONTAL escape no scroll offset can fix, which is
+    # exactly what this half of the check catches.
+    for widget_id in field_ids:
+        widget = app.screen.query_one(widget_id)
+        if not widget.is_on_screen:
+            continue
+        assert widget.region.x >= dialog.region.x and widget.region.right <= dialog.region.right, (
+            f"[{context}] {widget_id} region {widget.region} escapes the dialog horizontally "
+            f"({dialog.region}) — unreachable by any amount of vertical scrolling"
+        )
+
+    # Vertical reachability: scroll each column to its end and confirm the last field in it is
+    # then fully inside the dialog. This is the actual c.3 regression check on the reading
+    # side — the old bug capped max_scroll_y at 3 regardless of content height, so scrolling
+    # "worked" but never actually surfaced the clipped fields.
+    left_scroll = app.screen.query_one("#edit-model-scroll")
+    right_scroll = app.screen.query_one("#edit-model-right")
+    left_scroll.scroll_end(animate=False)
+    right_scroll.scroll_end(animate=False)
+    await pilot.pause(0.2)
+    for widget_id in ("#f-group", "#f-env"):
+        widget = app.screen.query_one(widget_id)
+        assert widget.is_on_screen, f"[{context}] {widget_id} never reachable by scrolling"
+        assert dialog.region.contains_region(widget.region), (
+            f"[{context}] {widget_id} region {widget.region} still escapes the dialog "
+            f"{dialog.region} after scrolling its column to the end"
+        )
+    left_scroll.scroll_home(animate=False)
+    right_scroll.scroll_home(animate=False)
+    await pilot.pause(0.1)
+
+    # The c.3 regression test: a plain Vertical field-group inside a scroll container must
+    # size to its own content (height: auto), not clip it to the framework's height: 1fr
+    # default. Covers both columns — #edit-model-right was converted to a VerticalScroll for
+    # the same reason once args/cmd moved above env there.
+    for group_id in ("#f-llamacpp-fields", "#f-args-group", "#f-cmd-group"):
+        group = app.screen.query_one(group_id)
+        if not group.is_on_screen:
+            continue
+        assert group.region.height >= group.virtual_size.height, (
+            f"[{context}] {group_id}: region.height={group.region.height} < "
+            f"virtual_size.height={group.virtual_size.height} — clipped, the c.3 defect"
+        )
+
+    _assert_buttons_in_bounds(app, f"{context} EditModelModal")
+
+    app.screen.dismiss(False)
+    await pilot.pause(0.1)
+
+
 async def verify_geometry_and_export_screenshots() -> None:
     _assert_no_awaited_workers()
     print("No awaited @work methods.")
@@ -447,6 +533,8 @@ async def verify_geometry_and_export_screenshots() -> None:
                 if name == "scripts":
                     _assert_script_toggle_labels(app, f"{name} @ {w}x{h}")
                     await pilot.pause(0.1)
+                if name == "deploy":
+                    await _assert_edit_model_modal(app, pilot, f"{name} @ {w}x{h}")
                 if name == "settings_services":
                     await _assert_wol_form_wiring(app, pilot, f"{name} @ {w}x{h}")
                     await _assert_root_gate(app, pilot, f"{name} @ {w}x{h}")
