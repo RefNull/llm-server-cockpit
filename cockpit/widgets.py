@@ -259,8 +259,10 @@ Screen.-narrow .columns-responsive {
 Screen.-wide .columns-responsive {
     layout: horizontal;
 }
-/* Dashboard-left/right column gutter (Defect 4 cosmetic fix, plans/03-ui-qa-pass.md remediation
-   pass). This used to live in DashboardScreen.DEFAULT_CSS, which is silently the wrong place: a
+/* Two-column gutter, shared by the Dashboard and the Settings sub-tabs (Defect 4 cosmetic fix,
+   plans/03-ui-qa-pass.md remediation pass; unified into one rule by plans/05 Phase 6).
+
+   This used to live in DashboardScreen.DEFAULT_CSS, which is silently the wrong place: a
    widget's DEFAULT_CSS is SCOPED_CSS=True by default, and Textual's parser (css/parse.py) only
    leaves a rule's selector alone when its FIRST token already names the scope type — otherwise
    it prepends an implicit "DashboardScreen " ancestor requirement. A rule starting with
@@ -275,40 +277,36 @@ Screen.-wide .columns-responsive {
    GPU row beside it. A rule plus $space-section either side gives 5 cells and an unambiguous
    boundary, which is cheaper to read than more whitespace would be at any width that still
    leaves room for the columns themselves. */
-/* Both columns fill the row, so the divider below runs its full length. This has to be here
-   rather than in DashboardScreen.DEFAULT_CSS: `.panel` sets `height: auto` and lives in this
-   sheet, which is App.CSS — a higher tier than any widget's DEFAULT_CSS — so an id selector
-   over there loses to a class selector over here regardless of specificity. Measured: the rule
-   in DEFAULT_CSS left `styles.height` as `auto` and the rule was simply inert. */
+/* The gutter is CONTENT-HEIGHT, and the Dashboard and Settings share one rule.
+
+   The Dashboard used to force `height: 1fr` on both its columns so the divider ran the full
+   row ("Both columns fill the row, so the divider below runs its full length"). Settings never
+   did — `.settings-column` is `height: auto` — so the identical three declarations produced two
+   visibly different rules: one running to the bottom of the taller column, one ending with its
+   own column's content. Operator preference, 2026-09-17 (plans/05-qa-remediation-pass.md Phase
+   6): the Settings look wins. The `1fr` is gone, and with it the reason the two screens needed
+   separate rules at all.
+
+   Each side is a wrapper (`#dashboard-left`, `.settings-column`) rather than a bare `.panel`,
+   because a column can hold more than one panel — System Services stacks Wake-on-LAN above
+   Tailscale. */
 Screen.-wide DashboardScreen #dashboard-left,
-Screen.-wide DashboardScreen #dashboard-right {
-    height: 1fr;
-}
-Screen.-wide DashboardScreen #dashboard-left {
-    margin-right: $space-section;
-    padding-right: $space-section;
-    border-right: solid $surface-lighten-2;
-}
-Screen.-narrow DashboardScreen #dashboard-left {
-    margin-right: 0;
-    padding-right: 0;
-    border-right: none;
-    margin-bottom: $space-section;
-}
-/* Same treatment for the Settings sub-tabs' paired panels — same reason, same rule shape, and
-   here too it has to live in SHARED_CSS rather than SettingsScreen.DEFAULT_CSS: a scoped
-   DEFAULT_CSS rule beginning with "Screen..." is rewritten to require a SettingsScreen
-   ancestor of a Screen, which never matches. */
-/* Each side is a .settings-column wrapper rather than a bare .panel, because a column can
-   hold more than one panel (System Services stacks Wake-on-LAN above Tailscale). */
-SettingsScreen .settings-column {
-    width: 1fr;
-    height: auto;
-}
 Screen.-wide SettingsScreen .settings-columns > .settings-column:first-of-type {
     margin-right: $space-section;
     padding-right: $space-section;
     border-right: solid $surface-lighten-2;
+}
+SettingsScreen .settings-column {
+    width: 1fr;
+    height: auto;
+}
+/* Stacked, the columns want a wider gap than `.panel`'s own $space-normal. The `-wide` gutter
+   above needs no reset here: `Screen._get_breakpoint_classes` (textual/screen.py:1547) returns
+   `{class_name}` — a single class — so `-narrow` and `-wide` never coexist and the rule simply
+   does not apply. The three `margin-right: 0` / `padding-right: 0` / `border-right: none`
+   declarations that used to sit here were dead for that reason. */
+Screen.-narrow DashboardScreen #dashboard-left {
+    margin-bottom: $space-section;
 }
 
 /* No resting highlight on an un-focused table (DESIGN.md §4.4). A freshly mounted DataTable
