@@ -175,7 +175,7 @@ class DownloadsScreen(CockpitScreenBase):
                     placeholder="Download: repo_id:quant_file (e.g. org/Model-GGUF:model.Q4_K_M.gguf)",
                     id="fetch-input",
                 )
-                yield Button("Download", id="btn-fetch", variant="primary")
+                yield Button("Download", id="btn-fetch", variant="primary")  # inline archetype (DESIGN.md §9): bare Button inside .inline-row
 
             table = SingleClickDataTable(id="files-table", zebra_stripes=True, classes="data-table")
             table.cursor_type = "row"
