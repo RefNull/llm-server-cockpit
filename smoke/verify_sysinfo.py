@@ -274,12 +274,78 @@ def check_wol_tlp_precedence() -> None:
         shutil.rmtree(root, ignore_errors=True)
 
 
+def check_build_detects_foreign_build() -> None:
+    """A hand-built llama.cpp outside `paths.prefix_root` must be reported, read-only; a
+    managed build under `prefix_root` — including the `current` symlink resolved through —
+    must not be.
+
+    Precedent: check_wol_detects_foreign_unit() above (monkeypatch the module's fixed lookup
+    location, same as build_step._FOREIGN_BUILD_ROOTS here, since a hermetic test cannot
+    create files under the real /opt on the machine running it — see the docstring on
+    _FOREIGN_BUILD_ROOTS in provision/steps/build.py).
+    """
+    from provision.steps import build as build_step
+
+    root = pathlib.Path(tempfile.mkdtemp())
+    try:
+        # Foreign: upstream's own in-tree cmake layout, unmanaged by this toolkit.
+        foreign_bin = root / "opt-llama-cpp" / "build-vulkan" / "bin"
+        foreign_bin.mkdir(parents=True)
+        foreign_server = foreign_bin / "llama-server"
+        foreign_server.write_text("#!/bin/sh\n")
+        foreign_server.chmod(foreign_server.stat().st_mode | stat.S_IEXEC)
+
+        # Managed: prefix_root/<backend>/<ref>, activated via the `current` symlink — the
+        # shape a provisioned host actually has, and the shape shutil.which("llama-server")
+        # legitimately resolves to on one.
+        prefix_root = root / "prefix"
+        managed = prefix_root / "vulkan" / "abc123"
+        managed_bin = managed / "bin"
+        managed_bin.mkdir(parents=True)
+        managed_server = managed_bin / "llama-server"
+        managed_server.write_text("#!/bin/sh\n")
+        managed_server.chmod(managed_server.stat().st_mode | stat.S_IEXEC)
+        current_link = prefix_root / "vulkan" / "current"
+        current_link.symlink_to(managed, target_is_directory=True)
+
+        host_profile = {"paths": {"prefix_root": str(prefix_root)}}
+
+        original_roots = build_step._FOREIGN_BUILD_ROOTS
+        original_which = build_step.shutil.which
+        # The `current` symlink is exactly what a real shutil.which("llama-server") resolves
+        # to on a provisioned host (build.py:296) — route it through the same exclusion path
+        # a bare os.environ["PATH"] lookup would.
+        build_step.shutil.which = lambda name: str(current_link / "bin" / "llama-server")
+        try:
+            build_step._FOREIGN_BUILD_ROOTS = (root / "opt-llama-cpp", current_link)
+
+            found = build_step.find_foreign_builds(host_profile)
+            paths_found = {f["path"] for f in found}
+            assert str(foreign_bin.parent.resolve()) in paths_found, found
+            match = next(f for f in found if f["path"] == str(foreign_bin.parent.resolve()))
+            assert match["sane"] is True, match
+            assert str(managed.resolve()) not in paths_found, (
+                f"a managed build under prefix_root must never be reported as foreign: {found}"
+            )
+            assert str(current_link.resolve()) not in paths_found, (
+                f"the current symlink (and shutil.which resolving to it) must be excluded: {found}"
+            )
+            assert len(found) == 1, f"expected exactly the one foreign build, got {found}"
+            print("find_foreign_builds(): foreign build reported, managed/current excluded — PASSED")
+        finally:
+            build_step._FOREIGN_BUILD_ROOTS = original_roots
+            build_step.shutil.which = original_which
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def main() -> None:
     _check_board()
     _check_cpu()
     check_cpu_amd_core_suffix()
     check_wol_detects_foreign_unit()
     check_wol_tlp_precedence()
+    check_build_detects_foreign_build()
     _check_memory()
     _check_pci_gpus()
     check_pci_gpus_domain_qualified()

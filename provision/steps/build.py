@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -65,6 +66,74 @@ def _prefix_ready(prefix: Path) -> bool:
     # Both binaries matter: llama-cli is what the smoke test drives, llama-server is what
     # swap.py's generated config actually runs at serve time.
     return _binary_sane(prefix, "llama-cli") and _binary_sane(prefix, "llama-server")
+
+
+# Fixed, documented candidate roots for find_foreign_builds() — never a filesystem walk.
+# `/opt/llama.cpp` and `/opt/llama.cpp/build-*` are upstream llama.cpp's own in-tree cmake
+# layout (a plain `cmake -B build-<backend> && cmake --build build-<backend>`, with no
+# `--install`, leaves the binaries at `build-<backend>/bin/`); `/usr/local` is the other
+# common hand-install prefix. Module-level, not inlined, for two reasons: it is the one
+# readable place to audit what this toolkit looks at outside prefix_root, and it lets a
+# fixture test point the scan at a tmp tree the same way smoke/verify_sysinfo.py points
+# wol._SYSFS_NET at one — a hermetic test has no permission to create files under the real
+# /opt on the machine running it. Production callers never override this.
+_FOREIGN_BUILD_ROOTS: tuple[Path, ...] = (Path("/opt/llama.cpp"), Path("/usr/local"))
+
+
+def find_foreign_builds(host_profile: dict[str, Any]) -> list[dict[str, Any]]:
+    """Read-only scan for llama.cpp binaries this toolkit did not install and cannot manage.
+
+    Modelled on wol.find_persistence_unit (wol.py:298-323): a fixed, documented candidate
+    list plus a behaviour match on what is actually there, never a recursive walk. Operator
+    decision, 2026-09-17 (plans/05-qa-remediation-pass.md Phase 3): detect and surface,
+    never write, never adopt, never execute. `prefix_root` stays the single authoritative
+    install root.
+
+    Deliberately takes no `Runner` — this function cannot write, symlink, remove, or run
+    anything it finds, and the missing parameter makes that structural rather than a
+    promise. It also never executes a discovered binary: `sane` is `_binary_sane`, the same
+    exec-bit check `_prefix_ready` uses, not an invocation. Running a foreign build to learn
+    its version would initialise a GPU backend and wake the device (AGENTS.md → Scope, "Not
+    a monitor"; smoke/verify_no_gpu_wake.py) — path and exec-bit only, never a version.
+
+    Returns `[{"path", "kind", "sane"}, ...]` for whatever was found. `kind` names which
+    candidate matched, for display. Excludes anything under `prefix_root` (resolved, so a
+    `current` symlink — including the one `shutil.which` legitimately resolves to on a
+    provisioned host — that points back into prefix_root is excluded too); those builds are
+    managed, not foreign.
+    """
+    prefix_root = Path(host_profile["paths"]["prefix_root"]).resolve()
+
+    candidates: list[tuple[Path, str]] = [(root, str(root)) for root in _FOREIGN_BUILD_ROOTS]
+    llama_cpp_root = _FOREIGN_BUILD_ROOTS[0]
+    try:
+        candidates.extend(
+            (p, f"{llama_cpp_root}/build-*") for p in sorted(llama_cpp_root.glob("build-*"))
+        )
+    except OSError:
+        pass
+    which = shutil.which("llama-server")
+    if which:
+        # <bin>/llama-server -> its grandparent is the prefix/build-dir root, matching the
+        # other two layouts below.
+        candidates.append((Path(which).parent.parent, "PATH (llama-server)"))
+
+    found: list[dict[str, Any]] = []
+    seen: set[Path] = set()
+    for path, kind in candidates:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if resolved == prefix_root or prefix_root in resolved.parents:
+            continue  # managed, not foreign
+        if not (resolved / "bin" / "llama-server").exists():
+            continue  # keeps /usr/local silent on every ordinary host
+        found.append({"path": str(resolved), "kind": kind, "sane": _binary_sane(resolved, "llama-server")})
+    return found
 
 
 def _sh(value: str) -> str:

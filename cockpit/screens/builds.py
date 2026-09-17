@@ -27,6 +27,7 @@ from cockpit.widgets import (
     TableAction,
     TableActionInvoked,
     acquire_sudo,
+    escape_markup,
     root_note,
 )
 from provision.common import Runner
@@ -609,6 +610,9 @@ class BuildsScreen(CockpitScreenBase):
     BuildsScreen {
         height: 1fr;
     }
+    BuildsScreen #foreign-builds-note {
+        display: none;
+    }
     """
 
     def __init__(
@@ -673,6 +677,13 @@ class BuildsScreen(CockpitScreenBase):
                     id="no-backends",
                     classes="panel",
                 )
+
+            # Populated by _refresh_backends_table (DESIGN.md §3.0: data reads belong in the
+            # refresh path, not compose/on_mount), which also toggles `display` — hidden on a
+            # clean host, and re-evaluated on every refresh rather than fixed at construction,
+            # so it neither lingers after a foreign tree is removed nor misses one built while
+            # the tab is open.
+            yield Static(id="foreign-builds-note", classes="panel")
 
             # Two rows, split by what the operator is deciding, not by width — both rows fit
             # one line at normal widths and both stack under Screen.-narrow (SHARED_CSS,
@@ -788,6 +799,26 @@ class BuildsScreen(CockpitScreenBase):
             *table.action_cells("llama-swap"),
             key="llama-swap",
         )
+        self._refresh_foreign_builds_note()
+
+    def _refresh_foreign_builds_note(self) -> None:
+        """Read-only filesystem scan (build_step.find_foreign_builds) — belongs here, not in
+        __init__/compose/on_mount, per DESIGN.md §3.0: a hidden tab does no I/O, and this runs
+        only from on_first_view/on_refresh_requested via _refresh_backends_table. Toggling
+        `display` each call, rather than computing once, is what keeps the note honest if a
+        foreign tree appears or disappears while the tab stays open."""
+        note = self.query_one("#foreign-builds-note", Static)
+        foreign = build_step.find_foreign_builds(self.host_profile)
+        if not foreign:
+            note.update("")
+            note.display = False
+            return
+        lines = ["Detected outside paths.prefix_root — not managed by this toolkit:"]
+        for f in foreign:
+            suffix = "" if f["sane"] else " (binary missing or not executable)"
+            lines.append(f"  [$text-muted]{escape_markup(f['path'])}{suffix}[/]")
+        note.update("\n".join(lines))
+        note.display = True
 
     def _format_update_cell(self, result: dict | None, *, shorten: bool) -> Text:
         if result is None:
