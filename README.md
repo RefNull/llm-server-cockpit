@@ -222,6 +222,8 @@ hf:
   token_env: HF_TOKEN
 ```
 
+**Where builds actually live.** Compiled backends go under `paths.prefix_root` only — `<prefix_root>/<backend>/<ref>`, activated by an atomic `current` symlink once a real-inference smoke test passes. This toolkit never reads or writes `/opt/llama.cpp`, and the per-backend rows in the Installs tab are the backends declared in `gpus[].backends` above, **not filesystem discoveries**. A hand-built tree elsewhere on disk is reported read-only in a note beneath that table; it is never adopted, built, pruned, or executed.
+
 ### 3. Model Catalog (`models.yaml`)
 
 Gitignored model registry mapping identifiers to engines, quant files, GPU backends, and invocation parameters:
