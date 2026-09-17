@@ -1037,6 +1037,18 @@ class SettingsScreen(CockpitScreenBase):
                 f" ethtool: {status['wake_flags'] or 'n/a'})",
                 f"persistence unit: {status.get('unit_name') or 'none found'}",
             ]
+            # A host can look armed right now and still not survive the next suspend/resume/
+            # boot if TLP will re-disable it then — surface that risk here rather than only
+            # after the operator is confused by WOL failing again later.
+            if status.get("tlp_present"):
+                if status.get("tlp_disables_wol"):
+                    source = status.get("tlp_wol_disable_source")
+                    lines.append(
+                        "TLP will re-disable WOL on next boot/resume: yes"
+                        + (f" ({source} sets WOL_DISABLE={status.get('tlp_wol_disable_value')!r})" if source else " (no config sets WOL_DISABLE=N)")
+                    )
+                else:
+                    lines.append(f"TLP will re-disable WOL on next boot/resume: no ({status.get('tlp_wol_disable_source')})")
             text = "\n".join(lines)
         except Exception as e:
             text = f"not available: {e}"

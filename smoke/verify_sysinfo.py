@@ -211,11 +211,75 @@ def check_wol_detects_foreign_unit() -> None:
         shutil.rmtree(root, ignore_errors=True)
 
 
+def check_wol_tlp_precedence() -> None:
+    """`_tlp_effective_wol_disable()` must resolve the winning file, not just 01-wol.conf.
+
+    This toolkit's own drop-in (`/etc/tlp.d/01-wol.conf`) sorts early by design (it matches the
+    operator's own hand-written repair — plans/05-qa-remediation-pass.md §0e/Phase 4). A
+    later-sorting drop-in setting the same key silently wins over it; the detection signal must
+    say so by naming the winning file, not just report a boolean.
+
+    NOTE: TLP's load order (main conf, then /etc/tlp.d/*.conf lexically, later wins) is an
+    assumption documented in wol.py — `tlp` is not installed on this dev box, so it could not
+    be verified against TLP's own source here (see the ASSUMPTION comment on
+    `_tlp_effective_wol_disable`). This test locks in that assumed behaviour, not TLP's actual
+    behaviour on a real host.
+    """
+    from provision.steps import wol
+
+    root = pathlib.Path(tempfile.mkdtemp())
+    try:
+        main_conf = root / "tlp.conf"
+        dropin_dir = root / "tlp.d"
+        dropin_dir.mkdir()
+        original_main, original_dir = wol._TLP_MAIN_CONF, wol._TLP_DROPIN_DIR
+        wol._TLP_MAIN_CONF, wol._TLP_DROPIN_DIR = main_conf, dropin_dir
+        try:
+            # Nothing set anywhere: TLP's own undocumented-here default (Y) applies.
+            value, source = wol._tlp_effective_wol_disable()
+            assert (value, source) == (None, None), f"expected no file to win, got {(value, source)}"
+
+            # This toolkit's own fix: 01-wol.conf sets N, nothing else present.
+            (dropin_dir / "01-wol.conf").write_text("WOL_DISABLE=N\n")
+            value, source = wol._tlp_effective_wol_disable()
+            assert value == "N" and source == dropin_dir / "01-wol.conf", (
+                f"01-wol.conf alone should win: got {(value, source)}"
+            )
+
+            # A later-sorting drop-in re-disables it — the exact silent-failure this signal
+            # exists to catch: writing 01-wol.conf did not actually fix anything.
+            (dropin_dir / "50-power.conf").write_text("WOL_DISABLE=Y\n")
+            value, source = wol._tlp_effective_wol_disable()
+            assert value == "Y" and source == dropin_dir / "50-power.conf", (
+                f"50-power.conf sorts after 01-wol.conf and must win: got {(value, source)}"
+            )
+
+            # `/etc/tlp.conf` is read LAST by TLP (https://linrunner.de/tlp/settings/
+            # introduction.html: "parameters in /etc/tlp.conf will override anything else
+            # because it is read last") — it beats every drop-in regardless of lexical name,
+            # including this toolkit's own 01-wol.conf. This is the regression case: an
+            # earlier version of this helper read tlp.conf FIRST, so on a host with
+            # WOL_DISABLE=Y in tlp.conf it reported the drop-in's "N" as effective while TLP
+            # actually applied "Y" — the exact defect this fix exists to close, reconstructed
+            # inside the fix.
+            main_conf.write_text("WOL_DISABLE=Y\n")
+            value, source = wol._tlp_effective_wol_disable()
+            assert value == "Y" and source == main_conf, (
+                f"/etc/tlp.conf must win over every drop-in (TLP reads it last): got {(value, source)}"
+            )
+        finally:
+            wol._TLP_MAIN_CONF, wol._TLP_DROPIN_DIR = original_main, original_dir
+        print("_tlp_effective_wol_disable(): later-sorting drop-in wins, tlp.conf wins over all drop-ins — PASSED")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def main() -> None:
     _check_board()
     _check_cpu()
     check_cpu_amd_core_suffix()
     check_wol_detects_foreign_unit()
+    check_wol_tlp_precedence()
     _check_memory()
     _check_pci_gpus()
     check_pci_gpus_domain_qualified()

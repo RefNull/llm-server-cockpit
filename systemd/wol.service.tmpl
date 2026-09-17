@@ -1,0 +1,16 @@
+[Unit]
+Description=Enable Wake-on-LAN magic packet for $iface
+After=network-online.target
+Wants=network-online.target
+DefaultDependencies=no
+Before=shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/ethtool -s $iface_cmd wol g
+ExecStop=/usr/sbin/ethtool -s $iface_cmd wol g
+
+[Install]
+WantedBy=multi-user.target

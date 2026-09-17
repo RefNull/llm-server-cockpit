@@ -39,6 +39,7 @@ from provision import schema  # noqa: E402
 from provision.common import Runner  # noqa: E402
 from provision.steps import scripts as scripts_step  # noqa: E402
 from provision.steps import swap  # noqa: E402
+from provision.steps import wol  # noqa: E402
 
 
 class CapturingRunner(Runner):
@@ -51,11 +52,15 @@ class CapturingRunner(Runner):
     def __init__(self) -> None:
         super().__init__()
         self.written: dict[str, str] = {}
+        # Not just "nothing to do here" any more: a regression test needs to observe that a
+        # guard genuinely prevented a mutation, not merely that this stub swallowed one.
+        self.run_calls: list[list[str]] = []
 
     def write_file(self, path, content: str, *, mode: int | None = None) -> None:
         self.written[pathlib.Path(path).name] = content
 
     def run(self, cmd, **kwargs):  # systemctl daemon-reload / enable — nothing to do here
+        self.run_calls.append(list(cmd))
         return None
 
 
@@ -110,6 +115,9 @@ def check_systemd_units() -> None:
         {"id": "demo", "path": "/opt/demo/serve.py", "args": ["--port", "9000"], "restart_policy": "always"},
         host_profile, _REPO_ROOT, runner,
     )
+    wol_iface = host_profile["network"]["wol"]["interface"]
+    wol_unit_name = f"wol-{wol_iface}.service"
+    runner.write_file(pathlib.Path("/etc/systemd/system") / wol_unit_name, wol._unit_content(wol_iface, _REPO_ROOT))
 
     expected = {
         "llama-swap.service": ("Unit", "Service", "Install"),
@@ -118,6 +126,7 @@ def check_systemd_units() -> None:
         "llm-server-cockpit-update-check.service": ("Unit", "Service"),
         "llm-server-cockpit-update-check.timer": ("Unit", "Timer", "Install"),
         "cockpit-script-demo.service": ("Unit", "Service", "Install"),
+        wol_unit_name: ("Unit", "Service", "Install"),
     }
     missing = set(expected) - set(runner.written)
     assert not missing, f"these units were never rendered, so nothing below checked them: {sorted(missing)}"
@@ -133,7 +142,92 @@ def check_systemd_units() -> None:
             assert parser.has_option("Service", "ExecStart"), f"{name}: [Service] with no ExecStart="
         if parser.has_section("Timer"):
             assert parser.get("Timer", "OnCalendar").strip(), f"{name}: [Timer] with empty OnCalendar="
+    wol_text = runner.written[wol_unit_name]
+    wol_parser = parse_unit(wol_unit_name, wol_text)
+    assert wol_parser.has_option("Service", "ExecStop"), f"{wol_unit_name}: [Service] with no ExecStop= (some NICs drop WOL arming on poweroff, not just reboot)"
     print(f"  {len(expected)} systemd units render, parse, and carry their required sections")
+
+
+def check_wol_unit_byte_identical_to_prior_output() -> None:
+    """`wol.service.tmpl` + Template.substitute() must render exactly what the inline
+    `_unit_content()` produced before this relocation — captured from the pre-relocation
+    code with iface="enp6s0" (a realistic name, not the render-shape test's placeholder
+    "TODO", so this actually exercises unit_value/unit_command's escaping and isn't vacuously
+    true for a value with no `%` or `$` in it either way).
+    """
+    # Captured verbatim via `python3 -c "from provision.steps.wol import _unit_content;
+    # print(repr(_unit_content('enp6s0')))"` against the pre-relocation code, before
+    # `_unit_content` was changed to take `repo_root` and render from the .tmpl file.
+    prior_output = (
+        "[Unit]\n"
+        "Description=Enable Wake-on-LAN magic packet for enp6s0\n"
+        "After=network-online.target\n"
+        "Wants=network-online.target\n"
+        "DefaultDependencies=no\n"
+        "Before=shutdown.target\n"
+        "Conflicts=shutdown.target\n"
+        "\n"
+        "[Service]\n"
+        "Type=oneshot\n"
+        "RemainAfterExit=yes\n"
+        "ExecStart=/usr/sbin/ethtool -s enp6s0 wol g\n"
+        "ExecStop=/usr/sbin/ethtool -s enp6s0 wol g\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=multi-user.target\n"
+    )
+    rendered = wol._unit_content("enp6s0", _REPO_ROOT)
+    assert rendered == prior_output, (
+        "wol.service.tmpl relocation changed the rendered unit's bytes — it must not (this is a "
+        "relocation for testability, not a redesign; plans/05-qa-remediation-pass.md §0e/Phase 4):\n"
+        f"--- prior ---\n{prior_output!r}\n--- rendered ---\n{rendered!r}"
+    )
+    print("  wol-<iface>.service renders byte-identical to the pre-relocation _unit_content() output")
+
+
+def check_wol_ethtool_missing_mutates_nothing() -> None:
+    """Regression test for §0e defect (ii): the run must fail before touching anything.
+
+    Before the fix, the ethtool availability check ran AFTER `_fix_tlp` and
+    `_arm_networkmanager` — both of which mutate (write a TLP drop-in, restart tlp, and/or run
+    `nmcli con up`, a link-up event). A host with no ethtool then aborted having already
+    disturbed the NIC, with no re-arm. `tlp` is made resolvable here (a fake path — never
+    executed, since CapturingRunner intercepts every `runner.run`/`write_file` call) so that a
+    reintroduced ordering bug would actually attempt a mutation and this test would catch it;
+    `nmcli` is left unresolvable so `_arm_networkmanager` short-circuits without touching
+    `subprocess.run` for a binary (`systemctl`) this dev box may not even have.
+    """
+    host_profile = schema.load_host_profile(_REPO_ROOT / "hosts" / "example.yaml")
+    host_profile["network"]["wol"] = {"interface": "enp6s0", "mac": "d8:bb:c1:00:11:22"}
+
+    runner = CapturingRunner()
+    original_resolve_tool = wol._resolve_tool
+    original_read_iface_mac = wol._read_iface_mac
+    # Bypass the `ip link show` MAC check (no `ip` on this dev box, and it isn't what this test
+    # is about) so the run reaches the ethtool-availability guard being exercised.
+    wol._read_iface_mac = lambda iface: "d8:bb:c1:00:11:22"
+    wol._resolve_tool = lambda name: (
+        None if name in ("ethtool", "nmcli") else "/usr/sbin/tlp" if name == "tlp" else original_resolve_tool(name)
+    )
+    try:
+        try:
+            wol.run(host_profile, {}, {}, runner, _REPO_ROOT)
+        except SystemExit as e:
+            assert "ethtool" in str(e.code), f"wrong reason for exit: {e.code!r}"
+        else:
+            raise AssertionError("wol.run() did not exit despite ethtool being unresolvable")
+        assert runner.run_calls == [], (
+            f"wol.run() ran a command despite ethtool being unresolvable — mutated before "
+            f"failing: {runner.run_calls}"
+        )
+        assert runner.written == {}, (
+            f"wol.run() wrote a file despite ethtool being unresolvable — mutated before "
+            f"failing: {sorted(runner.written)}"
+        )
+    finally:
+        wol._resolve_tool = original_resolve_tool
+        wol._read_iface_mac = original_read_iface_mac
+    print("  wol.run() with ethtool unresolvable performs zero mutations (regression for §0e defect ii)")
 
 
 def check_systemd_metacharacter_escaping() -> None:
@@ -219,6 +313,8 @@ def main() -> None:
     check_systemd_units()
     check_systemd_metacharacter_escaping()
     check_llama_swap_config()
+    check_wol_unit_byte_identical_to_prior_output()
+    check_wol_ethtool_missing_mutates_nothing()
     print("Rendered-artifact verification PASSED.")
 
 
