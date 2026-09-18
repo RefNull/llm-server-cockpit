@@ -102,18 +102,27 @@ def run_smoke_test(
     there's anything to test yet.
     """
     argv = _smoke_argv(binary, model, fixture)
+    prefix = binary.parent.parent
+    lib_dirs = [str(prefix / "lib"), str(prefix / "lib64"), str(binary.parent)]
+    existing_ld = os.environ.get("LD_LIBRARY_PATH", "")
+    combined_ld = ":".join(lib_dirs) + (f":{existing_ld}" if existing_ld else "")
+    env = {**os.environ, "LD_LIBRARY_PATH": combined_ld}
+
     try:
         if source_script:
             # sycl backends need the oneAPI runtime env (LD_LIBRARY_PATH etc.) sourced to even
             # start the binary, same reason build.py's configure+build goes through a shell.
-            script = f"source {source_script} && " + " ".join(shlex.quote(a) for a in argv)
+            script = f"export LD_LIBRARY_PATH={shlex.quote(combined_ld)} && source {source_script} && " + " ".join(shlex.quote(a) for a in argv)
             proc = subprocess.run(
                 ["bash", "-c", script],
+                env=env,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=SMOKE_TIMEOUT_S,
             )
         else:
             proc = subprocess.run(
-                argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=SMOKE_TIMEOUT_S,
+                argv,
+                env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=SMOKE_TIMEOUT_S,
             )
     except subprocess.TimeoutExpired:
         return False, f"timed out after {SMOKE_TIMEOUT_S}s"

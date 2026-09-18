@@ -81,13 +81,6 @@ def _root_hint() -> str:
     )
 
 
-def _default_paths() -> dict[str, str]:
-    """A single root under the invoking user's home, with subfolders — proposed as real
-    prefilled values (not just placeholder ghost text), editable before saving."""
-    root = str(Path.home() / "llm-server-cockpit")
-    return {"models_dir": f"{root}/models", "state_dir": f"{root}/state", "prefix_root": f"{root}/builds"}
-
-
 class SettingsScreen(CockpitScreenBase):
     """Mounted inside a TabPane by cockpit/app.py — not a Textual Screen."""
 
@@ -451,10 +444,10 @@ class SettingsScreen(CockpitScreenBase):
             self.query_one("#f-port", Input).value = "8090"
             self.query_one("#f-retain", Input).value = "3"
             self.query_one("#f-token-env", Input).value = "HF_TOKEN"
-            defaults = _default_paths()
-            self.query_one("#f-models-dir", Input).value = defaults["models_dir"]
-            self.query_one("#f-state-dir", Input).value = defaults["state_dir"]
-            self.query_one("#f-prefix-root", Input).value = defaults["prefix_root"]
+            root = Path.home() / "llm-server-cockpit"
+            self.query_one("#f-models-dir", Input).value = str(root / "models")
+            self.query_one("#f-state-dir", Input).value = str(root / "state")
+            self.query_one("#f-prefix-root", Input).value = str(root / "builds")
             return
 
         self.query_one("#f-hostname", Input).value = hp["hostname"]

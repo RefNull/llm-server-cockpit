@@ -12,6 +12,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -34,13 +35,8 @@ _MAX_FAILED_BUILDS_KEPT = 20
 _BUILD_DIR_RE = re.compile(r"^build(\d+)$")
 
 
-def _needed_backends(host_profile: dict[str, Any]) -> list[str]:
-    seen: list[str] = []
-    for gpu in host_profile["gpus"]:
-        for backend in gpu["backends"]:
-            if backend not in seen:
-                seen.append(backend)
-    return seen
+def needed_backends(host_profile: dict[str, Any]) -> list[str]:
+    return list(dict.fromkeys(b for g in host_profile.get("gpus", []) for b in g.get("backends", [])))
 
 
 def _git_head(checkout_dir: Path) -> str | None:
@@ -61,7 +57,7 @@ def _git_head(checkout_dir: Path) -> str | None:
     return None
 
 
-def _ensure_checkout(runner: Runner, repo: str, ref: str, checkout_dir: Path) -> None:
+def ensure_checkout(runner: Runner, repo: str, ref: str, checkout_dir: Path) -> None:
     current = _git_head(checkout_dir)
     if current == ref:
         log.info("build: checkout at %s already at pinned ref %s, skipping clone/fetch", checkout_dir, ref)
@@ -87,14 +83,7 @@ def _ensure_checkout(runner: Runner, repo: str, ref: str, checkout_dir: Path) ->
     runner.run(["git", "-c", "safe.directory=*", "-C", str(checkout_dir), "checkout", ref])
 
 
-def fetch_checkout(runner: Runner, repo: str, ref: str, checkout_dir: Path) -> None:
-    """Public wrapper around `_ensure_checkout` for callers outside this module (the cockpit's
-    "Update to latest" — plans/07 Phase 1) that need to bring the local source checkout to a
-    pinned ref without building. `_ensure_checkout` stays private and does the real work
-    (already idempotent, already `Runner`-driven); this exists only so a screen never calls a
-    leading-underscore function directly (the same rule that made `swap.install_pinned_binary`
-    a public wrapper rather than exposing `swap._install_binary`)."""
-    _ensure_checkout(runner, repo, ref, checkout_dir)
+fetch_checkout = ensure_checkout
 
 
 def _binary_sane(prefix: Path, name: str) -> bool:
@@ -294,20 +283,27 @@ def _write_build_record(
     outcome: str,
     detail: str,
     log_lines: list[str],
+    argv: list[str] | None = None,
+    prebuilt: bool = False,
+    asset: str | None = None,
 ) -> None:
     """Writes build-info.json (always — this is what makes an outcome, including a failure,
     readable) and build.log (only when log_lines is non-empty, i.e. only when a build actually
     ran this call — the idempotent "already built, skipping" path must never blank out an
     existing build's real compile transcript). Both go through Runner so sudo and --dry-run
     stay honest; a dry_run=True Runner writes neither."""
-    record = {
+    record: dict[str, Any] = {
         "ref": ref,
-        "cmake_flags": resolve_cmake_flags(recipe),
-        "argv": resolve_cmake_argv(backend, recipe, checkout_dir, build_dir),
+        "cmake_flags": resolve_cmake_flags(recipe) if not prebuilt else [],
+        "argv": argv if argv is not None else resolve_cmake_argv(backend, recipe, checkout_dir, build_dir),
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "outcome": outcome,  # "smoke_pass" | "smoke_failed" | "build_failed"
         "detail": detail[:2000],
     }
+    if prebuilt:
+        record["prebuilt"] = True
+    if asset:
+        record["asset"] = asset
     runner.write_file(build_dir / "build-info.json", json.dumps(record, indent=2) + "\n", mode=0o644)
     if log_lines:
         runner.write_file(build_dir / "build.log", "\n".join(log_lines) + "\n", mode=0o644)
@@ -351,8 +347,17 @@ def resolve_cmake_flags(recipe: dict[str, Any]) -> list[str]:
     -DCMAKE_BUILD_TYPE=Release must be set at configure time, not just `--config Release` at
     build time — that flag only matters for multi-config generators (Xcode/MSVC); the default
     Linux Makefile/Ninja generator is single-config and would otherwise build unoptimized.
+
+    -DCMAKE_INSTALL_RPATH embeds relative paths ($ORIGIN/../lib) so installed binaries can
+    load companion shared libraries (libllama-cli-impl.so, etc.) without system-wide ld.so.conf.
     """
-    return ["-DCMAKE_BUILD_TYPE=Release", *recipe["cmake_flags"]]
+    flags = [
+        "-DCMAKE_BUILD_TYPE=Release",
+        "-DCMAKE_INSTALL_RPATH=$ORIGIN/../lib:$ORIGIN/../lib64:$ORIGIN",
+        "-DCMAKE_INSTALL_RPATH_USE_LINK_PATH=TRUE",
+    ]
+    flags.extend(recipe.get("cmake_flags", []))
+    return flags
 
 
 def resolve_cmake_argv(backend: str, recipe: dict[str, Any], checkout_dir: Path, prefix: Path) -> list[str]:
@@ -547,10 +552,11 @@ def list_builds(host_profile: dict[str, Any], backend: str) -> list[dict[str, An
             "id": d.name,
             "version": meta["ref"] if meta is not None else d.name,
             "legacy": legacy,
-            "current": d == current_target,
+            "current": d.resolve() == current_target,
             "sane": _prefix_ready(d),
             "outcome": None if meta is None else meta.get("outcome"),
             "timestamp": None if meta is None else meta.get("timestamp"),
+            "prebuilt": False if meta is None else meta.get("prebuilt", False),
         })
     return result
 
@@ -633,7 +639,7 @@ def run(
     Every existing caller defaults to False, so the already-pinned-SHA idempotence CLI callers
     rely on is unchanged.
     """
-    needed = _needed_backends(host_profile)
+    needed = needed_backends(host_profile)
     if backends is None:
         backends = needed
     else:
@@ -648,7 +654,7 @@ def run(
         return
 
     checkout_dir = checkout_dir_for(host_profile)
-    _ensure_checkout(runner, manifest["llama_cpp"]["repo"], manifest["llama_cpp"]["ref"], checkout_dir)
+    ensure_checkout(runner, manifest["llama_cpp"]["repo"], manifest["llama_cpp"]["ref"], checkout_dir)
 
     fixture = load_smoke_fixture(repo_root)
     prefix_root = Path(host_profile["paths"]["prefix_root"])
@@ -747,3 +753,122 @@ def run(
 
     if failed:
         sys.exit(f"build: FAILED for backend(s): {', '.join(failed)} — see log above; 'current' left untouched for each")
+
+
+def download_prebuilt_release(
+    host_profile: dict[str, Any],
+    manifest: dict[str, Any],
+    backend: str,
+    asset_name: str,
+    asset_url: str,
+    *,
+    cudart_url: str | None = None,
+    runner: Runner,
+    repo_root: Path,
+) -> Path:
+    """Download, extract, and activate an upstream prebuilt release binary for `backend`.
+
+    1. Downloads archive (+ optional companion cudart runtime libraries) via runner (curl).
+    2. Extracts into prefix_root/<backend>/build-<tag>.
+    3. Copies binaries to bin/ and shared libraries to lib/ and bin/ with proper permissions (chmod 0755/0644).
+    4. Writes build-info.json and build.log.
+    5. Runs real-inference smoke test against the downloaded binary.
+    6. On pass: atomically links current symlink and prunes retained builds.
+    7. On fail: leaves current symlink untouched and raises RuntimeError.
+    """
+    clean = asset_name.removeprefix("cudart-")
+    m = re.match(r"^llama-([^-]+)-bin-", clean)
+    tag = m.group(1) if m else "prebuilt"
+
+    prefix_root = Path(host_profile["paths"]["prefix_root"])
+    backend_dir = prefix_root / backend
+    prefix = allocate_build_dir(host_profile, backend, ref=tag, tag=tag)
+
+    workdir = Path(host_profile["paths"]["state_dir"]) / "prebuilt-download" / f"{backend}-{tag}"
+    runner.mkdir(workdir, mode=0o755)
+    tarball = workdir / asset_name
+
+    log_lines: list[str] = []
+
+    def _log(msg: str) -> None:
+        log.info(msg)
+        log_lines.append(msg)
+        if runner.on_output:
+            runner.on_output(msg)
+
+    _log(f"build[{backend}]: downloading {asset_name} from {asset_url}")
+    runner.run(["curl", "-fsSL", "-o", str(tarball), asset_url])
+
+    cudart_tarball: Path | None = None
+    if cudart_url:
+        cudart_name = Path(urllib.parse.urlsplit(cudart_url).path).name or f"cudart-{asset_name}"
+        cudart_tarball = workdir / cudart_name
+        _log(f"build[{backend}]: downloading companion CUDA runtime from {cudart_url}")
+        runner.run(["curl", "-fsSL", "-o", str(cudart_tarball), cudart_url])
+
+    # Extraction
+    extract_dir = workdir / "extracted"
+    runner.mkdir(extract_dir, mode=0o755)
+    _log(f"build[{backend}]: extracting {asset_name}")
+    runner.run(["tar", "-xzf", str(tarball), "-C", str(extract_dir)])
+    if cudart_tarball:
+        _log(f"build[{backend}]: extracting {cudart_tarball.name}")
+        runner.run(["tar", "-xzf", str(cudart_tarball), "-C", str(extract_dir)])
+
+    # Target directory structure
+    runner.mkdir(prefix / "bin", mode=0o755)
+    runner.mkdir(prefix / "lib", mode=0o755)
+
+    if not runner.dry_run:
+        # Move/copy files from extracted tree
+        copy_script = (
+            f"find {_sh(str(extract_dir))} -type f -exec cp -f {{}} {_sh(str(prefix / 'bin'))}/ \\; && "
+            f"find {_sh(str(extract_dir))} -type f -name '*.so*' -exec cp -f {{}} {_sh(str(prefix / 'lib'))}/ \\;"
+        )
+        runner.shell(copy_script)
+
+        # Ensure executable bits on binaries
+        for bin_name in ("llama-cli", "llama-server", "llama-bench"):
+            p = prefix / "bin" / bin_name
+            if p.exists():
+                runner.run(["chmod", "0755", str(p)], check=False)
+
+        runner.run(["chmod", "a+rx", str(prefix_root), str(backend_dir)], check=False)
+        runner.run(["chmod", "-R", "a+rX", str(prefix)], check=False)
+
+    cli_binary = prefix / "bin" / "llama-cli"
+    if not cli_binary.exists() and not runner.dry_run:
+        err = f"expected binary {cli_binary} not found after extraction"
+        _log(f"build[{backend}]: {err}")
+        _write_build_record(
+            prefix, runner, backend=backend, ref=tag, recipe={"cmake_flags": []},
+            checkout_dir=workdir, outcome="build_failed", detail=err, log_lines=log_lines,
+            argv=["download", asset_url], prebuilt=True, asset=asset_name,
+        )
+        raise RuntimeError(err)
+
+    fixture = load_smoke_fixture(repo_root)
+    model_path = ensure_smoke_model(host_profile, fixture, runner)
+
+    _log(f"build[{backend}]: running real-inference smoke test against {cli_binary}")
+    recipe = manifest.get("backends", {}).get(backend, {})
+    ok, detail = run_smoke_test(cli_binary, model_path, fixture, source_script=recipe.get("source_script"))
+
+    if not ok:
+        _log(f"build[{backend}]: SMOKE TEST FAILED — {detail}")
+        _write_build_record(
+            prefix, runner, backend=backend, ref=tag, recipe={"cmake_flags": []},
+            checkout_dir=workdir, outcome="smoke_failed", detail=detail, log_lines=log_lines,
+            argv=["download", asset_url], prebuilt=True, asset=asset_name,
+        )
+        raise RuntimeError(f"smoke test failed for {asset_name}: {detail}")
+
+    _log(f"build[{backend}]: prebuilt smoke test passed")
+    _write_build_record(
+        prefix, runner, backend=backend, ref=tag, recipe={"cmake_flags": []},
+        checkout_dir=workdir, outcome="smoke_pass", detail=detail, log_lines=log_lines,
+        argv=["download", asset_url], prebuilt=True, asset=asset_name,
+    )
+    runner.atomic_symlink(backend_dir / "current", prefix)
+    _prune_old_builds(prefix_root, backend, host_profile.get("retain_builds", 3), runner)
+    return prefix

@@ -13,6 +13,9 @@ cockpit or hitting refresh, not a tight poll loop. Must never crash the app: any
 from __future__ import annotations
 
 import json
+import os
+import platform
+import re
 import time
 import urllib.request
 from pathlib import Path
@@ -77,11 +80,7 @@ def _write_cache(results: dict[str, Any]) -> None:
 
 def cache_age_seconds() -> float | None:
     """How old the stored result is, for the UI to say so. None when there is none."""
-    try:
-        data = yaml.safe_load(_CACHE_PATH.read_text()) or {}
-    except (OSError, yaml.YAMLError):
-        return None
-    checked_at = data.get("checked_at")
+    checked_at = _read_full_cache().get("checked_at")
     return time.time() - checked_at if isinstance(checked_at, (int, float)) else None
 
 
@@ -135,11 +134,205 @@ def check_releases(repo_url: str, *, force: bool = False, limit: int = 20) -> di
     except Exception as e:  # network down, rate-limited, VPN-only host — never crash the UI
         return {"ok": False, "error": str(e)}
     releases = [
-        {"tag_name": r.get("tag_name"), "published_at": r.get("published_at")}
+        {
+            "tag_name": r.get("tag_name"),
+            "published_at": r.get("published_at"),
+            "name": r.get("name") or r.get("tag_name"),
+            "assets": [
+                {
+                    "name": a.get("name"),
+                    "size": a.get("size", 0),
+                    "browser_download_url": a.get("browser_download_url"),
+                }
+                for a in r.get("assets", [])
+                if isinstance(a, dict) and a.get("name")
+            ],
+        }
         for r in data if isinstance(r, dict)
     ]
     _write_releases_cache(repo, releases)
     return {"ok": True, "releases": releases}
+
+
+_LINUX_ARCH_MAP = {
+    "x86_64": "x64",
+    "amd64": "x64",
+    "aarch64": "arm64",
+    "arm64": "arm64",
+}
+
+
+def detect_host_arch() -> str:
+    m = platform.machine().lower()
+    return _LINUX_ARCH_MAP.get(m, m)
+
+
+def detect_host_cuda_version() -> str | None:
+    """Safely detect installed CUDA version from /usr/local/cuda* paths without waking GPU."""
+    for p in (Path("/usr/local/cuda"), Path("/usr/local/cuda-12"), Path("/usr/local/cuda-13")):
+        try:
+            if p.is_symlink():
+                target = os.readlink(p)
+                m = re.search(r"cuda-([0-9.]+)", target)
+                if m:
+                    return m.group(1)
+        except OSError:
+            pass
+    try:
+        cand: list[str] = []
+        for d in Path("/usr/local").glob("cuda-*"):
+            if d.is_dir() and not d.is_symlink():
+                m = re.match(r"^cuda-([0-9.]+)$", d.name)
+                if m:
+                    cand.append(m.group(1))
+        if cand:
+            cand.sort(key=lambda s: [int(x) for x in s.split(".") if x.isdigit()], reverse=True)
+            return cand[0]
+    except OSError:
+        pass
+    return None
+
+
+def parse_asset_info(name: str) -> dict[str, Any] | None:
+    """Parse release asset filename into metadata (backend, arch, cuda_version, is_cudart)."""
+    if not name.endswith(".tar.gz"):
+        return None
+    if any(k in name for k in ("win", "macos", "android")):
+        return None
+
+    is_cudart = name.startswith("cudart-")
+    clean = name.removeprefix("cudart-")
+
+    m = re.match(r"^llama-([^-]+)-bin-(?:ubuntu-)?(.+)\.tar\.gz$", clean)
+    if not m:
+        m = re.match(r"^llama-([^-]+)-bin-(.+)\.tar\.gz$", clean)
+        if not m:
+            return None
+
+    tag = m.group(1)
+    rest = m.group(2)
+
+    arch = "x64" if "x64" in rest else ("arm64" if "arm64" in rest else ("s390x" if "s390x" in rest else "unknown"))
+
+    backend = "cpu"
+    cuda_ver = None
+    if "cuda" in rest:
+        backend = "cuda"
+        cm = re.search(r"cuda-([0-9.]+)", rest)
+        if cm:
+            cuda_ver = cm.group(1)
+    elif "vulkan" in rest:
+        backend = "vulkan"
+    elif "rocm" in rest:
+        backend = "rocm"
+    elif "sycl" in rest:
+        backend = "sycl"
+    elif "openvino" in rest:
+        backend = "openvino"
+
+    label = f"CUDA {cuda_ver}" if cuda_ver else backend.upper()
+    return {
+        "name": name,
+        "tag": tag,
+        "arch": arch,
+        "backend": backend,
+        "cuda_version": cuda_ver,
+        "is_cudart": is_cudart,
+        "label": label,
+    }
+
+
+def parse_release_assets(assets: list[dict[str, Any]], host_arch: str | None = None) -> list[dict[str, Any]]:
+    """Filter and parse assets for Linux, pairing CUDA assets with companion cudart."""
+    target_arch = host_arch or detect_host_arch()
+    cudart_map: dict[str, dict[str, Any]] = {}
+    runnable_assets: list[dict[str, Any]] = []
+
+    for a in assets:
+        name = a.get("name", "")
+        info = parse_asset_info(name)
+        if not info:
+            continue
+        entry = {**a, **info}
+        if entry["is_cudart"]:
+            # e.g. key by base name (without "cudart-")
+            cudart_map[name.removeprefix("cudart-")] = entry
+        else:
+            runnable_assets.append(entry)
+
+    # Attach companion cudart
+    for r in runnable_assets:
+        r["companion_cudart"] = cudart_map.get(r["name"])
+
+    # Prioritize matching host architecture
+    runnable_assets.sort(
+        key=lambda x: (
+            0 if x.get("arch") == target_arch else 1,
+            0 if x.get("backend") == "cuda" else (1 if x.get("backend") == "vulkan" else 2),
+            x.get("name", ""),
+        )
+    )
+    return runnable_assets
+
+
+def find_recommended_asset(
+    assets: list[dict[str, Any]],
+    host_profile: dict[str, Any] | None = None,
+    target_backend: str | None = None,
+) -> dict[str, Any] | None:
+    """Identify the recommended asset for this host hardware & architecture."""
+    host_arch = detect_host_arch()
+    matching_arch = [a for a in assets if a.get("arch") == host_arch]
+    if not matching_arch:
+        matching_arch = assets
+
+    detected_cuda = detect_host_cuda_version() or "12.8"
+
+    if target_backend:
+        if target_backend == "cuda":
+            for a in matching_arch:
+                if a.get("backend") == "cuda" and a.get("cuda_version") == detected_cuda:
+                    return a
+            for a in matching_arch:
+                if a.get("backend") == "cuda":
+                    return a
+        else:
+            for a in matching_arch:
+                if a.get("backend") == target_backend:
+                    return a
+        return matching_arch[0] if matching_arch else None
+
+    # No explicit target backend: inspect host GPUs
+    gpus = (host_profile or {}).get("gpus", [])
+    has_nvidia = any(
+        "nvidia" in (g.get("vendor", "") + " " + g.get("model", "")).lower()
+        for g in gpus
+    )
+    if has_nvidia:
+        for a in matching_arch:
+            if a.get("backend") == "cuda" and a.get("cuda_version") == detected_cuda:
+                return a
+        for a in matching_arch:
+            if a.get("backend") == "cuda":
+                return a
+
+    # Try vulkan
+    for a in matching_arch:
+        if a.get("backend") == "vulkan":
+            return a
+
+    # Fallback to cpu
+    for a in matching_arch:
+        if a.get("backend") == "cpu":
+            return a
+
+    return matching_arch[0] if matching_arch else None
+
+
+def fallback_asset_url(repo_url: str, tag: str, asset_name: str) -> str:
+    """Generate predictable GitHub release download URL when API is rate-limited."""
+    repo = repo_url.rstrip("/").removeprefix("https://github.com/")
+    return f"https://github.com/{repo}/releases/download/{tag}/{asset_name}"
 
 
 def resolve_ref_sha(repo_url: str, ref: str) -> str:

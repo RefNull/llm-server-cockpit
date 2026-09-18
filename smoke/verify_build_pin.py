@@ -47,6 +47,7 @@ import bootstrap  # noqa: E402
 
 bootstrap.add_venv_site_packages(_REPO_ROOT)
 
+from cockpit import update_check  # noqa: E402
 from cockpit.screens.builds import _short, _write_manifest_cmake_flags, _write_manifest_ref  # noqa: E402
 from cockpit.widgets import TableAction  # noqa: E402
 from provision import schema, smoke as smoke_step  # noqa: E402
@@ -708,7 +709,10 @@ def verify_resolve_cmake_argv_matches_build() -> None:
         argv = build_step.resolve_cmake_argv(backend, recipe, checkout_dir, prefix)
         expected = [
             "cmake", "-B", str(checkout_dir / f"build-{backend}"),
-            "-DCMAKE_BUILD_TYPE=Release", *recipe["cmake_flags"],
+            "-DCMAKE_BUILD_TYPE=Release",
+            "-DCMAKE_INSTALL_RPATH=$ORIGIN/../lib:$ORIGIN/../lib64:$ORIGIN",
+            "-DCMAKE_INSTALL_RPATH_USE_LINK_PATH=TRUE",
+            *recipe["cmake_flags"],
             f"-DCMAKE_INSTALL_PREFIX={prefix}", str(checkout_dir),
         ]
         assert argv == expected, f"{backend}: resolve_cmake_argv() = {argv!r}, expected {expected!r}"
@@ -1215,6 +1219,115 @@ def verify_swap_update_transaction_and_state() -> None:
     print("verify_build_pin: swap update transaction installs target version, updates manifest/state/cache, atomic on failure — OK")
 
 
+def verify_prebuilt_release_asset_discovery() -> None:
+    sample_assets = [
+        {"name": "llama-b11037-bin-ubuntu-x64.tar.gz", "size": 1000, "browser_download_url": "https://url/cpu"},
+        {"name": "llama-b11037-bin-ubuntu-vulkan-x64.tar.gz", "size": 2000, "browser_download_url": "https://url/vulkan"},
+        {"name": "llama-b11037-bin-ubuntu-cuda-12.8-x64.tar.gz", "size": 3000, "browser_download_url": "https://url/cuda12"},
+        {"name": "cudart-llama-b11037-bin-ubuntu-cuda-12.8-x64.tar.gz", "size": 4000, "browser_download_url": "https://url/cudart12"},
+        {"name": "llama-b11037-bin-win-x64.zip", "size": 5000, "browser_download_url": "https://url/win"},
+        {"name": "llama-b11037-bin-macos-arm64.tar.gz", "size": 6000, "browser_download_url": "https://url/mac"},
+    ]
+    parsed = update_check.parse_release_assets(sample_assets, host_arch="x64")
+    # Only linux x64 assets should be parsed, windows/mac ignored, cudart paired
+    assert len(parsed) == 3, f"Expected 3 parsed assets, got {len(parsed)}"
+
+    cuda = next(a for a in parsed if a["backend"] == "cuda")
+    assert cuda["cuda_version"] == "12.8"
+    assert cuda["companion_cudart"] is not None
+    assert cuda["companion_cudart"]["browser_download_url"] == "https://url/cudart12"
+
+    vulkan = next(a for a in parsed if a["backend"] == "vulkan")
+    assert vulkan["companion_cudart"] is None
+
+    rec_cuda = update_check.find_recommended_asset(parsed, target_backend="cuda")
+    assert rec_cuda is not None and rec_cuda["backend"] == "cuda"
+
+    rec_vulkan = update_check.find_recommended_asset(parsed, target_backend="vulkan")
+    assert rec_vulkan is not None and rec_vulkan["backend"] == "vulkan"
+
+    fallback = update_check.fallback_asset_url("https://github.com/ggml-org/llama.cpp", "b11037", "llama-b11037-bin-ubuntu-vulkan-x64.tar.gz")
+    assert fallback == "https://github.com/ggml-org/llama.cpp/releases/download/b11037/llama-b11037-bin-ubuntu-vulkan-x64.tar.gz"
+    print("verify_build_pin: prebuilt release asset discovery and recommendation — OK")
+
+
+def verify_download_prebuilt_pipeline() -> None:
+    import tarfile
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        prefix_root = root / "builds"
+        state_dir = root / "state"
+        host_profile = {
+            "retain_builds": 3,
+            "paths": {"prefix_root": str(prefix_root), "state_dir": str(state_dir)},
+            "gpus": [{"vendor": "AMD"}],
+        }
+        manifest = {
+            "backends": {
+                "vulkan": {"cmake_flags": ["-DGGML_VULKAN=ON"]}
+            }
+        }
+
+        # Create a mock source directory and tarball
+        pkg_dir = root / "pkg"
+        pkg_bin = pkg_dir / "bin"
+        pkg_bin.mkdir(parents=True)
+        (pkg_bin / "llama-cli").write_text("#!/bin/sh\necho llama-cli\n")
+        (pkg_bin / "llama-cli").chmod(0o755)
+        (pkg_bin / "llama-server").write_text("#!/bin/sh\necho llama-server\n")
+        (pkg_bin / "llama-server").chmod(0o755)
+        pkg_lib = pkg_dir / "lib"
+        pkg_lib.mkdir(parents=True)
+        (pkg_lib / "libllama.so").write_text("dummy shared library")
+
+        tar_path = root / "llama-b11037-bin-ubuntu-vulkan-x64.tar.gz"
+        with tarfile.open(tar_path, "w:gz") as tar:
+            tar.add(pkg_dir, arcname="llama-b11037")
+
+        orig_smoke = build_step.run_smoke_test
+        orig_ensure = build_step.ensure_smoke_model
+        build_step.run_smoke_test = lambda *args, **kwargs: (True, "mock smoke test pass")
+        build_step.ensure_smoke_model = lambda *args, **kwargs: root / "dummy_model.gguf"
+        (root / "dummy_model.gguf").write_text("gguf")
+
+        runner = Runner(dry_run=False)
+        try:
+            prefix = build_step.download_prebuilt_release(
+                host_profile,
+                manifest,
+                "vulkan",
+                "llama-b11037-bin-ubuntu-vulkan-x64.tar.gz",
+                f"file://{tar_path}",
+                runner=runner,
+                repo_root=_REPO_ROOT,
+            )
+            assert prefix.exists()
+            assert prefix.name == "build-b11037"
+            assert (prefix / "bin" / "llama-cli").exists()
+            assert (prefix / "bin" / "llama-server").exists()
+            assert (prefix_root / "vulkan" / "current").resolve() == prefix.resolve()
+
+            # Verify build-info.json
+            info = build_step._read_build_metadata(prefix)
+            assert info is not None
+            assert info.get("prebuilt") is True
+            assert info.get("ref") == "b11037"
+            assert info.get("outcome") == "smoke_pass"
+
+            # Verify list_builds() surfaces prebuilt
+            builds = build_step.list_builds(host_profile, "vulkan")
+            assert len(builds) == 1
+            assert builds[0]["prebuilt"] is True
+            assert builds[0]["current"] is True
+            assert builds[0]["version"] == "b11037"
+        finally:
+            build_step.run_smoke_test = orig_smoke
+            build_step.ensure_smoke_model = orig_ensure
+
+    print("verify_build_pin: download_prebuilt_release pipeline, metadata and symlink — OK")
+
+
 def main() -> None:
     verify_missing_manifest_fails_with_remedy()
     verify_first_run_creates_manifest_verbatim()
@@ -1243,6 +1356,8 @@ def main() -> None:
     verify_fetch_checkout_existing_dir()
     verify_extract_manifest_tag()
     verify_ensure_smoke_model_fallback()
+    verify_prebuilt_release_asset_discovery()
+    verify_download_prebuilt_pipeline()
     print("verify_build_pin: all checks passed")
 
 

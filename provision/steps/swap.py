@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+import platform
 import re
 import shlex
 import shutil
@@ -47,7 +48,7 @@ def _install_llama_swap(host_profile: dict[str, Any], manifest: dict[str, Any], 
         log.info("swap: llama-swap already installed at pinned %s (%s)", version, installed.splitlines()[0])
         return _BINARY_PATH
 
-    machine = subprocess.run(["uname", "-m"], stdout=subprocess.PIPE, text=True).stdout.strip()
+    machine = platform.machine()
     arch_suffix = _ARCH_MAP.get(machine)
     if arch_suffix is None:
         raise RuntimeError(f"swap: unsupported host architecture {machine!r} (supported: {sorted(_ARCH_MAP)})")
