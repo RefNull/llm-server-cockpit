@@ -116,13 +116,12 @@ def validate_host_profile_dict(
 
 def validate_manifest_dict(data: dict, source: str = "manifest.yaml") -> None:
     """Validate in-memory manifest dictionary."""
-    _require(data, ["llama_cpp", "llama_swap", "huggingface_hub", "textual", "backends"], source)
+    _require(data, ["llama_cpp", "llama_swap", "huggingface_hub", "backends"], source)
     _require(data["llama_cpp"], ["ref", "repo"], f"{source}.llama_cpp")
     if not re.match(r"^[0-9a-f]{40}$", str(data["llama_cpp"]["ref"])):
         raise ValidationError(f"{source}.llama_cpp.ref: must be a 40-character hex commit SHA")
     _require(data["llama_swap"], ["version", "repo"], f"{source}.llama_swap")
     _require(data["huggingface_hub"], ["version"], f"{source}.huggingface_hub")
-    _require(data["textual"], ["version"], f"{source}.textual")
 
     backends = data["backends"]
     if not isinstance(backends, dict) or len(backends) == 0:

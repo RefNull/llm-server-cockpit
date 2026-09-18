@@ -14,11 +14,11 @@ llama_swap:
   version: v255
   repo: https://github.com/mostlygeek/llama-swap
 
+# huggingface_hub is installed into the managed host's venv (via hf.py _ensure_hub_pinned),
+# NOT into the cockpit/provision venv. requirements.txt covers the toolchain itself;
+# managed stack dependencies belong here.
 huggingface_hub:
   version: "0.29.1"
-
-textual:
-  version: "8.2.8"  # confirmed latest as of 2026-09-11, via GitHub releases API
 
 # Backend recipes are repo-level, not host-level: a host profile only says
 # *which* of these its GPUs use (hosts/<hostname>.yaml gpus[].backends).

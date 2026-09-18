@@ -6,8 +6,8 @@ screenshots/
 /HANDOVER.md
 
 # Real per-deployment data — hostnames, MACs, home-dir paths, driver fingerprints. Never
-# committed to a public repo. See hosts/example.yaml and models.example.yaml for the
-# templates that ARE tracked; copy them and fill in your own machine's facts locally.
+# committed to a public repo. See hosts/example.yaml, models.example.yaml and manifest.example.yaml
+# for the templates that ARE tracked; copy them and fill in your own machine's facts locally.
 /hosts/*.yaml
 !/hosts/example.yaml
 /hosts/*.lock.yaml
@@ -15,3 +15,6 @@ screenshots/
 /hosts/*.update-cache.yaml
 /models.yaml
 /scripts.yaml
+/manifest.yaml
+!/manifest.example.yaml
+
