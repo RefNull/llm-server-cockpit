@@ -166,7 +166,7 @@ def _fixture(tmp_root: Path) -> tuple[dict, dict, dict, str]:
 
 def _write_fake_prefix(prefix: Path) -> None:
     (prefix / "bin").mkdir(parents=True, exist_ok=True)
-    for name in ("llama-cli", "llama-server"):
+    for name in ("llama-completion", "llama-server"):
         p = prefix / "bin" / name
         p.write_text("#!/bin/sh\necho fake\n")
         p.chmod(0o755)
@@ -1273,8 +1273,8 @@ def verify_download_prebuilt_pipeline() -> None:
         pkg_dir = root / "pkg"
         pkg_bin = pkg_dir / "bin"
         pkg_bin.mkdir(parents=True)
-        (pkg_bin / "llama-cli").write_text("#!/bin/sh\necho llama-cli\n")
-        (pkg_bin / "llama-cli").chmod(0o755)
+        (pkg_bin / "llama-completion").write_text("#!/bin/sh\necho llama-completion\n")
+        (pkg_bin / "llama-completion").chmod(0o755)
         (pkg_bin / "llama-server").write_text("#!/bin/sh\necho llama-server\n")
         (pkg_bin / "llama-server").chmod(0o755)
         pkg_lib = pkg_dir / "lib"
@@ -1304,7 +1304,7 @@ def verify_download_prebuilt_pipeline() -> None:
             )
             assert prefix.exists()
             assert prefix.name == "build-b11037"
-            assert (prefix / "bin" / "llama-cli").exists()
+            assert (prefix / "bin" / "llama-completion").exists()
             assert (prefix / "bin" / "llama-server").exists()
             assert (prefix_root / "vulkan" / "current").resolve() == prefix.resolve()
 

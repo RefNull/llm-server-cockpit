@@ -92,9 +92,12 @@ def _binary_sane(prefix: Path, name: str) -> bool:
 
 
 def _prefix_ready(prefix: Path) -> bool:
-    # Both binaries matter: llama-cli is what the smoke test drives, llama-server is what
-    # swap.py's generated config actually runs at serve time.
-    return _binary_sane(prefix, "llama-cli") and _binary_sane(prefix, "llama-server")
+    # Both binaries matter: llama-completion is what the smoke test drives (upstream split
+    # the old "main" tool into llama-cli, always chat-templated with no raw-completion flag,
+    # and llama-completion, which still takes -no-cnv for one-shot text continuation — see
+    # provision/smoke.py's -no-cnv comment), llama-server is what swap.py's generated config
+    # actually runs at serve time.
+    return _binary_sane(prefix, "llama-completion") and _binary_sane(prefix, "llama-server")
 
 
 # Fixed, documented candidate roots for find_foreign_builds() — never a filesystem walk.
@@ -708,16 +711,16 @@ def run(
             finally:
                 runner.on_output = original_on_output
 
-        cli_binary = prefix / "bin" / "llama-cli"
-        if not cli_binary.exists():
+        completion_binary = prefix / "bin" / "llama-completion"
+        if not completion_binary.exists():
             if runner.dry_run:
                 log.info("build[%s]: --dry-run, nothing built yet at %s — skipping smoke test", backend, prefix)
                 continue
             failed.append(backend)
-            log.error("build[%s]: expected binary %s not present after build — cannot smoke test", backend, cli_binary)
+            log.error("build[%s]: expected binary %s not present after build — cannot smoke test", backend, completion_binary)
             _write_build_record(
                 prefix, runner, backend=backend, ref=ref, recipe=recipe, checkout_dir=checkout_dir,
-                outcome="build_failed", detail=f"expected binary {cli_binary} not present after build",
+                outcome="build_failed", detail=f"expected binary {completion_binary} not present after build",
                 log_lines=log_lines,
             )
             continue
@@ -730,9 +733,9 @@ def run(
 
         log.info(
             "build[%s]: running real-inference smoke test against %s%s",
-            backend, cli_binary, " (read-only diagnostic under --dry-run)" if runner.dry_run else "",
+            backend, completion_binary, " (read-only diagnostic under --dry-run)" if runner.dry_run else "",
         )
-        ok, detail = run_smoke_test(cli_binary, model_path, fixture, source_script=recipe.get("source_script"))
+        ok, detail = run_smoke_test(completion_binary, model_path, fixture, source_script=recipe.get("source_script"))
         if not ok:
             failed.append(backend)
             log.error("build[%s]: SMOKE TEST FAILED — %s — leaving 'current' symlink untouched", backend, detail)
@@ -828,7 +831,7 @@ def download_prebuilt_release(
         runner.shell(copy_script)
 
         # Ensure executable bits on binaries
-        for bin_name in ("llama-cli", "llama-server", "llama-bench"):
+        for bin_name in ("llama-cli", "llama-completion", "llama-server", "llama-bench"):
             p = prefix / "bin" / bin_name
             if p.exists():
                 runner.run(["chmod", "0755", str(p)], check=False)
@@ -836,7 +839,7 @@ def download_prebuilt_release(
         runner.run(["chmod", "a+rx", str(prefix_root), str(backend_dir)], check=False)
         runner.run(["chmod", "-R", "a+rX", str(prefix)], check=False)
 
-    cli_binary = prefix / "bin" / "llama-cli"
+    cli_binary = prefix / "bin" / "llama-completion"
     if not cli_binary.exists() and not runner.dry_run:
         err = f"expected binary {cli_binary} not found after extraction"
         _log(f"build[{backend}]: {err}")

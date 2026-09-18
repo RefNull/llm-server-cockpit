@@ -73,8 +73,11 @@ def ensure_smoke_model(host_profile: dict[str, Any], fixture: dict[str, Any], ru
 
 
 def _smoke_argv(binary: Path, model: Path, fixture: dict[str, Any]) -> list[str]:
-    # -no-cnv: llama-cli defaults to interactive chat mode for instruct models, which never
-    # exits on its own — force plain one-shot completion instead. --temp 0: greedy decoding,
+    # -no-cnv: llama-completion defaults to interactive chat mode for instruct models, which
+    # never exits on its own — force plain one-shot completion instead. (Upstream split the
+    # old "main" tool: llama-cli is chat-templated only and does not accept this flag at all —
+    # build.py's run()/_prefix_ready() drive llama-completion here, not llama-cli.) --temp 0:
+    # greedy decoding,
     # so the expected_substring check isn't at the mercy of sampling noise. -ngl 999: force
     # full GPU offload. Without this, a CUDA/Vulkan/SYCL-built binary can still default to
     # CPU-only inference — which would mean this test never touches the actual backend kernels
