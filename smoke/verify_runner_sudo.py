@@ -96,6 +96,30 @@ def main() -> None:
         assert len(log.read_text().splitlines()) == before, "sudo was invoked with sudo=False"
         print("sudo=False: sudo invoked zero times")
 
+        # env under sudo=False must MERGE onto the inherited environment, not replace it —
+        # a direct-exec cmake call (provision/steps/build.py's non-source_script path) passes
+        # only the 1-2 keys it cares about (e.g. CUDACXX) and still needs HOME/PATH/etc. to
+        # reach the child. Regression coverage for the merge dropped in 220827f.
+        os.environ["MARKER_VAR"] = "should-survive"
+        try:
+            merge_res = plain.run(
+                ["sh", "-c", 'printf "%s|%s" "$HOME" "$OVERRIDE_VAR"'],
+                env={"OVERRIDE_VAR": "set"},
+                capture=True,
+            )
+            home, override = merge_res.stdout.split("|")
+            assert home == os.environ.get("HOME", ""), f"HOME not inherited under sudo=False env=: {merge_res.stdout!r}"
+            assert override == "set", f"explicit env override lost: {merge_res.stdout!r}"
+
+            marker_res = plain.run(["sh", "-c", 'printf "%s" "$MARKER_VAR"'], env={"OVERRIDE_VAR": "set"}, capture=True)
+            assert marker_res.stdout == "should-survive", f"unrelated inherited var lost: {marker_res.stdout!r}"
+
+            unset_res2 = plain.run(["sh", "-c", 'printf "%s" "$MARKER_VAR"'], unset_env=["MARKER_VAR"], capture=True)
+            assert unset_res2.stdout == "", f"unset_env under sudo=False failed: {unset_res2.stdout!r}"
+        finally:
+            os.environ.pop("MARKER_VAR", None)
+        print("sudo=False: env= merges onto inherited environment, unset_env still removes")
+
         # on_output: streaming, not capture-then-dump. A script that prints, sleeps, prints
         # must deliver each line to the callback as it happens, not all at once at the end.
         script = work / "stream.sh"

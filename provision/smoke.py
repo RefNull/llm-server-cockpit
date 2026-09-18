@@ -9,6 +9,7 @@ shows up in the output. "It loaded" is not a passing test — this actually gene
 from __future__ import annotations
 
 import logging
+import os
 import shlex
 import subprocess
 import sys

@@ -97,7 +97,7 @@ class Runner:
         else:
             elevated = self._elevate(cmd)
             if env is not None or unset_env:
-                sub_env = dict(env or os.environ)
+                sub_env = {**os.environ, **(env or {})}
                 if unset_env:
                     for u in unset_env:
                         sub_env.pop(u, None)
