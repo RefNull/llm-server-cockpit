@@ -549,6 +549,37 @@ async def _assert_backend_detail_modal(app: CockpitApp, pilot, context: str) -> 
     await pilot.pause(0.1)
 
 
+async def _assert_add_deployment_modal(app: CockpitApp, pilot, context: str) -> None:
+    """plans/06 Phase 4 (A4) — AddDeploymentModal is fixed at width 60, well under the 80x24
+    floor, so containment is not the interesting fact here; the number is (60 < 80 is not
+    evidence, a measured region is). Asserted by construction/containment only — this harness
+    does not drive Select input end-to-end for any modal today (ChangeVersionModal isn't
+    exercised that way either), so the pick-a-GPU/pick-a-backend/reject-a-duplicate path is
+    proven separately, against a scratch host profile, not through Pilot."""
+    from cockpit.screens.builds import AddDeploymentModal
+
+    modal = AddDeploymentModal(app.host_profile, app.manifest)
+    app.push_screen(modal)
+    await pilot.pause(0.2)
+
+    dialog = app.screen.query_one("#deployment-dialog")
+    print(f"[{context}] AddDeploymentModal dialog region: {dialog.region}")
+    assert app.screen.region.contains_region(dialog.region), (
+        f"[{context}] AddDeploymentModal dialog {dialog.region} is not fully inside the screen "
+        f"{app.screen.region}"
+    )
+    for widget_id in ("#f-deployment-gpu", "#f-deployment-backend", "#btn-deployment-add", "#btn-deployment-cancel"):
+        widget = app.screen.query_one(widget_id)
+        assert widget.region.x >= dialog.region.x and widget.region.right <= dialog.region.right, (
+            f"[{context}] {widget_id} region {widget.region} escapes the dialog horizontally "
+            f"({dialog.region})"
+        )
+
+    _assert_buttons_in_bounds(app, f"{context} AddDeploymentModal")
+    app.pop_screen()
+    await pilot.pause(0.1)
+
+
 async def verify_geometry_and_export_screenshots() -> None:
     _assert_no_awaited_workers()
     print("No awaited @work methods.")
@@ -627,6 +658,7 @@ async def verify_geometry_and_export_screenshots() -> None:
                 if name == "builds":
                     await _assert_backend_detail_modal(app, pilot, f"{name} @ {w}x{h}")
                     await _assert_builds_list_modal(app, pilot, f"{name} @ {w}x{h}")
+                    await _assert_add_deployment_modal(app, pilot, f"{name} @ {w}x{h}")
                 if name == "settings_services":
                     await _assert_wol_form_wiring(app, pilot, f"{name} @ {w}x{h}")
                     await _assert_root_gate(app, pilot, f"{name} @ {w}x{h}")

@@ -285,6 +285,35 @@ class CockpitApp(App):
         except schema.ValidationError as e:
             self.notify(f"manifest.yaml error: {e}", severity="error")
 
+    def reload_host_profile(self) -> None:
+        """Re-read hosts/<hostname>.yaml — the fourth sibling to reload_manifest()/
+        reload_models()/reload_scripts(). BuildsScreen's "Add deployment" (plans/06 Phase 4) is
+        the first screen-initiated host-profile write outside Settings, and this keeps
+        self.host_profile here the one object every screen's constructor was handed, the same
+        reasoning reload_manifest already gives for self.manifest.
+
+        Keyed on self.host_name — the file __init__ actually loaded (--host, or the machine's
+        own hostname) — never on host_profile["hostname"], which is the field inside that file
+        and can name a different host entirely (settings.py._host_profile_path() does that; see
+        its own caller for why this phase does not follow it).
+
+        This does not, by itself, make an already-mounted screen redraw with the new value:
+        only BuildsScreen calls it today and then re-reads self.host_profile from here itself.
+        No other screen's on_refresh_requested rereads self.app_ref.host_profile (only manifest
+        gets that treatment, via dashboard.py's on_refresh_requested) — so Settings, Deploy,
+        Dashboard etc. still need a restart to see a change made here, exactly as
+        _confirm_and_save_profile's own "restart the cockpit for other tabs to see the change"
+        already says. Wiring that up everywhere is a separate change, not this one.
+        """
+        if self.host_profile is None:
+            return
+        try:
+            self.host_profile = schema.try_load_host_profile(
+                self.repo_root / "hosts" / f"{self.host_name}.yaml", self.manifest
+            )
+        except schema.ValidationError as e:
+            self.notify(f"host profile error: {e}", severity="error")
+
     def reload_models(self) -> None:
         if self.host_profile is None:
             return

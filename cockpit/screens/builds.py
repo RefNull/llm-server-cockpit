@@ -5,6 +5,7 @@ lives here, only rendering and the ConfirmModal gate in front of every mutating 
 """
 from __future__ import annotations
 
+import copy
 import logging
 import os
 import re
@@ -18,7 +19,7 @@ from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.css.query import NoMatches
 from textual.screen import ModalScreen
-from textual.widgets import Button, DataTable, Input, RichLog, Static, TextArea
+from textual.widgets import Button, DataTable, Input, RichLog, Select, Static, TextArea
 
 from cockpit import update_check
 from cockpit.widgets import (
@@ -32,6 +33,7 @@ from cockpit.widgets import (
     escape_markup,
     root_note,
 )
+from provision import schema
 from provision.common import Runner
 from provision.steps import build as build_step
 from provision.steps import swap as swap_step
@@ -774,6 +776,105 @@ class ChangeVersionModal(ModalScreen[str | None]):
         self.app.call_from_thread(self.dismiss, sha)
 
 
+class AddDeploymentModal(ModalScreen[tuple[str, str] | None]):
+    """Binds an existing backend to an existing GPU (plans/06 Phase 4, A4) — the "Add
+    deployment" vector under the Installs table's llama.cpp section. Shell cloned from
+    ChangeVersionModal (nearest pick-one-and-dismiss precedent in this file), but this one has
+    no table: two `Select`s, both closed lists, so nothing typed here can name a GPU or a
+    backend that does not already exist.
+
+    Per operator decision (plans/06 §0h-2) this **never adds or renames a GPU** — Settings ->
+    GPU Topology stays the only editor for `gpus[]` itself, and the GPU `Select`'s options come
+    straight from `host_profile["gpus"]`. The backend `Select`'s options come from
+    `manifest["backends"].keys()` — the same source `settings.py`'s `_backend_hint`/
+    `_validate_gpu_form` derive from — so a backend with no `manifest.yaml` recipe is
+    structurally unselectable rather than merely rejected after the fact.
+
+    Only picks and validates the pairing; it does not write anything. The caller
+    (BuildsScreen._confirm_and_add_deployment) owns the schema re-validation, the confirm
+    step and the write — the same split ChangeVersionModal already has with
+    _confirm_and_change_version.
+    """
+
+    BINDINGS = [("escape", "dismiss_modal", "Close")]
+
+    DEFAULT_CSS = """
+    AddDeploymentModal {
+        align: center middle;
+    }
+    #deployment-dialog {
+        width: 60;
+        height: auto;
+        border: thick $background 80%;
+        background: $surface;
+        padding: $space-normal $space-section;
+    }
+    #deployment-header {
+        height: auto;
+        margin-bottom: $space-normal;
+    }
+    #deployment-title {
+        width: 1fr;
+        text-style: bold;
+    }
+    #deployment-error {
+        color: $error;
+        height: auto;
+        margin-bottom: $space-normal;
+    }
+    """
+
+    def __init__(self, host_profile: dict, manifest: dict) -> None:
+        super().__init__()
+        self.host_profile = host_profile
+        self.manifest = manifest
+
+    def compose(self) -> ComposeResult:
+        gpu_options = [(g["id"], g["id"]) for g in self.host_profile.get("gpus", [])]
+        backend_options = [(b, b) for b in sorted(self.manifest.get("backends", {}).keys())]
+        with Vertical(id="deployment-dialog"):
+            with Horizontal(id="deployment-header"):
+                yield Static("Add Deployment", id="deployment-title")
+                yield Button("×", id="deployment-close", classes="close-button", variant="error")
+            with Horizontal(classes="form-row"):
+                yield Static("GPU", classes="form-label")
+                yield Select(gpu_options, id="f-deployment-gpu", allow_blank=True, classes="form-field")
+            with Horizontal(classes="form-row"):
+                yield Static("Backend", classes="form-label")
+                yield Select(backend_options, id="f-deployment-backend", allow_blank=True, classes="form-field")
+            yield Static("", id="deployment-error")
+            with Horizontal(classes="action-row-primary"):
+                yield Button("Add", id="btn-deployment-add", variant="primary", classes="thin-button")
+                yield Button("Cancel", id="btn-deployment-cancel", classes="thin-button")
+
+    def _set_error(self, message: str) -> None:
+        self.query_one("#deployment-error", Static).update(message)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id in ("deployment-close", "btn-deployment-cancel"):
+            self.dismiss(None)
+        elif event.button.id == "btn-deployment-add":
+            self._select()
+
+    def _select(self) -> None:
+        gpu_id = self.query_one("#f-deployment-gpu", Select).value
+        backend = self.query_one("#f-deployment-backend", Select).value
+        if gpu_id is Select.BLANK or backend is Select.BLANK:
+            self._set_error("choose a GPU and a backend")
+            return
+        gpu = next((g for g in self.host_profile.get("gpus", []) if g["id"] == gpu_id), None)
+        if gpu is None:
+            self._set_error(f"unknown GPU {gpu_id!r}")
+            return
+        if backend in gpu.get("backends", []):
+            self._set_error(f"{gpu_id!r} already has backend {backend!r}")
+            return
+        self.dismiss((str(gpu_id), str(backend)))
+
+    def action_dismiss_modal(self) -> None:
+        self.dismiss(None)
+
+
 class BackendDetailModal(ModalScreen[None]):
     """Edit view for one backend row on the Installs table (plans/06 Phase 3, A6) — a plain
     field:value form, not the earlier What/Where/How narrative the operator asked to have
@@ -1102,10 +1203,13 @@ class BuildsScreen(CockpitScreenBase):
             backends_table.cursor_type = "row"
             yield backends_table
             # Answers "where does a row come from, and how do I add one" — the operator's
-            # 2026-09-18 QA report: the bind lives in Settings -> GPU Topology's "Add GPU" form
-            # (gpus[].backends). Not a second GPU-editing form — that stays the only one.
+            # 2026-09-18 QA report. "Add deployment" (plans/06 Phase 4) opens AddDeploymentModal,
+            # which binds an existing backend to an existing GPU. It is not a second
+            # GPU-editing form: Settings -> GPU Topology stays the only place gpus[] itself is
+            # added to or edited; this button only ever appends to a GPU that is already there.
             with Horizontal(classes="action-row-secondary"):
                 yield Button("Build log", id="btn-build-log", classes="thin-button")
+                yield Button("Add deployment", id="btn-add-deployment", classes="thin-button")
                 # Hidden by default (DEFAULT_CSS) until _refresh_backends_table finds something —
                 # a scan result behind a button (A2), not an always-visible block, and never
                 # rescanned on click (DESIGN.md §3.0: the scan itself stays in the refresh path).
@@ -1372,6 +1476,8 @@ class BuildsScreen(CockpitScreenBase):
             self.app.push_screen(InfoModal("Foreign builds", self._foreign_builds_text()))
         elif button_id == "btn-swap-update-to-latest":
             self._confirm_and_update_swap()
+        elif button_id == "btn-add-deployment":
+            self._confirm_and_add_deployment()
 
     def _open_log_modal(self, title: str) -> None:
         modal = BuildLogModal(title, self._log_buffer)
@@ -1498,6 +1604,69 @@ class BuildsScreen(CockpitScreenBase):
         # is the third sibling to reload_models()/reload_scripts() (cockpit/app.py).
         self.app_ref.reload_manifest()
         self.manifest = getattr(self.app_ref, "manifest", self.manifest)
+
+    # ------------------------------------------------------------------ add deployment (writes hosts/<hostname>.yaml, never builds)
+
+    @work
+    async def _confirm_and_add_deployment(self) -> None:
+        """Binds an existing backend to an existing GPU by writing hosts/<hostname>.yaml
+        gpus[].backends (plans/06 Phase 4, A4). Never adds or renames a GPU (§0h-2) — if the
+        host profile has none, this points at Settings -> GPU Topology instead of growing a
+        second GPU-editing form here."""
+        if not self.host_profile.get("gpus"):
+            self.notify("no GPUs configured — add one in Settings -> GPU Topology first", severity="warning")
+            return
+        selection = await self.app.push_screen_wait(AddDeploymentModal(self.host_profile, self.manifest))
+        if selection is None:
+            return
+        gpu_id, backend = selection
+
+        candidate = copy.deepcopy(self.host_profile)
+        target_gpu = next((g for g in candidate["gpus"] if g["id"] == gpu_id), None)
+        if target_gpu is None:
+            self.notify(f"unknown GPU {gpu_id!r}", severity="error")
+            return
+        if backend in target_gpu.get("backends", []):
+            # AddDeploymentModal already rejected this against the same host_profile reference;
+            # re-checking against the fresh deep copy only matters if the profile changed
+            # between opening the modal and confirming here (another screen's write landing in
+            # between) — cheap enough to keep as a genuine second check, not a copy of the first.
+            self.notify(f"{gpu_id!r} already has backend {backend!r}", severity="warning")
+            return
+        target_gpu["backends"] = list(target_gpu.get("backends", [])) + [backend]
+
+        try:
+            schema.validate_host_profile_dict(candidate, known_backends=self.manifest["backends"].keys())
+        except schema.ValidationError as e:
+            self.notify(f"validation failed: {e}", severity="error")
+            return
+
+        message = f"Bind backend {backend!r} to GPU {gpu_id!r} in hosts/{self.app_ref.host_name}.yaml?"
+        confirmed = await self.app.push_screen_wait(ConfirmModal(message, confirm_label="Add", danger=True))
+        if not confirmed:
+            return
+
+        # Keyed on app_ref.host_name (the file cockpit/app.py actually loaded, --host or the
+        # machine's own hostname), not candidate["hostname"] (the field inside it) — settings.py
+        # ._host_profile_path() uses the latter, which is a pre-existing latent bug there: dormant
+        # only because the two happen to match on every host profile in this repo today. Do not
+        # copy that idiom here; a write keyed on the field can land in a different file than the
+        # one that was read the moment they diverge (e.g. `bin/cockpit --host staging`).
+        content = yaml.safe_dump(candidate, sort_keys=False)
+        target_path = self.repo_root / "hosts" / f"{self.app_ref.host_name}.yaml"
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        target_path.write_text(content, encoding="utf-8")
+
+        # Reload through the app, not by keeping `candidate`: reload_host_profile() re-parses
+        # the file just written, and reading self.app_ref.host_profile back (rather than
+        # assigning `candidate` directly) means BuildsScreen ends up holding the same object
+        # every other screen's constructor would get on the next restart — one object, not two
+        # equal-but-distinct ones (the same shape dashboard.py:147 uses for self.models).
+        self.app_ref.reload_host_profile()
+        self.host_profile = getattr(self.app_ref, "host_profile", self.host_profile)
+        self.backends = self._compute_backends()
+        self._refresh_backends_table()
+        self.notify(f"backend {backend!r} bound to {gpu_id!r} — hosts/{self.app_ref.host_name}.yaml written")
 
     # ------------------------------------------------------------------ build (blocking, off main thread)
 
