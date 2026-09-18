@@ -333,6 +333,7 @@ def _build_backend(
     nproc = str(os.cpu_count() or 4)
     source_script = recipe.get("source_script")
 
+    unset_vars: list[str] = []
     # Sanitize CUDACXX: CMake's CMakeDetermineCUDACompiler fails with:
     # "Could not find compiler set in environment variable CUDACXX: <path>"
     # if CUDACXX points to a compiler binary that does not exist on disk.
@@ -341,17 +342,25 @@ def _build_backend(
         if val and not (Path(val.strip()).is_file() or shutil.which(val.strip())):
             log.warning("build[%s]: ignoring invalid CUDACXX=%r (binary not found)", backend, val)
             target.pop("CUDACXX", None)
+            if "CUDACXX" not in unset_vars:
+                unset_vars.append("CUDACXX")
 
-    if backend == "cuda" and not build_env.get("CUDACXX") and not os.environ.get("CUDACXX"):
-        default_nvcc = Path("/usr/local/cuda/bin/nvcc")
-        if default_nvcc.is_file():
-            build_env["CUDACXX"] = str(default_nvcc)
-            cuda_bin = str(default_nvcc.parent)
-            cur_path = os.environ.get("PATH", "")
-            if cuda_bin not in cur_path.split(os.pathsep):
-                build_env["PATH"] = f"{cuda_bin}{os.pathsep}{cur_path}"
-        elif shutil.which("nvcc"):
-            build_env["CUDACXX"] = shutil.which("nvcc")  # type: ignore[assignment]
+    if backend == "cuda":
+        # Always ensure CUDACXX is unset if it was invalid or not explicitly given in build_env,
+        # so host /etc/environment or PAM cannot inject a stale CUDACXX under sudo.
+        if "CUDACXX" not in build_env:
+            if "CUDACXX" not in unset_vars:
+                unset_vars.append("CUDACXX")
+            default_nvcc = Path("/usr/local/cuda/bin/nvcc")
+            if default_nvcc.is_file():
+                build_env["CUDACXX"] = str(default_nvcc)
+            elif shutil.which("nvcc"):
+                build_env["CUDACXX"] = shutil.which("nvcc")  # type: ignore[assignment]
+        cuda_dir = Path("/usr/local/cuda/bin")
+        if cuda_dir.is_dir():
+            cur_path = build_env.get("PATH") or os.environ.get("PATH", "")
+            if str(cuda_dir) not in cur_path.split(os.pathsep):
+                build_env["PATH"] = f"{cuda_dir}{os.pathsep}{cur_path}"
 
     # cmake --install over hand-copying build-<backend>/bin/: llama.cpp's CMakeLists.txt
     # ships standard install() targets for llama-cli/llama-server/libllama, so this gives a
@@ -359,9 +368,11 @@ def _build_backend(
     if source_script:
         # `source` only works inside a shell — the whole configure+build+install has to be
         # one runner.shell call, not separate runner.run() direct-exec calls.
+        unsets = "".join(f"unset {u}\n" for u in unset_vars)
         exports = "".join(f"export {k}={_sh(v)}\n" for k, v in build_env.items())
         flags = " ".join(_sh(f) for f in resolve_cmake_flags(recipe))
         script = (
+            f"{unsets}"
             f"{exports}"
             f"source {source_script} && "
             f"cmake -B {_sh(str(builddir))} {flags} -DCMAKE_INSTALL_PREFIX={_sh(str(prefix))} "
@@ -371,10 +382,21 @@ def _build_backend(
         )
         runner.shell(script)
     else:
-        env = {**os.environ, **build_env}
-        runner.run(resolve_cmake_argv(backend, recipe, checkout_dir, prefix), env=env)
-        runner.run(["cmake", "--build", str(builddir), "--config", "Release", "-j", nproc], env=env)
-        runner.run(["cmake", "--install", str(builddir)], env=env)
+        runner.run(
+            resolve_cmake_argv(backend, recipe, checkout_dir, prefix),
+            env=build_env,
+            unset_env=unset_vars,
+        )
+        runner.run(
+            ["cmake", "--build", str(builddir), "--config", "Release", "-j", nproc],
+            env=build_env,
+            unset_env=unset_vars,
+        )
+        runner.run(
+            ["cmake", "--install", str(builddir)],
+            env=build_env,
+            unset_env=unset_vars,
+        )
 
 
 def _prune_old_builds(prefix_root: Path, backend: str, retain: int, runner: Runner) -> None:

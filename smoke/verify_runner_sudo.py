@@ -72,9 +72,17 @@ def main() -> None:
         runner.shell(f"echo hi > {work / 'shelled'}")
         assert (work / "shelled").read_text().strip() == "hi"
 
+        # env and unset_env under sudo=True propagate via env in the elevated argv
+        env_res = runner.run(["sh", "-c", 'printf "%s" "$TEST_SUDO_ENV"'], env={"TEST_SUDO_ENV": "active"}, capture=True)
+        assert env_res is not None and env_res.stdout == "active", f"env under sudo failed: {env_res}"
+        os.environ["TEST_BAD_ENV"] = "bad"
+        unset_res = runner.run(["sh", "-c", 'printf "%s" "$TEST_BAD_ENV"'], unset_env=["TEST_BAD_ENV"], capture=True)
+        assert unset_res is not None and unset_res.stdout == "", f"unset_env under sudo failed: {unset_res}"
+        os.environ.pop("TEST_BAD_ENV", None)
+
         calls = log.read_text().splitlines()
         assert all(c.startswith("-n ") for c in calls), f"not every call was `sudo -n`: {calls}"
-        for expected in ("install -m 0644", "install -m 0755", "mkdir -p -m 0755", "os.replace", "bash -c"):
+        for expected in ("install -m 0644", "install -m 0755", "mkdir -p -m 0755", "os.replace", "bash -c", "env TEST_SUDO_ENV=active", "env -u TEST_BAD_ENV"):
             assert any(expected in c for c in calls), f"no elevated call matched {expected!r}: {calls}"
         print(f"sudo=True: {len(calls)} elevated commands, all via `sudo -n`")
 

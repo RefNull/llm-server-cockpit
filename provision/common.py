@@ -56,8 +56,25 @@ class Runner:
     def _announce(self, action: str) -> None:
         log.info("%s%s%s", "[dry-run] " if self.dry_run else "", "[sudo] " if self.sudo else "", action)
 
-    def _elevate(self, cmd: Sequence[str]) -> list[str]:
-        return ["sudo", "-n", *(str(c) for c in cmd)] if self.sudo else [str(c) for c in cmd]
+    def _elevate(
+        self,
+        cmd: Sequence[str],
+        *,
+        env: dict | None = None,
+        unset_env: Sequence[str] | None = None,
+    ) -> list[str]:
+        if not self.sudo:
+            return [str(c) for c in cmd]
+        if not env and not unset_env:
+            return ["sudo", "-n", *(str(c) for c in cmd)]
+        env_cmd = ["env"]
+        if unset_env:
+            for u in unset_env:
+                env_cmd.extend(["-u", str(u)])
+        if env:
+            for k, v in env.items():
+                env_cmd.append(f"{k}={v}")
+        return ["sudo", "-n", *env_cmd, *(str(c) for c in cmd)]
 
     def run(
         self,
@@ -67,16 +84,31 @@ class Runner:
         env: dict | None = None,
         cwd: str | Path | None = None,
         capture: bool = False,
+        unset_env: Sequence[str] | None = None,
     ) -> subprocess.CompletedProcess | None:
         self._announce(f"run: {' '.join(str(c) for c in cmd)}" + (f"  (cwd={cwd})" if cwd else ""))
         if self.dry_run:
             return None
+        if self.sudo:
+            elevated = self._elevate(cmd, env=env, unset_env=unset_env)
+            # Under sudo, env overrides and unsets are passed via `env` in the argv,
+            # so sudo's default env_reset and PAM's /etc/environment cannot scrub or corrupt them.
+            sub_env = None
+        else:
+            elevated = self._elevate(cmd)
+            if env is not None or unset_env:
+                sub_env = dict(env or os.environ)
+                if unset_env:
+                    for u in unset_env:
+                        sub_env.pop(u, None)
+            else:
+                sub_env = None
         if self.on_output is not None:
-            return self._run_streaming(self._elevate(cmd), check=check, env=env, cwd=cwd)
+            return self._run_streaming(elevated, check=check, env=sub_env, cwd=cwd)
         return subprocess.run(
-            self._elevate(cmd),
+            elevated,
             check=check,
-            env=env,
+            env=sub_env,
             cwd=cwd,
             stdout=subprocess.PIPE if capture else None,
             stderr=subprocess.STDOUT if capture else None,

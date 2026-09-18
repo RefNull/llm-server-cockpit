@@ -740,6 +740,42 @@ def verify_resolve_cmake_argv_matches_build() -> None:
     print("verify_build_pin: resolve_cmake_argv() is what _build_backend actually runs — OK")
 
 
+def verify_build_cuda_env_sanitization() -> None:
+    """Verifies that an invalid CUDACXX in os.environ is stripped and passed to unset_env so
+    PAM/sudo cannot inject it into cmake under elevation."""
+    import yaml as _yaml
+
+    manifest_dict = _yaml.safe_load((_REPO_ROOT / "manifest.example.yaml").read_text())
+    call_kwargs: list[dict] = []
+
+    class _CaptureKwargsRunner(Runner):
+        def run(self, cmd, **kwargs):
+            call_kwargs.append(dict(kwargs))
+            return None
+
+        def apt_install(self, packages):
+            return None
+
+    orig_cudacxx = os.environ.get("CUDACXX")
+    try:
+        os.environ["CUDACXX"] = "/usr/local/cuda-nonexistent/bin/nvcc"
+        with tempfile.TemporaryDirectory() as td:
+            real_checkout = Path(td) / "checkout"
+            prefix = Path(td) / "prefix"
+            build_step._build_backend("cuda", manifest_dict["backends"]["cuda"], real_checkout, prefix, _CaptureKwargsRunner())
+        assert "CUDACXX" not in os.environ, "invalid CUDACXX was not stripped from os.environ"
+        assert len(call_kwargs) >= 1
+        assert "CUDACXX" in call_kwargs[0].get("unset_env", []), (
+            f"CUDACXX was not included in unset_env: {call_kwargs[0]}"
+        )
+    finally:
+        if orig_cudacxx is not None:
+            os.environ["CUDACXX"] = orig_cudacxx
+        else:
+            os.environ.pop("CUDACXX", None)
+    print("verify_build_pin: CUDA CUDACXX sanitization and unset_env propagation — OK")
+
+
 # --------------------------------------------------------------------- TableAction.confirm callable
 
 def verify_table_action_confirm_callable() -> None:
@@ -1170,6 +1206,7 @@ def main() -> None:
     verify_backend_names_derive_from_manifest()
     verify_cmake_flags_write_aborts_on_bad_backend()
     verify_resolve_cmake_argv_matches_build()
+    verify_build_cuda_env_sanitization()
     verify_table_action_confirm_callable()
     verify_four_status_states()
     verify_update_does_not_make_stale_build_read_up_to_date()
