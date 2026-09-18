@@ -1649,6 +1649,10 @@ class BuildsScreen(CockpitScreenBase):
         self.app.call_from_thread(self._apply_cpp_check_result, {
             **check, "pinned": new_ref, "update_available": new_ref != check.get("latest"),
         })
+        self.app.call_from_thread(
+            self._append_build_log,
+            f"\nDone: llama.cpp source fetched at {_short(new_ref)}. Close this modal to build backends below.",
+        )
         self.app.call_from_thread(self.app.notify, f"llama.cpp source fetched at {_short(new_ref)}")
 
     @work
@@ -1734,6 +1738,10 @@ class BuildsScreen(CockpitScreenBase):
             log.warning("swap_step.reconcile_service failed: %s", e)
             service_state = "unknown"
 
+        self.app.call_from_thread(
+            self._append_build_log,
+            f"\nDone: llama-swap {new_version} installed at {swap_step._BINARY_PATH}.",
+        )
         self.app.call_from_thread(self._on_swap_updated, new_version, service_state, check)
 
     def _on_swap_updated(self, new_version: str, service_state: str, check: dict) -> None:
