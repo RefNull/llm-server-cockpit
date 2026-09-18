@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import copy
 import inspect
 import os
 import shutil
@@ -24,7 +25,7 @@ bootstrap.add_venv_site_packages(_REPO_ROOT)
 
 from cockpit import update_check  # noqa: E402
 from cockpit.app import CockpitApp  # noqa: E402
-from cockpit.screens.builds import BuildsScreen  # noqa: E402
+from cockpit.screens.builds import BackendDetailModal, BuildsScreen  # noqa: E402
 from cockpit.screens.scripts import ScriptsScreen  # noqa: E402
 from cockpit.screens.settings import SettingsScreen  # noqa: E402
 from provision.steps import wol  # noqa: E402
@@ -456,7 +457,56 @@ async def _assert_edit_model_modal(app: CockpitApp, pilot, context: str) -> None
 
     _assert_buttons_in_bounds(app, f"{context} EditModelModal")
 
-    app.screen.dismiss(False)
+
+async def _assert_backend_detail_modal(app: CockpitApp, pilot, context: str) -> None:
+    """plans/05-qa-remediation-pass.md follow-up (operator QA 2026-09-18) —
+    BackendDetailModal carries paths and a flag list, both long-content shapes the add-model
+    form's 110-cell dialog was caught by (see _assert_edit_model_modal). Built against a
+    host_profile carrying haupe-server's real (long) prefix_root (/opt/llm-server/builds)
+    rather than the bundled example profile's, so the geometry check exercises the longer of
+    the two paths this repo actually has on record instead of only the shorter fixture one.
+    """
+    host_profile = copy.deepcopy(app.host_profile)
+    host_profile["paths"]["prefix_root"] = "/opt/llm-server/builds"
+    backend = "cuda"
+    assert backend in app.manifest.get("backends", {}), "fixture assumption: manifest.yaml has no 'cuda' backend"
+
+    modal = BackendDetailModal(host_profile, app.manifest, backend, app.repo_root, app)
+    app.push_screen(modal)
+    await pilot.pause(0.2)
+
+    dialog = app.screen.query_one("#detail-dialog")
+    assert app.screen.region.contains_region(dialog.region), (
+        f"[{context}] BackendDetailModal dialog {dialog.region} is not fully inside the screen "
+        f"{app.screen.region} — a dialog wider than the screen is the add-model-form failure "
+        f"this check exists to catch"
+    )
+
+    field_ids = ("#detail-what", "#detail-where", "#detail-how", "#f-detail-cmake-flags",
+                 "#btn-detail-save", "#btn-detail-close-bottom")
+    for widget_id in field_ids:
+        widget = app.screen.query_one(widget_id)
+        if not widget.is_on_screen:
+            continue
+        assert widget.region.x >= dialog.region.x and widget.region.right <= dialog.region.right, (
+            f"[{context}] {widget_id} region {widget.region} escapes the dialog horizontally "
+            f"({dialog.region}) — unreachable by any amount of vertical scrolling"
+        )
+
+    # Vertical reachability: scroll #detail-body to its end and confirm the Save/Close row —
+    # the content furthest down — is still inside the dialog. A pathological path is allowed
+    # to make this content scroll (VerticalScroll is the point); it is not allowed to make the
+    # dialog itself wider or push a button off past the screen edge.
+    body = app.screen.query_one("#detail-body")
+    body.scroll_end(animate=False)
+    await pilot.pause(0.2)
+    save_button = app.screen.query_one("#btn-detail-save")
+    assert save_button.is_on_screen, f"[{context}] Save flags button never reachable by scrolling"
+    body.scroll_home(animate=False)
+    await pilot.pause(0.1)
+
+    _assert_buttons_in_bounds(app, f"{context} BackendDetailModal")
+    app.pop_screen()
     await pilot.pause(0.1)
 
 
@@ -535,6 +585,8 @@ async def verify_geometry_and_export_screenshots() -> None:
                     await pilot.pause(0.1)
                 if name == "deploy":
                     await _assert_edit_model_modal(app, pilot, f"{name} @ {w}x{h}")
+                if name == "builds":
+                    await _assert_backend_detail_modal(app, pilot, f"{name} @ {w}x{h}")
                 if name == "settings_services":
                     await _assert_wol_form_wiring(app, pilot, f"{name} @ {w}x{h}")
                     await _assert_root_gate(app, pilot, f"{name} @ {w}x{h}")

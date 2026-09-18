@@ -8,15 +8,17 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shlex
 from pathlib import Path
 
+import yaml
 from rich.text import Text
 from textual import work
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.css.query import NoMatches
 from textual.screen import ModalScreen
-from textual.widgets import Button, DataTable, Input, RichLog, Static
+from textual.widgets import Button, DataTable, Input, RichLog, Static, TextArea
 
 from cockpit import update_check
 from cockpit.widgets import (
@@ -62,6 +64,69 @@ def _write_manifest_ref(path: Path, new_ref: str, new_comment: str | None = None
     new_text, count = _MANIFEST_REF_RE.subn(_sub, text, count=1)
     if count != 1:
         raise RuntimeError(f"manifest.yaml: could not find a llama_cpp.ref line to rewrite in {path}")
+    path.write_text(new_text)
+
+
+def _yaml_quote(value: str) -> str:
+    """Double-quote a scalar for a manifest.yaml list item, matching the file's existing
+    cmake_flags style (`- "-DGGML_CUDA=ON"`) rather than leaving it bare — a bare `-D...`
+    value is valid YAML today but not worth relying on for anything an operator typed."""
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _write_manifest_cmake_flags(path: Path, backend: str, new_flags: list[str]) -> None:
+    """Rewrite manifest.yaml's `backends.<backend>.cmake_flags` list in place — the list-block
+    equivalent of `_write_manifest_ref`'s scalar-line rewrite, for the same reason: never
+    `yaml.safe_dump`, which would destroy the header comment block and every inline comment
+    (e.g. `apt_packages: []  # CUDA toolkit presence is checked...`) on every backend, not
+    only the one being edited.
+
+    Order-independent by construction, not by assumption: the backend's own block is found by
+    its key line and bounded by the next sibling key at the same indent (never by assuming
+    cmake_flags is that block's first child key), and cmake_flags is then located *inside*
+    that bounded slice — so a backend that lists apt_packages before cmake_flags, or sits
+    between two other backends, is handled the same way as the first-key case.
+
+    manifest.yaml uses a 2-space indent per nesting level throughout (`backends:` at column 0,
+    `<backend>:` at column 2, its keys at column 4, list items at column 6) — that file-wide
+    style, not a per-call guess, is what fixes the indent widths below.
+    """
+    text = path.read_text()
+
+    backend_key_re = re.compile(rf"^( {{2}}){re.escape(backend)}:[ \t]*\n", re.MULTILINE)
+    key_match = backend_key_re.search(text)
+    if key_match is None:
+        raise RuntimeError(f"manifest.yaml: no backends.{backend} block found in {path}")
+    indent = key_match.group(1)  # "  " — this backend's own key indent
+    block_start = key_match.end()
+
+    # Bounded by the next line at the *same* indent (the next backend key, or a dedent back to
+    # "backends:"/EOF) — never by counting a fixed number of lines, so sibling key order and
+    # count never matter.
+    next_sibling_re = re.compile(rf"^{indent}\S", re.MULTILINE)
+    next_match = next_sibling_re.search(text, block_start)
+    block_end = next_match.start() if next_match else len(text)
+    block = text[block_start:block_end]
+
+    flags_re = re.compile(rf"^{indent}  cmake_flags:[ \t]*\n((?:{indent}    - .*\n)+)", re.MULTILINE)
+    flags_match = flags_re.search(block)
+    if flags_match is None:
+        raise RuntimeError(f"manifest.yaml: backends.{backend} has no cmake_flags list to rewrite in {path}")
+
+    new_items = "".join(f"{indent}    - {_yaml_quote(f)}\n" for f in new_flags)
+    new_block = block[: flags_match.start(1)] + new_items + block[flags_match.end(1):]
+    new_text = text[:block_start] + new_block + text[block_end:]
+
+    # Never trust the regex alone: parse the result back (yaml.safe_load — read-only, not the
+    # forbidden safe_dump) and confirm it says what was meant before committing anything to
+    # disk. Abort without writing on any mismatch.
+    parsed = yaml.safe_load(new_text)
+    actual = ((parsed or {}).get("backends", {}) or {}).get(backend, {}).get("cmake_flags")
+    if actual != new_flags:
+        raise RuntimeError(
+            f"manifest.yaml: cmake_flags rewrite for {backend!r} would produce {actual!r}, "
+            f"expected {new_flags!r} — aborting without writing"
+        )
     path.write_text(new_text)
 
 
@@ -601,6 +666,205 @@ class ChangeVersionModal(ModalScreen[str | None]):
         self.app.call_from_thread(self.dismiss, sha)
 
 
+class BackendDetailModal(ModalScreen[None]):
+    """Read/write detail view for one backend row on the Installs table — the operator's
+    2026-09-18 QA report: given a row that just says "llama.cpp (vulkan)", what is it, why is
+    it that way, how do I redefine its parameters, where does it point on disk, and how do I
+    control its build flags. Answers all of that in one place, plus makes cmake_flags
+    editable (plans/05-qa-remediation-pass.md Phase 2 follow-up, item 3):
+
+    - **what**: the backend name and which GPU(s) in the host profile declare it.
+    - **where**: `prefix_root/<backend>/`, the `current` symlink target, every retained ref
+      (`build_step.list_builds`).
+    - **how**: the effective cmake command line via `build_step.resolve_cmake_argv` — the
+      same function `_build_backend` calls to configure the real build, so this is provably
+      what runs, not a description of it — plus `apt_packages`/`build_env`/`source_script`.
+    - **where it's defined**: `manifest.yaml` → `backends.<name>.cmake_flags`, named
+      explicitly so the operator knows where to look outside this modal too.
+
+    cmake_flags is the one editable field: a TextArea, one flag per line, confirmed with
+    `ConfirmModal(danger=True)` old -> new (DESIGN.md §5's declarative-write idiom), written
+    by `_write_manifest_cmake_flags` — a targeted block rewrite, never `yaml.safe_dump`.
+
+    Not a CockpitScreenBase, same reason RetainedBuildsModal/ChangeVersionModal aren't: a
+    ModalScreen is a different widget-tree root, so this implements its own confirm-then-write
+    dispatch rather than inheriting one.
+    """
+
+    BINDINGS = [("escape", "dismiss_modal", "Close")]
+
+    DEFAULT_CSS = """
+    BackendDetailModal {
+        align: center middle;
+    }
+    #detail-dialog {
+        width: 90%;
+        height: 80%;
+        border: thick $background 80%;
+        background: $surface;
+        padding: $space-normal $space-section;
+    }
+    #detail-header {
+        height: auto;
+        margin-bottom: $space-normal;
+    }
+    #detail-title {
+        width: 1fr;
+        text-style: bold;
+    }
+    #detail-body {
+        height: 1fr;
+    }
+    #detail-body Static {
+        margin-bottom: $space-normal;
+    }
+    #detail-flags-group {
+        height: auto;
+    }
+    #f-detail-cmake-flags {
+        height: 5;
+    }
+    #detail-error {
+        color: $error;
+        height: auto;
+        margin-bottom: $space-normal;
+    }
+    """
+
+    def __init__(self, host_profile: dict, manifest: dict, backend: str, repo_root: Path, app_ref) -> None:
+        super().__init__()
+        self.host_profile = host_profile
+        self.manifest = manifest
+        self.backend = backend
+        self.repo_root = repo_root
+        self.app_ref = app_ref
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="detail-dialog"):
+            with Horizontal(id="detail-header"):
+                yield Static(f"llama.cpp ({self.backend})", id="detail-title")
+                yield Button("×", id="detail-close", classes="close-button", variant="error")
+            with VerticalScroll(id="detail-body"):
+                yield Static(id="detail-what")
+                yield Static(id="detail-where")
+                yield Static(id="detail-how")
+                with Vertical(id="detail-flags-group"):
+                    yield Static(f"backends.{escape_markup(self.backend)}.cmake_flags — one flag per line:")
+                    yield TextArea(id="f-detail-cmake-flags")
+                yield Static("", id="detail-error")
+            with Horizontal(classes="action-row-primary"):
+                yield Button("Save flags", id="btn-detail-save", variant="primary", classes="thin-button")
+                yield Button("Close", id="btn-detail-close-bottom", classes="thin-button")
+
+    def on_mount(self) -> None:
+        self._populate_detail()
+
+    def _recipe(self) -> dict:
+        return self.manifest.get("backends", {}).get(self.backend, {}) or {}
+
+    def _populate_detail(self) -> None:
+        recipe = self._recipe()
+        gpus = [
+            f"{g.get('id', '?')} ({g.get('vendor', '?')})"
+            for g in self.host_profile.get("gpus", [])
+            if self.backend in g.get("backends", [])
+        ]
+        host_name = escape_markup(getattr(self.app_ref, "host_name", "?"))
+        self.query_one("#detail-what", Static).update(
+            "[b]What[/]\n"
+            f"Backend: {escape_markup(self.backend)}\n"
+            f"Declared by: {escape_markup(', '.join(gpus)) or '(no GPU declares it)'} "
+            f"— hosts/{host_name}.yaml"
+        )
+
+        prefix_root = Path(self.host_profile["paths"]["prefix_root"])
+        backend_dir = prefix_root / self.backend
+        current_link = backend_dir / "current"
+        current_target = current_link.resolve() if current_link.is_symlink() else None
+        builds = build_step.list_builds(self.host_profile, self.backend)
+        retained_lines = "\n".join(
+            f"  {_short(b['ref'])}{' (current)' if b['current'] else ''}{'' if b['sane'] else ' NOT SANE'}"
+            for b in builds
+        ) or "  (nothing built yet)"
+        self.query_one("#detail-where", Static).update(
+            "[b]Where[/]\n"
+            f"Install root: {escape_markup(str(backend_dir))}/\n"
+            f"'current' -> {escape_markup(str(current_target)) if current_target else '(not set)'}\n"
+            f"Retained builds:\n{escape_markup(retained_lines)}"
+        )
+
+        ref = self.manifest.get("llama_cpp", {}).get("ref", "")
+        prefix = build_step.backend_prefix(self.host_profile, self.backend, ref)
+        checkout_dir = build_step.checkout_dir_for(self.host_profile)
+        argv = build_step.resolve_cmake_argv(self.backend, recipe, checkout_dir, prefix)
+        cmd = " ".join(shlex.quote(a) for a in argv)
+        extra = []
+        apt_packages = recipe.get("apt_packages") or []
+        if apt_packages:
+            extra.append(f"apt_packages: {', '.join(apt_packages)}")
+        build_env = recipe.get("build_env") or {}
+        if build_env:
+            extra.append("build_env: " + ", ".join(f"{k}={v}" for k, v in build_env.items()))
+        source_script = recipe.get("source_script")
+        if source_script:
+            extra.append(f"sourced before configure+build: {source_script}")
+        extra_lines = ("\n".join(extra) + "\n") if extra else ""
+        self.query_one("#detail-how", Static).update(
+            "[b]How[/]\n"
+            f"{escape_markup(cmd)}\n{escape_markup(extra_lines)}"
+            f"Defined in manifest.yaml -> backends.{escape_markup(self.backend)}.cmake_flags"
+        )
+
+        self.query_one("#f-detail-cmake-flags", TextArea).text = "\n".join(recipe.get("cmake_flags", []))
+
+    def _set_error(self, message: str) -> None:
+        self.query_one("#detail-error", Static).update(escape_markup(message))
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id in ("detail-close", "btn-detail-close-bottom"):
+            self.dismiss(None)
+        elif event.button.id == "btn-detail-save":
+            self._confirm_and_save_flags()
+
+    def action_dismiss_modal(self) -> None:
+        self.dismiss(None)
+
+    @work
+    async def _confirm_and_save_flags(self) -> None:
+        new_flags = [
+            line.strip()
+            for line in self.query_one("#f-detail-cmake-flags", TextArea).text.splitlines()
+            if line.strip()
+        ]
+        if not new_flags:
+            self._set_error("cmake_flags cannot be emptied — at least one flag is required")
+            return
+        old_flags = self._recipe().get("cmake_flags", [])
+        if new_flags == old_flags:
+            self._set_error("no change")
+            return
+        message = (
+            f"Update backends.{self.backend}.cmake_flags in manifest.yaml?\n"
+            f"- old: {' '.join(old_flags)}\n"
+            f"+ new: {' '.join(new_flags)}"
+        )
+        confirmed = await self.app.push_screen_wait(
+            ConfirmModal(message, confirm_label="Save flags", danger=True)
+        )
+        if not confirmed:
+            return
+        try:
+            _write_manifest_cmake_flags(self.repo_root / "manifest.yaml", self.backend, new_flags)
+        except Exception as e:
+            self.app.notify(f"could not write manifest.yaml: {e}", severity="error")
+            return
+        self.app_ref.reload_manifest()
+        self.manifest = getattr(self.app_ref, "manifest", self.manifest)
+        self._set_error("")
+        self._populate_detail()
+        self.app.notify(f"{self.backend}: cmake_flags updated")
+
+
 class BuildsScreen(CockpitScreenBase):
     """The 'Installs' tab. One panel per backend the host's GPUs actually use (cuda, vulkan,
     etc. per hosts/<hostname>.yaml), plus one upstream-version-check panel.
@@ -612,6 +876,9 @@ class BuildsScreen(CockpitScreenBase):
     }
     BuildsScreen #foreign-builds-note {
         display: none;
+    }
+    BuildsScreen .version-line {
+        margin-bottom: $space-normal;
     }
     """
 
@@ -659,6 +926,12 @@ class BuildsScreen(CockpitScreenBase):
     def compose(self) -> ComposeResult:
         with VerticalScroll():
             with Vertical(id="update-panel", classes="panel"):
+                # The pin is one global fact (manifest.yaml llama_cpp.ref) rendered once here,
+                # not per row — a per-row "Version" column is what made "Update to latest"
+                # read as "changes every row" (plans/05 follow-up, operator QA 2026-09-18):
+                # a global fact was rendered in a per-row column. _refresh_backends_table
+                # keeps this in sync with the table.
+                yield Static(id="version-line", classes="version-line")
                 # No fixed_columns (DESIGN.md §4.2): datatable--fixed REPLACES the row
                 # style rather than compositing with it, so a pinned column cut a flat band
                 # down column 0 through the zebra stripes — the "first column is always
@@ -704,21 +977,29 @@ class BuildsScreen(CockpitScreenBase):
         backends_table.cursor_type = "row"
         backends_table.zebra_stripes = True
         backends_table.add_column("Component", width=22)
-        backends_table.add_column("Version", width=14)
         backends_table.add_column("Installed", width=14)
-        # 22 + 14 + 14 + 35 + 11 = 96 content, render 96 + 2*5 = 106 (DESIGN.md §4, updated for
-        # the Phase 2 5-column shape — Version/Installed replace the old single manifest-pin
-        # column). Status keeps enough room for both the useful case ("update available (latest
-        # d1d3c33)") and the failure case ("couldn't check (HTTP Error 403: rate limit
-        # exceeded)").
+        # 22 + 14 + 35 + 11 + 8 = 90 content, render 90 + 2*5 = 100 (DESIGN.md §4, updated for
+        # this follow-up's 5-column shape — the pin is hoisted above the table as one global
+        # line, so Version is no longer a per-row column; QA 2026-09-18 traced "Update to
+        # latest changes every row" to exactly that column existing). Status keeps enough room
+        # for both the useful case ("update available (latest d1d3c33)") and the failure case
+        # ("couldn't check (HTTP Error 403: rate limit exceeded)").
         backends_table.add_column("Status", width=35)
         backends_table.add_action_column(
             TableAction(
                 "build",
                 self._build_label,
                 width=11,  # fits "[ Rebuild ]" (7+4); "[ Build ]" (9) fits the same column
-                confirm="{action} llama.cpp ({row})? This can take several minutes.",
+                confirm=self._build_confirm_message,
                 requires_root=True,
+                available=lambda row_key: row_key in self.backends,
+            )
+        )
+        backends_table.add_action_column(
+            TableAction(
+                "info",
+                "Info",
+                width=8,  # len("Info") + 4
                 available=lambda row_key: row_key in self.backends,
             )
         )
@@ -753,6 +1034,25 @@ class BuildsScreen(CockpitScreenBase):
                 return "Rebuild"
         return "Build"
 
+    def _build_confirm_message(self, row_key: str) -> str:
+        """Composed per row (TableAction.confirm as a callable — cockpit/widgets.py, same
+        treatment `label` already gets): the operator asked to see the ref, the backend, the
+        resolved cmake flags and the target prefix before committing ten minutes, not just a
+        generic "Build llama.cpp (cuda)?" (operator QA 2026-09-18). `resolve_cmake_argv` is
+        the same function `_build_backend` uses to configure the real build, so this is
+        provably what will run, not a description of it."""
+        label = self._build_label(row_key)
+        ref = self.manifest.get("llama_cpp", {}).get("ref", "")
+        recipe = self.manifest.get("backends", {}).get(row_key, {})
+        prefix = build_step.backend_prefix(self.host_profile, row_key, ref)
+        checkout_dir = build_step.checkout_dir_for(self.host_profile)
+        argv = build_step.resolve_cmake_argv(row_key, recipe, checkout_dir, prefix)
+        cmd = " ".join(shlex.quote(a) for a in argv)
+        return (
+            f"{label} llama.cpp ({row_key}) at version {_short(ref)}?\n{cmd}\n"
+            f"Installs to {prefix}. This can take several minutes."
+        )
+
     def _installed_ref(self, backend: str) -> str | None:
         for b in build_step.list_builds(self.host_profile, backend):
             if b.get("current"):
@@ -770,9 +1070,15 @@ class BuildsScreen(CockpitScreenBase):
         return Text(_short(current_ref), style="bold yellow")
 
     def _refresh_backends_table(self) -> None:
+        version_line = self.query_one("#version-line", Static)
+        cpp_ref = self.manifest.get("llama_cpp", {}).get("ref", "")
+        version_line.update(
+            f"Selected version: {_short(cpp_ref)} — one source tree, per-backend compile "
+            "flags (manifest.yaml → llama_cpp.ref). Not per row: every backend below builds "
+            "the same commit."
+        )
         table = self.query_one("#backends-table", SingleClickDataTable)
         table.clear()
-        cpp_ref = self.manifest.get("llama_cpp", {}).get("ref", "")
         for backend in self.backends:
             status_cell = (
                 Text("building…", style="dim")
@@ -781,7 +1087,6 @@ class BuildsScreen(CockpitScreenBase):
             )
             table.add_row(
                 Text(f"llama.cpp ({backend})"),
-                Text(_short(cpp_ref)),
                 self._installed_cell(backend, cpp_ref),
                 status_cell,
                 *table.action_cells(backend),
@@ -789,13 +1094,15 @@ class BuildsScreen(CockpitScreenBase):
             )
         swap_version = self.manifest.get("llama_swap", {}).get("version", "")
         table.add_row(
-            Text("llama-swap"),
-            Text(swap_version),
+            # llama-swap has exactly one version (a release tag, not a per-backend build) and
+            # no Version column exists any more, so it's named in the component cell instead
+            # of dropped — the version-line above the table is llama.cpp-specific.
+            Text(f"llama-swap ({swap_version})" if swap_version else "llama-swap"),
             Text("—", style="dim"),
             self._format_update_cell(self._llama_swap_check, shorten=False),
             # The llama-swap row is informational only — updated from the Deploy tab's deploy
-            # action, not from here — so its Build cell is always blank ("llama-swap" is never
-            # in self.backends).
+            # action, not from here — so its Build/Info cells are always blank ("llama-swap"
+            # is never in self.backends).
             *table.action_cells("llama-swap"),
             key="llama-swap",
         )
@@ -845,6 +1152,11 @@ class BuildsScreen(CockpitScreenBase):
     # ------------------------------------------------------------------ per-row action dispatch
 
     async def handle_table_action(self, action_id: str, row_key: str, table: DataTable) -> None:
+        if action_id == "info":
+            self.app.push_screen(
+                BackendDetailModal(self.host_profile, self.manifest, row_key, self.repo_root, self.app_ref)
+            )
+            return
         if action_id != "build":
             return
         if self._building_backends:

@@ -140,6 +140,40 @@ def _sh(value: str) -> str:
     return shlex.quote(value)
 
 
+def checkout_dir_for(host_profile: dict[str, Any]) -> Path:
+    """Where the pinned llama.cpp source lives — one checkout shared by every backend."""
+    return Path(host_profile["paths"]["state_dir"]) / "src" / "llama.cpp"
+
+
+def backend_prefix(host_profile: dict[str, Any], backend: str, ref: str) -> Path:
+    """The versioned install prefix for one backend at one ref."""
+    return Path(host_profile["paths"]["prefix_root"]) / backend / ref
+
+
+def resolve_cmake_flags(recipe: dict[str, Any]) -> list[str]:
+    """The `-D...` flags passed to `cmake -B` for this backend's recipe, before the
+    positional -B/-DCMAKE_INSTALL_PREFIX/source-dir arguments are added around them.
+
+    Pure — no filesystem access, no Runner — so a display caller (the cockpit's per-backend
+    detail view and Build confirm) and the code that actually runs the build
+    (`_build_backend`) share one source of truth instead of a display copy that can drift
+    from what the compiler receives (plans/05-qa-remediation-pass.md Phase 2 follow-up).
+
+    -DCMAKE_BUILD_TYPE=Release must be set at configure time, not just `--config Release` at
+    build time — that flag only matters for multi-config generators (Xcode/MSVC); the default
+    Linux Makefile/Ninja generator is single-config and would otherwise build unoptimized.
+    """
+    return ["-DCMAKE_BUILD_TYPE=Release", *recipe["cmake_flags"]]
+
+
+def resolve_cmake_argv(backend: str, recipe: dict[str, Any], checkout_dir: Path, prefix: Path) -> list[str]:
+    """The full `cmake -B ...` configure command line for this backend — the exact argv
+    `_build_backend` passes to `Runner.run` on the (non-source_script) direct-exec path, so
+    anything that shows this to the operator is showing what actually executes."""
+    builddir = checkout_dir / f"build-{backend}"
+    return ["cmake", "-B", str(builddir), *resolve_cmake_flags(recipe), f"-DCMAKE_INSTALL_PREFIX={prefix}", str(checkout_dir)]
+
+
 def _build_backend(
     backend: str,
     recipe: dict[str, Any],
@@ -151,10 +185,6 @@ def _build_backend(
     runner.apt_install(recipe.get("apt_packages", []))
 
     build_env = {k: resolve_env_value(v) for k, v in recipe.get("build_env", {}).items()}
-    # -DCMAKE_BUILD_TYPE=Release must be set at configure time, not just `--config Release` at
-    # build time — that flag only matters for multi-config generators (Xcode/MSVC); the default
-    # Linux Makefile/Ninja generator is single-config and would otherwise build unoptimized.
-    cmake_flags = ["-DCMAKE_BUILD_TYPE=Release", *recipe["cmake_flags"]]
     nproc = str(os.cpu_count() or 4)
     source_script = recipe.get("source_script")
 
@@ -165,7 +195,7 @@ def _build_backend(
         # `source` only works inside a shell — the whole configure+build+install has to be
         # one runner.shell call, not separate runner.run() direct-exec calls.
         exports = "".join(f"export {k}={_sh(v)}\n" for k, v in build_env.items())
-        flags = " ".join(_sh(f) for f in cmake_flags)
+        flags = " ".join(_sh(f) for f in resolve_cmake_flags(recipe))
         script = (
             f"{exports}"
             f"source {source_script} && "
@@ -177,10 +207,7 @@ def _build_backend(
         runner.shell(script)
     else:
         env = {**os.environ, **build_env} if build_env else None
-        runner.run(
-            ["cmake", "-B", str(builddir), *cmake_flags, f"-DCMAKE_INSTALL_PREFIX={prefix}", str(checkout_dir)],
-            env=env,
-        )
+        runner.run(resolve_cmake_argv(backend, recipe, checkout_dir, prefix), env=env)
         runner.run(["cmake", "--build", str(builddir), "--config", "Release", "-j", nproc], env=env)
         runner.run(["cmake", "--install", str(builddir)], env=env)
 
@@ -308,7 +335,7 @@ def run(
         log.info("build: no GPU in host profile declares any backend — nothing to build")
         return
 
-    checkout_dir = Path(host_profile["paths"]["state_dir"]) / "src" / "llama.cpp"
+    checkout_dir = checkout_dir_for(host_profile)
     _ensure_checkout(runner, manifest["llama_cpp"]["repo"], manifest["llama_cpp"]["ref"], checkout_dir)
 
     fixture = load_smoke_fixture(repo_root)
@@ -326,7 +353,7 @@ def run(
                 f"manifest.yaml backends (defined: {sorted(manifest['backends'])})"
             )
 
-        prefix = prefix_root / backend / ref
+        prefix = backend_prefix(host_profile, backend, ref)
         try:
             if _prefix_ready(prefix) and not force:
                 log.info("build[%s]: prefix %s already built and sane, skipping build", backend, prefix)

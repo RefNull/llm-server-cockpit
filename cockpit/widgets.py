@@ -464,7 +464,10 @@ class TableAction:
     confirm     prompt for a non-destructive action that still changes host state (a service
                 restart). `{row}` is substituted with the row key and `{action}` with this
                 row's resolved label. Destructive actions get a default prompt and don't need
-                this.
+                this. A callable of the row key instead makes the prompt itself per-row
+                computed content (e.g. the resolved build recipe) rather than a template
+                substitution — the same treatment `label` already gets, for the same reason:
+                a static string can't carry facts the caller only knows per row.
     requires_root
                 this action writes under /etc, /opt or /usr/local, or drives systemctl/apt.
                 The confirm gate then elevates first (see CockpitScreenBase.confirm) and the
@@ -478,7 +481,7 @@ class TableAction:
     label: str | Callable[[str], str]
     width: int | None = None
     destructive: bool = False
-    confirm: str | None = None
+    confirm: str | Callable[[str], str] | None = None
     requires_root: bool = False
     available: Callable[[str], bool] | None = None
 
@@ -504,11 +507,12 @@ class TableAction:
 
     def confirm_message(self, row_key: str) -> str | None:
         """None = fire immediately. Anything else goes through CockpitScreenBase.confirm()."""
-        label = self.resolve_label(row_key)
         if self.confirm is not None:
-            return self.confirm.format(row=row_key, action=label)
+            if callable(self.confirm):
+                return self.confirm(row_key)
+            return self.confirm.format(row=row_key, action=self.resolve_label(row_key))
         if self.destructive:
-            return f"{label} {row_key}?"
+            return f"{self.resolve_label(row_key)} {row_key}?"
         return None
 
 

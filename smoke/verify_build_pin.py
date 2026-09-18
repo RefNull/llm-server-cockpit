@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Phase 2 verification (plans/05-qa-remediation-pass.md): manifest.yaml pin-write safety and
-force=True/False build semantics.
+"""Phase 2 verification (plans/05-qa-remediation-pass.md), extended by the 2026-09-18
+follow-up: manifest.yaml pin-write and cmake_flags-write safety, force=True/False build
+semantics, and the shared cmake-composition function the follow-up introduced.
 
-Two things nothing else in the repo checked before this phase made manifest.yaml writable from
+Things nothing else in the repo checked before this phase made manifest.yaml writable from
 the cockpit for the first time:
 
 1. The header comment block and the `# bNNNNN` trailing comment on llama_cpp.ref must survive a
@@ -12,6 +13,20 @@ the cockpit for the first time:
 2. `build_step.run(..., force=True)` must not take the `_prefix_ready` early return that makes
    `force=False` skip a prefix that already exists — that early return is also the mechanism
    that made the old "Update" button silently do nothing on a second press (plans/05 §0a).
+3. `_write_manifest_cmake_flags` (the list-block equivalent of `_write_manifest_ref`) must
+   survive on fixtures where cmake_flags is not the backend's first child key, and where the
+   target backend sits between two siblings — the two shapes that would break a rewrite that
+   assumed cmake_flags's position rather than locating it inside the backend's own bounded
+   block.
+4. `build_step.resolve_cmake_argv`/`resolve_cmake_flags` — the functions BackendDetailModal
+   and the Build confirm now call to display "what will run" — must produce the exact argv
+   `_build_backend` passes to `Runner.run`, so the display is provably the same as the build,
+   not a second, driftable description of it (coordinator correction, 2026-09-18: this used
+   to be a planned "detect drift after the fact" test; extracting one pure function makes it
+   true by construction instead, and this test locks that argv's shape as a regression guard).
+5. `TableAction.confirm` accepting `str | Callable[[str], str]` (cockpit/widgets.py) must
+   leave every existing static-string call site byte-identical — the Build confirm is the only
+   caller that now passes a callable.
 
 Run: .venv/bin/python smoke/verify_build_pin.py
 """
@@ -28,7 +43,8 @@ import bootstrap  # noqa: E402
 
 bootstrap.add_venv_site_packages(_REPO_ROOT)
 
-from cockpit.screens.builds import _write_manifest_ref  # noqa: E402
+from cockpit.screens.builds import _write_manifest_cmake_flags, _write_manifest_ref  # noqa: E402
+from cockpit.widgets import TableAction  # noqa: E402
 from provision.common import Runner  # noqa: E402
 from provision.steps import build as build_step  # noqa: E402
 
@@ -170,9 +186,200 @@ def verify_force_flag() -> None:
     print("verify_build_pin: force=True rebuilds, force=False still skips — OK")
 
 
+# --------------------------------------------------------------------- cmake_flags block rewrite
+
+_FIXTURE_APT_FIRST = """\
+backends:
+  cuda:
+    apt_packages: []  # CUDA toolkit presence is checked, not installed, by `provision drivers`
+    cmake_flags:
+      - "-DGGML_CUDA=ON"
+      - "-DGGML_NATIVE=OFF"
+  vulkan:
+    cmake_flags:
+      - "-DGGML_VULKAN=ON"
+    apt_packages:
+      - libvulkan-dev
+"""
+
+_FIXTURE_MIDDLE_BACKEND = """\
+backends:
+  cuda:
+    cmake_flags:
+      - "-DGGML_CUDA=ON"
+  rocm:
+    cmake_flags:
+      - "-DGGML_HIP=ON"
+    build_env:
+      HIPCXX: "$(hipconfig -l)/clang"
+  vulkan:
+    cmake_flags:
+      - "-DGGML_VULKAN=ON"
+    apt_packages:
+      - libvulkan-dev
+"""
+
+
+def verify_cmake_flags_roundtrip_order_independent() -> None:
+    """The two shapes that would break a rewrite assuming cmake_flags's position: cmake_flags
+    is not the backend's first child key, and the target backend is neither first nor last
+    among its siblings. _write_manifest_cmake_flags locates the backend's block by its own key
+    line (bounded by the next sibling at the same indent) and then locates cmake_flags inside
+    that slice, so neither shape should matter — this proves it rather than asserting it."""
+    with tempfile.TemporaryDirectory() as td:
+        # cmake_flags is not the first key under cuda: (apt_packages is).
+        tmp1 = Path(td) / "apt_first.yaml"
+        tmp1.write_text(_FIXTURE_APT_FIRST)
+        _write_manifest_cmake_flags(tmp1, "cuda", ["-DGGML_CUDA=ON", "-DGGML_NATIVE=OFF", "-DLLAMA_BUILD_TESTS=OFF"])
+        after1 = tmp1.read_text()
+        assert '#' in after1.splitlines()[2], "apt_packages' inline comment was not preserved"
+        assert "libvulkan-dev" in after1, "vulkan's sibling block was disturbed"
+        assert after1.count("cmake_flags:") == 2, "a sibling's cmake_flags key was duplicated or dropped"
+        cuda_block = after1.split("vulkan:")[0]
+        assert '"-DLLAMA_BUILD_TESTS=OFF"' in cuda_block, "new flag not written into cuda's block"
+        vulkan_block = after1.split("vulkan:")[1]
+        assert '"-DGGML_VULKAN=ON"' in vulkan_block and "-DGGML_CUDA" not in vulkan_block, (
+            "vulkan's cmake_flags were touched by a rewrite targeting cuda"
+        )
+
+        # rocm sits between two siblings, and has a non-cmake_flags key (build_env) after it.
+        tmp2 = Path(td) / "middle_backend.yaml"
+        tmp2.write_text(_FIXTURE_MIDDLE_BACKEND)
+        _write_manifest_cmake_flags(tmp2, "rocm", ["-DGGML_HIP=ON", "-DGGML_NATIVE=OFF"])
+        after2 = tmp2.read_text()
+        assert '"-DGGML_CUDA=ON"' in after2.split("rocm:")[0], "cuda's block (before rocm) was disturbed"
+        assert '"-DGGML_VULKAN=ON"' in after2.split("vulkan:")[1], "vulkan's block (after rocm) was disturbed"
+        assert "HIPCXX" in after2, "rocm's build_env sibling key was dropped"
+        rocm_block = after2.split("rocm:")[1].split("vulkan:")[0]
+        assert '"-DGGML_HIP=ON"' in rocm_block and '"-DGGML_NATIVE=OFF"' in rocm_block, (
+            "new flags not written into rocm's (middle) block"
+        )
+    print("verify_build_pin: cmake_flags rewrite is order-independent (apt-first, middle-backend) — OK")
+
+
+def verify_cmake_flags_roundtrip_real_manifest() -> None:
+    """The real manifest.yaml: header, every sibling backend, and cuda's own apt_packages
+    comment must survive a cmake_flags rewrite targeting cuda."""
+    original = (_REPO_ROOT / "manifest.yaml").read_text()
+    header = original.split("llama_cpp:")[0]
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td) / "manifest.yaml"
+        tmp.write_text(original)
+        new_flags = ["-DGGML_CUDA=ON", "-DGGML_NATIVE=OFF", "-DLLAMA_BUILD_TESTS=OFF"]
+        _write_manifest_cmake_flags(tmp, "cuda", new_flags)
+        after = tmp.read_text()
+        assert after.startswith(header), "header comment block was not preserved"
+        assert "# CUDA toolkit presence is checked" in after, "cuda's apt_packages comment was lost"
+        assert "# ROCm stack presence is checked" in after, "rocm's block/comment was disturbed"
+        assert '"-DGGML_VULKAN=ON"' in after, "vulkan's cmake_flags were disturbed"
+        assert '"-DGGML_SYCL=ON"' in after, "sycl's cmake_flags were disturbed"
+        assert '"-DLLAMA_BUILD_TESTS=OFF"' in after, "new flag was not written"
+        # ref: line (a completely different rewrite path) must be untouched by this call.
+        assert "481c65f091f74c5e7089dd0a3a1cc6b50cced31e  # b10903" in after, (
+            "llama_cpp.ref was disturbed by a cmake_flags-only rewrite"
+        )
+    print("verify_build_pin: real manifest.yaml survives a cmake_flags rewrite — OK")
+
+
+def verify_cmake_flags_write_aborts_on_bad_backend() -> None:
+    """No block to find -> raise, never write a null/partial result."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td) / "manifest.yaml"
+        tmp.write_text(_FIXTURE_APT_FIRST)
+        before = tmp.read_text()
+        try:
+            _write_manifest_cmake_flags(tmp, "does-not-exist", ["-DX=1"])
+            raised = False
+        except RuntimeError:
+            raised = True
+        assert raised, "rewriting a nonexistent backend must raise, not silently no-op"
+        assert tmp.read_text() == before, "a failed rewrite must not modify the file"
+    print("verify_build_pin: cmake_flags rewrite aborts (without writing) on an unknown backend — OK")
+
+
+# --------------------------------------------------------------------- shared cmake composition
+
+def verify_resolve_cmake_argv_matches_build() -> None:
+    """resolve_cmake_argv/resolve_cmake_flags are what BackendDetailModal and the Build confirm
+    now display — this locks their output for the manifest.yaml backends actually in use
+    (cuda, vulkan) so a future change to the composition is a visible diff here, not silent
+    drift between 'what is shown' and 'what runs' (there is only one function now; this test
+    is a regression guard on its shape, not a drift detector between two copies)."""
+    import yaml as _yaml
+
+    manifest_dict = _yaml.safe_load((_REPO_ROOT / "manifest.yaml").read_text())
+    host_profile = {"paths": {"state_dir": "/var/lib/llm-server", "prefix_root": "/opt/llm-server/builds"}}
+    checkout_dir = build_step.checkout_dir_for(host_profile)
+    assert checkout_dir == Path("/var/lib/llm-server/src/llama.cpp")
+
+    for backend in ("cuda", "vulkan"):
+        recipe = manifest_dict["backends"][backend]
+        prefix = build_step.backend_prefix(host_profile, backend, "deadbeef")
+        assert prefix == Path("/opt/llm-server/builds") / backend / "deadbeef"
+        argv = build_step.resolve_cmake_argv(backend, recipe, checkout_dir, prefix)
+        expected = [
+            "cmake", "-B", str(checkout_dir / f"build-{backend}"),
+            "-DCMAKE_BUILD_TYPE=Release", *recipe["cmake_flags"],
+            f"-DCMAKE_INSTALL_PREFIX={prefix}", str(checkout_dir),
+        ]
+        assert argv == expected, f"{backend}: resolve_cmake_argv() = {argv!r}, expected {expected!r}"
+
+    build_calls: list[list[str]] = []
+
+    class _RecordingRunner(Runner):
+        def run(self, cmd, **kwargs):
+            build_calls.append(list(cmd))
+            return None
+
+        def apt_install(self, packages):
+            return None
+
+    with tempfile.TemporaryDirectory() as td:
+        real_checkout = Path(td) / "checkout"
+        prefix = Path(td) / "prefix"
+        build_step._build_backend("cuda", manifest_dict["backends"]["cuda"], real_checkout, prefix, _RecordingRunner())
+        configure_call = build_calls[0]
+        assert configure_call == build_step.resolve_cmake_argv("cuda", manifest_dict["backends"]["cuda"], real_checkout, prefix), (
+            "the argv _build_backend actually ran diverged from resolve_cmake_argv()'s display value"
+        )
+    print("verify_build_pin: resolve_cmake_argv() is what _build_backend actually runs — OK")
+
+
+# --------------------------------------------------------------------- TableAction.confirm callable
+
+def verify_table_action_confirm_callable() -> None:
+    """cockpit/widgets.py: TableAction.confirm now accepts str | Callable[[str], str], the same
+    treatment `label` already has. Every existing static-string call site must be untouched."""
+    static = TableAction("restart", "Restart", confirm="Restart {row}?")
+    assert static.confirm_message("cuda") == "Restart cuda?", "static confirm template regressed"
+
+    templated = TableAction("build", lambda row: "Rebuild" if row == "cuda" else "Build", width=11, confirm="{action} llama.cpp ({row})?")
+    assert templated.confirm_message("cuda") == "Rebuild llama.cpp (cuda)?"
+    assert templated.confirm_message("vulkan") == "Build llama.cpp (vulkan)?"
+
+    seen: list[str] = []
+
+    def _compose(row_key: str) -> str:
+        seen.append(row_key)
+        return f"composed for {row_key}"
+
+    callable_action = TableAction("build", "Build", confirm=_compose)
+    assert callable_action.confirm_message("cuda") == "composed for cuda"
+    assert seen == ["cuda"], "callable confirm was not invoked with the row key"
+
+    destructive = TableAction("remove", "Remove", destructive=True)
+    assert destructive.confirm_message("x") == "Remove x?", "destructive default prompt regressed"
+    print("verify_build_pin: TableAction.confirm accepts str (unchanged) and callable (new) — OK")
+
+
 def main() -> None:
     verify_manifest_roundtrip()
     verify_force_flag()
+    verify_cmake_flags_roundtrip_order_independent()
+    verify_cmake_flags_roundtrip_real_manifest()
+    verify_cmake_flags_write_aborts_on_bad_backend()
+    verify_resolve_cmake_argv_matches_build()
+    verify_table_action_confirm_callable()
     print("verify_build_pin: all checks passed")
 
 
