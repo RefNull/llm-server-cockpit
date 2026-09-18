@@ -1683,21 +1683,6 @@ class BuildsScreen(CockpitScreenBase):
 
     @work(thread=True)
     def _run_swap_update(self, new_version: str) -> None:
-        # Preflight before anything mutates. install_pinned_binary() + restart_or_start()
-        # deliberately never install the unit file — only swap.run() does, because writing it
-        # also regenerates config.yaml, which is a deploy rather than an update. So on a host
-        # where llama-swap was never deployed, this used to bump the pin, swap the binary, and
-        # only then fail on `systemctl enable --now` with a bare exit 1 — leaving manifest.yaml
-        # claiming a version the machine had no service for. Checking first means a host that
-        # cannot finish the update is not half-updated by it.
-        if not swap_step.unit_installed():
-            self.app.call_from_thread(
-                self.app.notify,
-                "llama-swap has no systemd unit on this host — deploy it from LLM > Models "
-                "first. Nothing was changed.",
-                severity="warning",
-            )
-            return
         try:
             _write_manifest_llama_swap_version(self.repo_root / "manifest.yaml", new_version)
         except Exception as e:
@@ -1707,14 +1692,23 @@ class BuildsScreen(CockpitScreenBase):
         self.manifest = getattr(self.app_ref, "manifest", self.manifest)
         try:
             swap_step.install_pinned_binary(self.host_profile, self.manifest, self.privileged_runner)
-            swap_step.restart_or_start(self.privileged_runner)
+            service_state = swap_step.reconcile_service(self.privileged_runner)
         except SystemExit as e:
             self.app.call_from_thread(self.app.notify, f"llama-swap update failed: {e}", severity="error")
             return
         except Exception as e:
             self.app.call_from_thread(self.app.notify, f"llama-swap update failed: {e}", severity="error")
             return
-        self.app.call_from_thread(self.app.notify, f"llama-swap updated to {new_version}")
+        # The binary update is the update. What happened to the service is a separate fact and
+        # is reported as one — a host with no llama-swap.service is not a failed update, it is
+        # a host that does not supervise llama-swap with systemd.
+        tail = {
+            "restarted": " — service restarted",
+            "started": " — service enabled and started",
+            "no-unit": " — no llama-swap.service on this host, so nothing was restarted",
+            "unknown": " — could not reach systemd to restart the service",
+        }.get(service_state, "")
+        self.app.call_from_thread(self.app.notify, f"llama-swap updated to {new_version}{tail}")
         self.app.call_from_thread(self._refresh_backends_table)
         self.app.call_from_thread(self._update_action_buttons_state)
 

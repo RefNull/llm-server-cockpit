@@ -331,15 +331,21 @@ def install_pinned_binary(host_profile: dict[str, Any], manifest: dict[str, Any]
     return _install_llama_swap(host_profile, manifest, runner)
 
 
-def unit_installed() -> bool:
-    """True when llama-swap's systemd unit file exists on this host.
+def unit_load_state() -> str:
+    """What systemd itself says about llama-swap.service: "loaded", "not-found", "masked", …
 
-    `install_pinned_binary()` + `restart_or_start()` deliberately do not install it — only
-    run() does (_install_unit), because writing the unit also means regenerating config.yaml
-    and that is a full deploy, not an update. So a caller that only swaps the binary must
-    check this first: on a host where llama-swap was never deployed through this toolkit,
-    `systemctl enable --now` fails with a bare exit 1 and no explanation."""
-    return _UNIT_PATH.exists()
+    Asked of systemd rather than by probing `_UNIT_PATH`, because a unit can equally live in
+    /lib/systemd/system or /usr/lib/systemd/system — a path check would call a perfectly good
+    packaged unit missing. Returns "" when systemctl cannot be reached at all (no systemd,
+    e.g. a dev machine), which callers must treat as "unknown", not as "not-found"."""
+    try:
+        result = subprocess.run(
+            ["systemctl", "show", "-p", "LoadState", "--value", _UNIT_NAME],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=_TIMEOUT_S,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return ""
+    return result.stdout.strip() if result.returncode == 0 else ""
 
 
 def _systemctl(runner: Runner, *args: str) -> None:
@@ -357,23 +363,35 @@ def _systemctl(runner: Runner, *args: str) -> None:
         ) from e
 
 
-def restart_or_start(runner: Runner) -> None:
-    """Restart llama-swap if it's already running, otherwise start+enable it — without
-    touching config.yaml or the unit file. Narrow counterpart to run()'s own tail (lines
-    414-420), reused here rather than duplicated so a caller that only changed the binary (via
-    install_pinned_binary()) can bring the running service in line with it: without this,
-    `_current_installed_version` would report the new pin while the running process still
-    executes the old inode."""
-    if not unit_installed():
-        raise RuntimeError(
-            f"{_UNIT_NAME} is not installed at {_UNIT_PATH} — llama-swap has never been "
-            "deployed on this host. Deploy it from LLM > Models first; updating the binary "
-            "cannot start a service that has no unit file."
-        )
+def reconcile_service(runner: Runner) -> str:
+    """Bring the running service in line with the binary on disk, and say what was done.
+
+    Returns "restarted" | "started" | "no-unit" | "unknown". Never touches config.yaml or the
+    unit file — only run() does that, because writing them is a deploy, not an update.
+
+    Exists because `_current_installed_version` reads the binary: after install_pinned_binary()
+    swaps it, the version on screen would report the new pin while the running process still
+    executes the old inode. Restarting closes that gap.
+
+    **A missing unit is not a failure.** The binary is a system-wide install at _BINARY_PATH
+    and updating it is complete in itself; whether systemd supervises it is a separate
+    question. An earlier version of this raised on a missing unit, which made a binary swap
+    depend on a service and refused updates on hosts where llama-swap runs perfectly well
+    without one."""
+    state = unit_load_state()
+    if state == "not-found":
+        # Not an error. The binary at _BINARY_PATH is a system-wide install and updating it is
+        # complete on its own; whether a systemd unit happens to supervise it is a separate
+        # question. Refusing the update because no unit exists made a binary swap depend on a
+        # service, which is backwards — reported by the operator on 2026-09-18.
+        return "no-unit"
+    if state == "":
+        return "unknown"
     if _is_active(_UNIT_NAME):
         _systemctl(runner, "restart", _UNIT_NAME)
-    else:
-        _systemctl(runner, "enable", "--now", _UNIT_NAME)
+        return "restarted"
+    _systemctl(runner, "enable", "--now", _UNIT_NAME)
+    return "started"
 
 
 def _sync_timer_pair(
