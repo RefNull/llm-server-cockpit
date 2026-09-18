@@ -257,10 +257,9 @@ absent), say so plainly rather than switching to a tab where nothing is selected
 
 ## Open, carried forward and still unanswered
 
-1. **`manifest.yaml` serves two purposes.** `AGENTS.md` says backend recipes are repo-level
-   and a host profile only says which backends it uses — but the Installs tab edits those
-   recipes per machine. Invisible with one deployment, wrong with two. **Raised three times,
-   never answered.** A canon change, not a phase's business.
+1. **`manifest.yaml` serves two purposes.** [RESOLVED in `plans/08-manifest-per-deployment.md`:
+   resolved by splitting into tracked `manifest.example.yaml` template and gitignored
+   per-deployment `manifest.yaml`.]
 2. **`settings.py`'s `_host_profile_path()` keys on the `hostname:` field inside the file**
    while `app.py` loads `hosts/<host_name>.yaml` from `--host` or the machine hostname. If
    they disagree a save lands in a different file. Dormant on `haupe-server`; five call

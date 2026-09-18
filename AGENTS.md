@@ -37,8 +37,8 @@ below, never mixed into the routing above.
 ### Repository Discipline
 1. **Idempotence & dry-run safety**: Every mutating operation in `provision/` must support dry-run (`--dry-run`) and be strictly idempotent. Preview actions before executing.
 2. **Layer decoupling**: Never call `sys.exit()` inside reusable core or schema modules (`provision/schema.py`). Raise descriptive exceptions (e.g. `ValidationError`) so CLI entrypoints can format exit codes while UI callers (`cockpit/`) catch and display errors gracefully.
-3. **Declarative configuration & zero drift**: Upstream component versions and compilation recipes belong in `manifest.yaml`. Deployment configurations belong in `hosts/` and `models.yaml`.
-4. **Secret & environmental hygiene**: Never commit deployment facts, tokens, or private endpoints. `hosts/<hostname>.yaml` and `models.yaml` must remain gitignored; use `hosts/example.yaml` and `models.example.yaml` as templates. Hugging Face tokens are resolved via environment variables and never persisted to disk.
+3. **Declarative configuration & zero drift**: Upstream component versions and compilation recipes ship templated in `manifest.example.yaml`. Backend recipes in the tracked template are repo-level; the per-deployment copy (`manifest.yaml`) is the host's, and editing recipes there via the TUI editor is expected. Deployment configurations belong in `manifest.yaml`, `hosts/` and `models.yaml`.
+4. **Secret & environmental hygiene**: Never commit deployment facts, tokens, or private endpoints. `hosts/<hostname>.yaml`, `models.yaml` and `manifest.yaml` must remain gitignored; use `hosts/example.yaml`, `models.example.yaml` and `manifest.example.yaml` as templates. Hugging Face tokens are resolved via environment variables and never persisted to disk.
 5. **Character budget**: All harness rule files must adhere to Antigravity's strict `< 12,000` character limit.
 6. **TUI design standards**: Interactive screens (`cockpit/screens/*.py`) must adhere to layout, token, breakpoint, and modal contracts defined in `cockpit/DESIGN.md`.
 
@@ -74,5 +74,5 @@ below, never mixed into the routing above.
   ```
 - **Schema & configuration validation**:
   ```bash
-  python3 -c "from provision import schema; from pathlib import Path; r = Path('.'); m = schema.load_manifest(r/'manifest.yaml'); h = schema.load_host_profile(r/'hosts/example.yaml'); schema.load_models(r/'models.example.yaml', h, m); print('OK')"
+  python3 -c "from provision import schema; from pathlib import Path; r = Path('.'); m = schema.load_manifest(r/'manifest.example.yaml'); h = schema.load_host_profile(r/'hosts/example.yaml'); schema.load_models(r/'models.example.yaml', h, m); print('OK')"
   ```

@@ -169,7 +169,7 @@ sudo bin/provision swap      # llama-swap install, config generation, systemd un
 
 ### 1. Software Manifest (`manifest.yaml`)
 
-Defines upstream release pins and per-backend compilation recipes. Bumping a version here is the only sanctioned path to update inference binaries — by hand, or from the cockpit's Installs tab ("Update to latest" / "Change version…"), which write this same file through a targeted, comment-preserving line rewrite (never a full YAML re-dump) and are themselves confirmed before they touch it. Either way the pin stays tracked by git, so a version change has an author and a diff:
+Defines upstream release pins and per-backend compilation recipes. Shipped templated as `manifest.example.yaml` and copied to `manifest.yaml` (gitignored, like other per-deployment configurations). Bumping a version here is the only sanctioned path to update inference binaries — by hand, or from the cockpit's Installs tab ("Update to latest" / "Change version…"), which write this same file through a targeted, comment-preserving line rewrite (never a full YAML re-dump) and are themselves confirmed before they touch it:
 
 ```yaml
 llama_cpp:
@@ -288,7 +288,7 @@ Verify Python syntax and declarative configuration schemas offline:
 python3 -m py_compile cockpit/*.py cockpit/screens/*.py provision/*.py provision/steps/*.py
 
 # Validate declarative schemas against example profiles
-python3 -c "from provision import schema; from pathlib import Path; r = Path('.'); m = schema.load_manifest(r/'manifest.yaml'); h = schema.load_host_profile(r/'hosts/example.yaml'); schema.load_models(r/'models.example.yaml', h, m); print('OK')"
+python3 -c "from provision import schema; from pathlib import Path; r = Path('.'); m = schema.load_manifest(r/'manifest.example.yaml'); h = schema.load_host_profile(r/'hosts/example.yaml'); schema.load_models(r/'models.example.yaml', h, m); print('OK')"
 ```
 
 ### Real-Inference Smoke Verification (`smoke/smoke.yaml`)

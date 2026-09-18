@@ -428,11 +428,9 @@ than writing a second one — the backend-name check already derives from
 
 ## Open, deliberately not decided here
 
-1. **`manifest.yaml` is now serving two purposes.** `AGENTS.md` says backend recipes are
-   repo-level and a host profile only says which backends it uses — but the Installs tab now
-   edits those recipes per machine. One deployment makes this invisible; a second would make
-   it wrong. Raised twice with the operator, not yet settled. **Do not resolve it inside a
-   phase** — it is a canon change.
+1. **`manifest.yaml` is now serving two purposes.** [RESOLVED in `plans/08-manifest-per-deployment.md`:
+   `manifest.example.yaml` ships repo-level recipes as a tracked template; `manifest.yaml` is
+   per-deployment and gitignored, tuned per machine via the TUI editor.]
 2. **Legacy `<sha>`-named build directories** are listed but never migrated (Phase 1 item 4).
    If they should be adopted or cleaned up, that is a separate decision.
 3. `update_check.cache_age_seconds()` still has no callers; `state_dir/update-check-result.json`

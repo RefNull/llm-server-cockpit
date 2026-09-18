@@ -200,7 +200,7 @@ raw `install ... returned non-zero exit status 1`.
 Two idioms, split on which fact the call site actually knows:
 - An action meeting one of the three clauses above calls `self.confirm(..., mutates_system=True)` (`CockpitScreenBase.confirm`), which derives `danger=True`. The call site declares *what the action does*, not how the button should look.
 - A write confined to this repo's declarative files (`models.yaml`, `scripts.yaml`, `hosts/<hostname>.yaml`, `manifest.yaml`) is not tier-1 by the clause above, but is still confirmed with `ConfirmModal(..., danger=True)` directly — established precedent across this project: a config write is the thing a later `Deploy` turns into a system change, and operators treat it as consequential.
-  - **`manifest.yaml` differs from the other three in being tracked by git.** That is why its confirm shows the old ref → the new one rather than just naming the file: the pin is auditable in history, and the confirm is the operator's last look before it moves. It is written by a targeted line rewrite, never `yaml.safe_dump`, which would destroy the header comment block and the `# bNNNNN` build-number comment on the `ref:` line.
+  - **`manifest.yaml` confirms show the old ref → the new one** rather than just naming the file (and `cmake_flags` confirms show the command line that will run). Like the other three config files, `manifest.yaml` is per-deployment and gitignored (with `manifest.example.yaml` as the tracked template). It is written by a targeted line rewrite, never `yaml.safe_dump`, preserving the header comment block and inline comments.
 
 ### Call-Site Audit & Enforcement
 All 20 modal confirmation call sites across the 6 mutating screens (Dashboard is read-only and opens no modal):
