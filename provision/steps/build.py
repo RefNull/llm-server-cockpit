@@ -70,6 +70,16 @@ def _ensure_checkout(runner: Runner, repo: str, ref: str, checkout_dir: Path) ->
     runner.run(["git", "-C", str(checkout_dir), "checkout", ref])
 
 
+def fetch_checkout(runner: Runner, repo: str, ref: str, checkout_dir: Path) -> None:
+    """Public wrapper around `_ensure_checkout` for callers outside this module (the cockpit's
+    "Update to latest" — plans/07 Phase 1) that need to bring the local source checkout to a
+    pinned ref without building. `_ensure_checkout` stays private and does the real work
+    (already idempotent, already `Runner`-driven); this exists only so a screen never calls a
+    leading-underscore function directly (the same rule that made `swap.install_pinned_binary`
+    a public wrapper rather than exposing `swap._install_binary`)."""
+    _ensure_checkout(runner, repo, ref, checkout_dir)
+
+
 def _binary_sane(prefix: Path, name: str) -> bool:
     p = prefix / "bin" / name
     return p.is_file() and os.access(p, os.X_OK)

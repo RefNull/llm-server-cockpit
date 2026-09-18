@@ -24,6 +24,14 @@ _TIMEOUT_S = 10
 _CACHE_TTL_S = 24 * 60 * 60
 _CACHE_PATH = Path(__file__).resolve().parent.parent / "hosts" / "upstream.update-cache.yaml"
 
+# A second, independent TTL for the Backends tab's automatic per-view check (plans/07 Phase 2)
+# — deliberately NOT `_CACHE_TTL_S`. That constant is shared with `bin/check-updates` and its
+# systemd timer (see check_all's own docstring); shortening it globally would make the
+# scheduled checker hit GitHub 96x more often for no reason a human ever asked for. 15 minutes
+# is short enough that switching tabs away and back within a session reads as "fresh", long
+# enough that repeatedly re-opening the tab in the same few minutes costs nothing extra.
+_VIEW_CACHE_TTL_S = 15 * 60
+
 
 def _read_full_cache() -> dict[str, Any]:
     """The whole cache file as a dict — check_all's "checked_at"/"results" plus, since Phase 2,
@@ -179,6 +187,60 @@ def check_llama_swap(manifest: dict[str, Any]) -> dict[str, Any]:
         "update_available": latest_tag != pinned,
         "latest_date": latest.get("published_at"),
     }
+
+
+def _read_view_cache(component: str) -> dict[str, Any] | None:
+    """Last per-view-scoped result for `component` ("llama_cpp" or "llama_swap"), if still
+    fresh under `_VIEW_CACHE_TTL_S`. A separate section of the same cache file — `"view"`,
+    keyed per component — never `check_all`'s own `"results"`/`"checked_at"`, so the two TTLs
+    (15m here, 24h there) can never collide or overwrite one another."""
+    entry = (_read_full_cache().get("view") or {}).get(component)
+    if not isinstance(entry, dict):
+        return None
+    checked_at = entry.get("checked_at")
+    if not isinstance(checked_at, (int, float)) or time.time() - checked_at > _VIEW_CACHE_TTL_S:
+        return None
+    result = entry.get("result")
+    return result if isinstance(result, dict) else None
+
+
+def _write_view_cache(component: str, result: dict[str, Any]) -> None:
+    data = _read_full_cache()
+    view = data.get("view")
+    if not isinstance(view, dict):
+        view = {}
+    view[component] = {"checked_at": time.time(), "result": result}
+    data["view"] = view
+    _write_full_cache(data)
+
+
+def check_llama_cpp_for_view(manifest: dict[str, Any], *, force: bool = False) -> dict[str, Any]:
+    """`check_llama_cpp`, cache-served within `_VIEW_CACHE_TTL_S` — the Backends tab's
+    automatic per-view check (plans/07 Phase 2), called from `on_tab_shown`. Independent of
+    `check_all`'s 24h cache and of llama-swap's own view check: each upstream component gets
+    its own check now, rather than one button firing both (which is what made the old
+    "Check for Updates" button counterintuitive sitting under the llama.cpp section)."""
+    if not force:
+        cached = _read_view_cache("llama_cpp")
+        if cached is not None:
+            return cached
+    result = check_llama_cpp(manifest)
+    if result.get("ok"):
+        _write_view_cache("llama_cpp", result)
+    return result
+
+
+def check_llama_swap_for_view(manifest: dict[str, Any], *, force: bool = False) -> dict[str, Any]:
+    """`check_llama_swap`'s own-component counterpart to `check_llama_cpp_for_view` — see that
+    function's docstring."""
+    if not force:
+        cached = _read_view_cache("llama_swap")
+        if cached is not None:
+            return cached
+    result = check_llama_swap(manifest)
+    if result.get("ok"):
+        _write_view_cache("llama_swap", result)
+    return result
 
 
 def check_all(manifest: dict[str, Any], *, force: bool = False) -> dict[str, dict[str, Any]]:

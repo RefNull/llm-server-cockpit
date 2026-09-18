@@ -46,7 +46,7 @@ import bootstrap  # noqa: E402
 
 bootstrap.add_venv_site_packages(_REPO_ROOT)
 
-from cockpit.screens.builds import _write_manifest_cmake_flags, _write_manifest_ref  # noqa: E402
+from cockpit.screens.builds import _short, _write_manifest_cmake_flags, _write_manifest_ref  # noqa: E402
 from cockpit.widgets import TableAction  # noqa: E402
 from provision import schema  # noqa: E402
 from provision.common import Runner  # noqa: E402
@@ -765,6 +765,165 @@ def verify_table_action_confirm_callable() -> None:
     print("verify_build_pin: TableAction.confirm accepts str (unchanged) and callable (new) — OK")
 
 
+# --------------------------------------------------------------------- Phase 1 (plans/07): Status
+
+def _screen_fixture(tmp_root: Path):
+    """A bare BuildsScreen — not mounted under a running app, since `_backend_status_cell` and
+    `_active_build_cell` touch no DOM (no `query_one`, no CSS) and only need
+    `self._building_backends`. Constructing it directly, the same way this file already
+    constructs bare `host_profile`/`manifest` fixtures, is cheaper and more honest than
+    spinning up a Pilot for two pure-function methods."""
+    from cockpit.screens.builds import BuildsScreen
+
+    host_profile, manifest, models, ref = _fixture(tmp_root)
+    screen = BuildsScreen(host_profile, manifest, models, CapturingRunner(), _REPO_ROOT, app_ref=None)
+    return screen, host_profile, ref
+
+
+def _write_build(backend_dir: Path, build_id: str, version: str, *, sane: bool = True, current: bool = False) -> Path:
+    d = backend_dir / build_id
+    if sane:
+        _write_fake_prefix(d)
+    else:
+        d.mkdir(parents=True, exist_ok=True)
+    (d / "build-info.json").write_text(json.dumps({"ref": version, "outcome": "smoke_pass"}))
+    if current:
+        current_link = backend_dir / "current"
+        if current_link.exists() or current_link.is_symlink():
+            current_link.unlink()
+        current_link.symlink_to(d)
+    return d
+
+
+def verify_four_status_states() -> None:
+    """The exact table from plans/07 Phase 1 item 3, asserted by text AND colour — the Status
+    column's whole reason for existing. `building…` precedence is checked separately below."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp_root = Path(td).resolve()  # see verify_list_builds_shape_and_legacy's comment
+        screen, host_profile, pin = _screen_fixture(tmp_root)
+        backend_dir = Path(host_profile["paths"]["prefix_root"]) / "cuda"
+
+        # 1. no build at all.
+        builds = build_step.list_builds(host_profile, "cuda")
+        current = screen._current_of(builds)
+        cell = screen._backend_status_cell("cuda", builds, current, pin)
+        assert cell.plain == "not built" and cell.style == "dim", f"not-built cell wrong: {cell.plain!r}/{cell.style!r}"
+
+        # 2. active build's version == pin.
+        _write_build(backend_dir, "build1", pin, current=True)
+        builds = build_step.list_builds(host_profile, "cuda")
+        current = screen._current_of(builds)
+        cell = screen._backend_status_cell("cuda", builds, current, pin)
+        assert cell.plain == "up to date" and cell.style == "green", f"up-to-date cell wrong: {cell.plain!r}/{cell.style!r}"
+        # Active build is neutral now (coordinator correction) — it is an identity, not a
+        # second colour-coding of the same up-to-date/out-of-date judgement Status just made.
+        active_cell = screen._active_build_cell(current)
+        assert not active_cell.style, f"Active build must be neutral, got style={active_cell.style!r}"
+        assert active_cell.plain == f"build1 · {_short(pin)}"
+
+        # 3. active != pin, but a sane build AT the pin exists (not active) — operator chose an
+        # older build on purpose.
+        old_ref = "d" * 40
+        _write_build(backend_dir, "build1", old_ref, current=True)  # re-point current to old_ref
+        _write_build(backend_dir, "build2", pin, current=False)  # sane, at the pin, not active
+        builds = build_step.list_builds(host_profile, "cuda")
+        current = screen._current_of(builds)
+        cell = screen._backend_status_cell("cuda", builds, current, pin)
+        # Names the ACTIVE build's version (old_ref), never the pin. A row reading
+        # "pinned at <pin>" beside an Active build of "build1 · <old_ref>" contradicts itself,
+        # and puts a global value in a per-row cell — the exact defect _backend_status_cell
+        # replaced. This assertion originally encoded the pin and so passed the bug through.
+        assert cell.plain == f"pinned at {_short(old_ref)}" and cell.style == "bold yellow", (
+            f"pinned-at cell wrong: {cell.plain!r}/{cell.style!r}"
+        )
+        assert _short(pin) not in cell.plain, (
+            f"pinned-at names the manifest pin {_short(pin)!r} instead of the active build"
+        )
+        active_cell = screen._active_build_cell(current)
+        assert not active_cell.style, "Active build coloured a match/mismatch verdict again"
+
+        # 4. active != pin, and NO sane build at the pin exists — genuinely out of date. Remove
+        # build2 (the sane build at the pin) so only the stale build1 remains.
+        import shutil as _shutil
+        _shutil.rmtree(backend_dir / "build2")
+        builds = build_step.list_builds(host_profile, "cuda")
+        current = screen._current_of(builds)
+        cell = screen._backend_status_cell("cuda", builds, current, pin)
+        assert cell.plain == f"out of date, built on {_short(old_ref)}" and cell.style == "bold red", (
+            f"out-of-date cell wrong: {cell.plain!r}/{cell.style!r}"
+        )
+
+        # building… keeps precedence over every other state.
+        screen._building_backends.add("cuda")
+        cell = screen._backend_status_cell("cuda", builds, current, pin)
+        assert cell.plain == "building…" and cell.style == "dim", "building… lost precedence"
+    print("verify_build_pin: all four Status states (text + colour), Active build neutral, building… precedence — OK")
+
+
+def verify_update_does_not_make_stale_build_read_up_to_date() -> None:
+    """The reported bug, asserted directly (plans/07 §0a): after 'Update to latest' moves the
+    pin, a backend whose active build predates the new pin must read `out of date`, never `up
+    to date` — the old code copied the global (now-true) 'pin == upstream latest' fact
+    verbatim into every row, so a stale build read exactly what this asserts it must not."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp_root = Path(td).resolve()
+        screen, host_profile, old_ref = _screen_fixture(tmp_root)
+        backend_dir = Path(host_profile["paths"]["prefix_root"]) / "cuda"
+        _write_build(backend_dir, "build1", old_ref, current=True)
+
+        # Simulate "Update to latest": the pin moves, nothing gets rebuilt.
+        new_pin = "e" * 40
+        builds = build_step.list_builds(host_profile, "cuda")
+        current = screen._current_of(builds)
+        cell = screen._backend_status_cell("cuda", builds, current, new_pin)
+        assert cell.plain != "up to date", "a build at the OLD ref reads up to date after the pin moved — the reported bug"
+        assert cell.plain == f"out of date, built on {_short(old_ref)}" and cell.style == "bold red", (
+            f"expected out-of-date, got {cell.plain!r}/{cell.style!r}"
+        )
+    print("verify_build_pin: a build at the old ref reads 'out of date' (not 'up to date') after Update — OK")
+
+
+def verify_fetch_checkout_idempotent() -> None:
+    """`build_step.fetch_checkout` (the public wrapper `_confirm_and_update_to_latest` calls)
+    must run no git command the second time it is called at the same ref — `_ensure_checkout`
+    is already idempotent; this proves the wrapper doesn't reimplement or bypass that."""
+    calls: list[list[str]] = []
+
+    class _CapRunner(Runner):
+        def run(self, cmd, **kwargs):
+            calls.append(list(cmd))
+            return None
+
+        def mkdir(self, path):
+            return None
+
+    # _git_head shells out to real git; faking it is the same technique verify_build_pin
+    # already uses for build_step._build_backend etc. — no checkout ever needs to exist on
+    # disk to prove the *count* of git commands run.
+    seen_head_calls = {"n": 0}
+
+    def fake_git_head(checkout_dir):
+        seen_head_calls["n"] += 1
+        return None if seen_head_calls["n"] == 1 else "deadbeef" * 5
+
+    orig_git_head = build_step._git_head
+    build_step._git_head = fake_git_head
+    try:
+        runner = _CapRunner()
+        checkout_dir = Path("/tmp/verify-fetch-checkout-idempotent")
+        ref = "deadbeef" * 5
+        build_step.fetch_checkout(runner, "https://github.com/example/llama.cpp", ref, checkout_dir)
+        first_count = len(calls)
+        assert first_count > 0, "first fetch (no checkout yet) ran no git command at all"
+        build_step.fetch_checkout(runner, "https://github.com/example/llama.cpp", ref, checkout_dir)
+        assert len(calls) == first_count, (
+            f"second fetch at the same ref ran additional git commands: {calls[first_count:]}"
+        )
+    finally:
+        build_step._git_head = orig_git_head
+    print("verify_build_pin: fetch_checkout runs no git command on a second call at the same ref — OK")
+
+
 def main() -> None:
     verify_manifest_roundtrip()
     verify_write_manifest_ref_rejects_non_sha()
@@ -782,6 +941,9 @@ def main() -> None:
     verify_cmake_flags_write_aborts_on_bad_backend()
     verify_resolve_cmake_argv_matches_build()
     verify_table_action_confirm_callable()
+    verify_four_status_states()
+    verify_update_does_not_make_stale_build_read_up_to_date()
+    verify_fetch_checkout_idempotent()
     print("verify_build_pin: all checks passed")
 
 

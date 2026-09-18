@@ -580,6 +580,137 @@ async def _assert_add_deployment_modal(app: CockpitApp, pilot, context: str) -> 
     await pilot.pause(0.1)
 
 
+def _print_backends_sections_height(app: CockpitApp, context: str) -> None:
+    """Measured, not projected (DESIGN.md §4.4's own methodology): the vertical span from the
+    first `.section-title` ("Llama-swap") to the top of `backends-table`, i.e. everything the
+    two compacted sections cost above the table. plans/07 Phase 2's own baseline, measured
+    against a real mounted CockpitApp at HEAD `00d20f3` with this exact query (swap in the old
+    builds.py, run this same measurement, swap back — not a separate harness, since a
+    differently-mounted screen measures differently): 27 lines. This print is the after number
+    for the same measurement, not a comparison against a mechanism that no longer exists."""
+    screen = app.query_one(BuildsScreen)
+    title = screen.query("Static.section-title").first()
+    table = screen.query_one("#backends-table")
+    height = table.region.y - title.region.y
+    print(f"[{context}] Llama-swap+Llama.cpp sections: {height} lines above backends-table "
+          f"(plans/07 Phase 0 baseline at HEAD 00d20f3, same measurement: 27)")
+
+
+async def _assert_update_buttons_absent_when_no_update(app: CockpitApp, pilot, context: str) -> None:
+    """plans/07 Phase 2 item 2: an Update button is ABSENT when there is nothing to apply, not
+    disabled-and-greyed — the same `display` on/off idiom `#btn-unmanaged-builds` already uses,
+    asserted here for both `#btn-update-to-latest` (llama.cpp) and `#btn-swap-update-to-latest`
+    (llama-swap), in both directions (absent with no update, present with one)."""
+    screen = app.query_one(BuildsScreen)
+    cpp_btn = app.screen.query_one("#btn-update-to-latest", Button)
+    swap_btn = app.screen.query_one("#btn-swap-update-to-latest", Button)
+
+    screen._apply_cpp_check_result({"ok": True, "pinned": "a" * 40, "latest": "a" * 40, "update_available": False})
+    screen._apply_swap_check_result({"ok": True, "pinned": "v1", "latest": "v1", "update_available": False})
+    await pilot.pause(0.1)
+    assert cpp_btn.display is False, f"[{context}] Update to latest (llama.cpp) must be absent with no update"
+    assert swap_btn.display is False, f"[{context}] Update to latest (llama-swap) must be absent with no update"
+
+    screen._apply_cpp_check_result({"ok": True, "pinned": "a" * 40, "latest": "b" * 40, "update_available": True})
+    screen._apply_swap_check_result({"ok": True, "pinned": "v1", "latest": "v2", "update_available": True})
+    await pilot.pause(0.1)
+    assert cpp_btn.display is True, f"[{context}] Update to latest (llama.cpp) must appear when an update exists"
+    assert swap_btn.display is True, f"[{context}] Update to latest (llama-swap) must appear when an update exists"
+    print(f"[{context}] Update-to-latest buttons: absent with no update, present with one — OK")
+
+
+async def _assert_on_tab_shown_fires_every_activation(app: CockpitApp, pilot, context: str) -> None:
+    """CockpitScreenBase.on_tab_shown (plans/07 Phase 2) must fire every time this tab becomes
+    visible again — unlike ensure_first_view/on_first_view, it is not latched. Probed on the
+    call count of BuildsScreen's own override (which starts the two per-view upstream checks),
+    not on a side effect that could be a cache hit either way."""
+    screen = app.query_one(BuildsScreen)
+    calls = {"n": 0}
+    real_on_tab_shown = type(screen).on_tab_shown
+
+    def counting(self):
+        calls["n"] += 1
+        real_on_tab_shown(self)
+
+    type(screen).on_tab_shown = counting
+    try:
+        main_tabs = app.query_one("#main-tabs", TabbedContent)
+        llm_tabs = app.query_one("#llm-tabs", TabbedContent)
+
+        main_tabs.active = "dashboard"
+        await pilot.pause(0.2)
+        main_tabs.active = "llm"
+        await pilot.pause(0.1)
+        llm_tabs.active = "backends"
+        await pilot.pause(0.3)
+        assert calls["n"] >= 1, f"[{context}] on_tab_shown did not fire on returning to Backends"
+        first = calls["n"]
+
+        main_tabs.active = "dashboard"
+        await pilot.pause(0.2)
+        main_tabs.active = "llm"
+        await pilot.pause(0.1)
+        llm_tabs.active = "backends"
+        await pilot.pause(0.3)
+        assert calls["n"] > first, (
+            f"[{context}] on_tab_shown fired once and never again ({calls['n']}) — it must not "
+            "be latched the way ensure_first_view is"
+        )
+    finally:
+        type(screen).on_tab_shown = real_on_tab_shown
+    print(f"[{context}] on_tab_shown fires on every activation, not just the first — OK")
+
+
+def _assert_view_check_ttl_cache() -> None:
+    """plans/07 Phase 2 item 3: `update_check.check_llama_cpp_for_view`/`check_llama_swap_for_view`
+    serve from a 15-minute cache and re-check once it has elapsed — asserted in both directions,
+    against the underlying network functions (monkeypatched) and a temp cache file, the same
+    isolation `_assert_launch_defers_hidden_tabs` uses for the same reason: a real cache file
+    left by an earlier run must never silently satisfy either half of this."""
+    calls = {"cpp": 0, "swap": 0}
+    real_cpp, real_swap = update_check.check_llama_cpp, update_check.check_llama_swap
+
+    def fake_cpp(manifest):
+        calls["cpp"] += 1
+        return {"ok": True, "pinned": "a" * 40, "latest": "a" * 40, "update_available": False}
+
+    def fake_swap(manifest):
+        calls["swap"] += 1
+        return {"ok": True, "pinned": "v1", "latest": "v1", "update_available": False}
+
+    update_check.check_llama_cpp = fake_cpp
+    update_check.check_llama_swap = fake_swap
+    cache_dir = tempfile.mkdtemp()
+    real_cache_path, update_check._CACHE_PATH = update_check._CACHE_PATH, Path(cache_dir) / "update-cache.yaml"
+    manifest = {"llama_cpp": {"ref": "a" * 40, "repo": "x"}, "llama_swap": {"version": "v1", "repo": "y"}}
+    try:
+        update_check.check_llama_cpp_for_view(manifest)
+        update_check.check_llama_swap_for_view(manifest)
+        assert calls == {"cpp": 1, "swap": 1}, f"first per-view check must hit the network once each: {calls}"
+
+        # Within the TTL: served from cache, no new network call either.
+        update_check.check_llama_cpp_for_view(manifest)
+        update_check.check_llama_swap_for_view(manifest)
+        assert calls == {"cpp": 1, "swap": 1}, (
+            f"a check within the 15-minute view TTL must not re-hit the network: {calls}"
+        )
+
+        # Past the TTL: age the stored entries back beyond _VIEW_CACHE_TTL_S and check again.
+        data = update_check._read_full_cache()
+        for component in ("llama_cpp", "llama_swap"):
+            data["view"][component]["checked_at"] -= update_check._VIEW_CACHE_TTL_S + 1
+        update_check._write_full_cache(data)
+        update_check.check_llama_cpp_for_view(manifest)
+        update_check.check_llama_swap_for_view(manifest)
+        assert calls == {"cpp": 2, "swap": 2}, f"a check past the view TTL must re-hit the network: {calls}"
+    finally:
+        update_check.check_llama_cpp = real_cpp
+        update_check.check_llama_swap = real_swap
+        update_check._CACHE_PATH = real_cache_path
+        shutil.rmtree(cache_dir, ignore_errors=True)
+    print("per-view update check: served from cache within 15m, re-checks after — OK")
+
+
 async def verify_geometry_and_export_screenshots() -> None:
     _assert_no_awaited_workers()
     print("No awaited @work methods.")
@@ -587,6 +718,8 @@ async def verify_geometry_and_export_screenshots() -> None:
     print("Apply Service Settings does not read the WOL fields.")
     await _assert_launch_defers_hidden_tabs()
     await _assert_markup_escaping_survives_textual()
+    _assert_view_check_ttl_cache()
+    print("Backends per-view check: TTL-cached, both directions.")
 
     out_dir = _REPO_ROOT / "screenshots" / "verification"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -656,9 +789,16 @@ async def verify_geometry_and_export_screenshots() -> None:
                 if name == "deploy":
                     await _assert_edit_model_modal(app, pilot, f"{name} @ {w}x{h}")
                 if name == "builds":
+                    if expected_class == "-wide":
+                        _print_backends_sections_height(app, f"{name} @ {w}x{h}")
                     await _assert_backend_detail_modal(app, pilot, f"{name} @ {w}x{h}")
                     await _assert_builds_list_modal(app, pilot, f"{name} @ {w}x{h}")
                     await _assert_add_deployment_modal(app, pilot, f"{name} @ {w}x{h}")
+                    await _assert_update_buttons_absent_when_no_update(app, pilot, f"{name} @ {w}x{h}")
+                    if expected_class == "-wide":
+                        # Only once — this drives real tab navigation and doesn't need to run
+                        # at both resolutions.
+                        await _assert_on_tab_shown_fires_every_activation(app, pilot, f"{name} @ {w}x{h}")
                 if name == "settings_services":
                     await _assert_wol_form_wiring(app, pilot, f"{name} @ {w}x{h}")
                     await _assert_root_gate(app, pilot, f"{name} @ {w}x{h}")

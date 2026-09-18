@@ -260,6 +260,10 @@ class CockpitApp(App):
         for screen in self.query(CockpitScreenBase):
             if screen.is_on_screen:
                 screen.ensure_first_view()
+                # Distinct from ensure_first_view above: on_tab_shown is not latched and fires
+                # on every activation, including this same first one (DESIGN.md §3.0 /
+                # cockpit/widgets.py CockpitScreenBase.on_tab_shown).
+                screen.on_tab_shown()
 
     def action_refresh_all(self) -> None:
         self.reload_manifest()

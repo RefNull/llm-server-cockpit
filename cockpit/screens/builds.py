@@ -19,7 +19,7 @@ from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.css.query import NoMatches
 from textual.screen import ModalScreen
-from textual.widgets import Button, DataTable, Input, RichLog, Select, Static, TextArea
+from textual.widgets import Button, DataTable, Input, RichLog, Select, Static, TabbedContent, TextArea
 
 from cockpit import update_check
 from cockpit.widgets import (
@@ -1098,8 +1098,20 @@ class BuildsScreen(CockpitScreenBase):
     BuildsScreen {
         height: 1fr;
     }
-    BuildsScreen #btn-foreign-builds {
+    BuildsScreen #btn-unmanaged-builds {
         display: none;
+    }
+    /* Update buttons follow the same absent-not-disabled idiom as #btn-unmanaged-builds above
+       (plans/07 Phase 2 item 2) — toggled by _update_action_buttons_state(), never by
+       .disabled=, so "no update available" removes the button rather than greying it out. */
+    BuildsScreen #btn-swap-update-to-latest, BuildsScreen #btn-update-to-latest {
+        display: none;
+    }
+    /* Explicit width, not a spacing value (DESIGN.md §1 carve-out) — these summary lines sit
+       in a plain Horizontal with a Button, not a .form-label pair, so .form-field's own
+       max-width: 40 would clip "update available (<sha>)" text. */
+    BuildsScreen #swap-summary, BuildsScreen #swap-detail, BuildsScreen #cpp-summary {
+        width: 1fr;
     }
     """
 
@@ -1127,6 +1139,9 @@ class BuildsScreen(CockpitScreenBase):
         # backend's build shares one source checkout (state_dir/src/llama.cpp, build.py:235)
         # that a second, concurrent build would race on.
         self._building_backends: set[str] = set()
+        # Cached from swap.status() on refresh so "(see process)" needn't re-shell out to
+        # systemctl on a click, and so the screen never reads swap.py's private _UNIT_NAME.
+        self._swap_unit_name: str = ""
         self._llama_cpp_check: dict | None = None
         self._llama_swap_check: dict | None = None
         # Owned by the screen, not the modal: the log survives a closed/reopened BuildLogModal
@@ -1154,36 +1169,30 @@ class BuildsScreen(CockpitScreenBase):
             # same shape — version, status, an update action — but never a table: this is one
             # global service, not a per-backend collection, and its Build/Info cells on the old
             # combined table were always blank because "llama-swap" was never in self.backends).
+            #
+            # Compacted to two lines (plans/07 Phase 2 item 1): version+status+action on one,
+            # path+unit on the other, replacing four `.form-row` label/value pairs that said the
+            # same four facts down a whole extra screenful. No free-standing prose either line.
             yield Static("Llama-swap", classes="section-title")
             with Vertical(id="swap-panel", classes="panel"):
                 with Horizontal(classes="form-row"):
-                    yield Static("Installed version", classes="form-label")
-                    yield Static(id="swap-installed-version", classes="form-field")
+                    yield Static(id="swap-summary")
+                    yield Button("Update to latest", id="btn-swap-update-to-latest", classes="thin-button")
                 with Horizontal(classes="form-row"):
-                    yield Static("Update status", classes="form-label")
-                    yield Static(id="swap-update-status", classes="form-field")
-                with Horizontal(classes="form-row"):
-                    yield Static("Binary path", classes="form-label")
-                    yield Static(id="swap-binary-path", classes="form-field")
-                with Horizontal(classes="form-row"):
-                    yield Static("Systemd unit", classes="form-label")
-                    yield Static(id="swap-unit-status", classes="form-field")
-            with Horizontal(classes="action-row-secondary"):
-                yield Button("Update to latest", id="btn-swap-update-to-latest", classes="thin-button", disabled=True)
+                    yield Static(id="swap-detail")
+                    yield Button("(see process)", id="btn-swap-see-process", classes="thin-button")
 
-            # Section two — Llama.cpp, mirroring section one's shape.
+            # Section two — Llama.cpp, mirroring section one's shape: one line, since it carries
+            # only a version and a status (no path/unit facts of its own). "Update to latest"
+            # sits beside the status it describes (item 2); "Change version…" moves in from the
+            # table's action row (item 5) — both are version actions, which belong to this
+            # section, not to the table below.
             yield Static("Llama.cpp", classes="section-title")
             with Vertical(id="cpp-panel", classes="panel"):
                 with Horizontal(classes="form-row"):
-                    yield Static("Version", classes="form-label")
-                    yield Static(id="cpp-version", classes="form-field")
-                with Horizontal(classes="form-row"):
-                    yield Static("Update status", classes="form-label")
-                    yield Static(id="cpp-update-status", classes="form-field")
-            with Horizontal(classes="action-row-secondary"):
-                yield Button("Update to latest", id="btn-update-to-latest", classes="thin-button", disabled=True)
-                yield Button("Change version…", id="btn-change-version", classes="thin-button")
-                yield Button("Check for Updates", id="btn-check-updates", classes="thin-button")
+                    yield Static(id="cpp-summary")
+                    yield Button("Update to latest", id="btn-update-to-latest", classes="thin-button")
+                    yield Button("Change version…", id="btn-change-version", classes="thin-button")
 
             if not self.backends:
                 yield Static(
@@ -1202,18 +1211,20 @@ class BuildsScreen(CockpitScreenBase):
             )
             backends_table.cursor_type = "row"
             yield backends_table
-            # Answers "where does a row come from, and how do I add one" — the operator's
-            # 2026-09-18 QA report. "Add deployment" (plans/06 Phase 4) opens AddDeploymentModal,
-            # which binds an existing backend to an existing GPU. It is not a second
-            # GPU-editing form: Settings -> GPU Topology stays the only place gpus[] itself is
-            # added to or edited; this button only ever appends to a GPU that is already there.
+            # Table buttons are about builds, not versions (plans/07 Phase 2 item 4/5 — version
+            # actions moved into the llama.cpp section above). "Add build" (renamed from "Add
+            # deployment", §0d-2 — same AddDeploymentModal, same behaviour: binds an existing
+            # backend to an existing GPU, is not a second GPU-editing form) and "Unmanaged
+            # builds" (renamed from "Foreign builds") answer "where does a row come from, and
+            # what's on this host that this toolkit doesn't manage" — the operator's 2026-09-18
+            # QA report.
             with Horizontal(classes="action-row-secondary"):
-                yield Button("Build log", id="btn-build-log", classes="thin-button")
-                yield Button("Add deployment", id="btn-add-deployment", classes="thin-button")
+                yield Button("Add build", id="btn-add-build", classes="thin-button")
                 # Hidden by default (DEFAULT_CSS) until _refresh_backends_table finds something —
                 # a scan result behind a button (A2), not an always-visible block, and never
                 # rescanned on click (DESIGN.md §3.0: the scan itself stays in the refresh path).
-                yield Button("Foreign builds", id="btn-foreign-builds", classes="thin-button")
+                yield Button("Unmanaged builds", id="btn-unmanaged-builds", classes="thin-button")
+                yield Button("Build log", id="btn-build-log", classes="thin-button")
 
     def on_mount(self) -> None:
         backends_table = self.query_one("#backends-table", SingleClickDataTable)
@@ -1271,11 +1282,23 @@ class BuildsScreen(CockpitScreenBase):
         self._update_action_buttons_state()
 
     def on_first_view(self) -> None:
-        """The one screen whose first view does more than a refresh: the upstream version
-        check is a network call, so it runs once when the tab is first opened and then only on
-        the explicit button — never on 'r'."""
+        """Local state only now (plans/07 Phase 2) — the upstream network check moved to
+        `on_tab_shown`, which also fires on this same first view (CockpitScreenBase.on_tab_shown
+        is unlatched and runs every time _load_visible_screens sees this screen on-screen,
+        including the first). Splitting them out means the check no longer needs a special
+        "first view does more than a refresh" carve-out: on_first_view is a plain refresh again,
+        and 'r' still never triggers the network check because on_refresh_requested doesn't
+        call either check method."""
         self._refresh_backends_table()
-        self._run_update_check(notify_result=False, force=False)
+
+    def on_tab_shown(self) -> None:
+        """Automatic upstream check, cache-served within 15 minutes (plans/07 Phase 2 item 3) —
+        replaces the deleted "Check for Updates" button. Two independent checks, not one: each
+        component gets its own worker and its own cache entry (update_check.py's `_VIEW_CACHE_TTL_S`)
+        rather than one call updating both, which is what made a button living under the
+        llama.cpp section also updating llama-swap's line counterintuitive."""
+        self._check_cpp_for_view()
+        self._check_swap_for_view()
 
     # ------------------------------------------------------------------ rendering
 
@@ -1284,6 +1307,13 @@ class BuildsScreen(CockpitScreenBase):
             if b.get("current"):
                 return b
         return None
+
+    @staticmethod
+    def _current_of(builds: list[dict]) -> dict | None:
+        """Same lookup as `_current_build`, over a `list_builds()` result the caller already
+        has — used in the refresh path so one `list_builds` call per backend serves both the
+        `Active build` and `Status` cells instead of two (plans/07 Phase 1 item 4)."""
+        return next((b for b in builds if b.get("current")), None)
 
     def _is_rebuild(self, backend: str, selected_ref: str) -> bool:
         """The single definition of "already built", shared by the confirm dialog's wording and
@@ -1315,23 +1345,54 @@ class BuildsScreen(CockpitScreenBase):
             f"Installs to {prefix}. This can take several minutes."
         )
 
-    def _active_build_cell(self, backend: str, selected_ref: str) -> Text:
+    def _active_build_cell(self, current: dict | None) -> Text:
         """§0b: `current` is a per-backend symlink target, independent of the (global) pin.
         Shows identity *and* version together (Phase 1 made them separable) — `build3 ·
-        481c65f09`, not just one or the other."""
-        build = self._current_build(backend)
-        if build is None:
+        481c65f09`, not just one or the other.
+
+        Neutral on purpose (plans/07 Phase 1, coordinator correction): this is an identity, not
+        a verdict. It used to colour green/yellow on the same match-the-pin fact `Status` now
+        colours — two columns colour-coding one judgement, the exact "don't say it twice" habit
+        this plan exists to undo. `Status` (`_backend_status_cell`) is the only column that
+        carries colour for this row now."""
+        if current is None:
             return Text("not built", style="dim")
-        label = f"{build['id']} · {_short(build.get('version', ''))}"
-        style = "green" if build.get("version") == selected_ref else "bold yellow"
-        return Text(label, style=style)
+        return Text(f"{current['id']} · {_short(current.get('version', ''))}")
+
+    def _backend_status_cell(self, backend: str, builds: list[dict], current: dict | None, pin: str) -> Text:
+        """Per-backend build staleness (plans/07 Phase 1, §0a/§0b/§0c) — replaces the old
+        verbatim copy of the global upstream-vs-pin line into every row, which was (i) a global
+        value in a per-row column and (ii) silent on the only per-row question worth asking: was
+        this backend's active build compiled from the selected version?
+
+        `building…` keeps precedence over every other state. The distinction between the last
+        two states is derivable from `list_builds` alone: if a sane build at the current pin
+        exists and is simply not active, the operator chose this one (`pinned at <ver>`,
+        yellow); if no such build exists, the active build predates the pin and nobody has
+        acted on that yet (`out of date, built on <ver>`, red). The global upstream-vs-pin
+        comparison (`self._llama_cpp_check`) does not appear here at all — it lives only in the
+        section line above the table."""
+        if backend in self._building_backends:
+            return Text("building…", style="dim")
+        if current is None:
+            return Text("not built", style="dim")
+        if current.get("version") == pin:
+            return Text("up to date", style="green")
+        if any(b.get("version") == pin and b.get("sane") for b in builds):
+            # The ACTIVE build's version, not the pin. This cell describes what this backend
+            # is running; naming the pin here would contradict `Active build` in the next
+            # column over ("pinned at <pin>" beside "build1 · <older>") and would put a global
+            # value in a per-row cell, which is the exact defect this method replaced.
+            return Text(f"pinned at {_short(current.get('version', ''))}", style="bold yellow")
+        return Text(f"out of date, built on {_short(current.get('version', ''))}", style="bold red")
 
     def _refresh_backends_table(self) -> None:
         cpp_ref = self.manifest.get("llama_cpp", {}).get("ref", "")
-        self.query_one("#cpp-version", Static).update(escape_markup(_short(cpp_ref)))
-        self.query_one("#cpp-update-status", Static).update(self._format_update_cell(self._llama_cpp_check))
+        cpp_version = escape_markup(_short(cpp_ref))
+        cpp_status = self._format_update_cell(self._llama_cpp_check)
+        cpp_summary = Text.assemble(f"{cpp_version} · ", cpp_status)
+        self.query_one("#cpp-summary", Static).update(cpp_summary)
 
-        self.query_one("#swap-update-status", Static).update(self._format_update_cell(self._llama_swap_check))
         # dashboard.py's _compute_llm_text guards this same call the same way: systemd isn't
         # available on every host this cockpit runs on (e.g. a dev machine), and swap.status()
         # shells out to `systemctl` with no guard of its own.
@@ -1342,37 +1403,35 @@ class BuildsScreen(CockpitScreenBase):
         except Exception as e:
             log.warning("swap.status() failed: %s", e)
             swap_facts = None
+        swap_version = escape_markup(swap_facts.get("installed_version") or "not installed") if swap_facts else "unknown"
+        swap_status = self._format_update_cell(self._llama_swap_check)
+        self.query_one("#swap-summary", Static).update(Text.assemble(f"{swap_version} · ", swap_status))
         if swap_facts is None:
-            self.query_one("#swap-installed-version", Static).update("unknown (systemd not available)")
-            self.query_one("#swap-binary-path", Static).update("unknown")
-            self.query_one("#swap-unit-status", Static).update("unknown")
+            self.query_one("#swap-detail", Static).update("unknown (systemd not available)")
         else:
-            self.query_one("#swap-installed-version", Static).update(
-                escape_markup(swap_facts.get("installed_version") or "not installed")
-            )
-            self.query_one("#swap-binary-path", Static).update(escape_markup(swap_facts["binary_path"]))
             unit_state = "active" if swap_facts["unit_active"] else "inactive"
             unit_state += ", enabled" if swap_facts["unit_enabled"] else ", disabled"
-            self.query_one("#swap-unit-status", Static).update(
-                escape_markup(f"{swap_facts['unit_name']} — {unit_state}")
+            self.query_one("#swap-detail", Static).update(
+                escape_markup(f"{swap_facts['binary_path']} · {swap_facts['unit_name']} ({unit_state})")
             )
+            self._swap_unit_name = swap_facts["unit_name"]
 
         table = self.query_one("#backends-table", SingleClickDataTable)
         table.clear()
         for backend in self.backends:
-            status_cell = (
-                Text("building…", style="dim")
-                if backend in self._building_backends
-                else self._format_update_cell(self._llama_cpp_check)
-            )
+            # One list_builds() call serves both cells (plans/07 Phase 1 item 4) — this used to
+            # be two per row (one inside the old _active_build_cell, a second the Status column
+            # never even needed because it just copied the global check).
+            builds = build_step.list_builds(self.host_profile, backend)
+            current = self._current_of(builds)
             # "EX. " marks a still-stock recipe (manifest.yaml backends.<name>.example) — see
             # BackendDetailModal's Edit view for what it means and how it clears.
             is_example = bool(self.manifest.get("backends", {}).get(backend, {}).get("example"))
             backend_label = f"{'EX. ' if is_example else ''}{backend}"
             table.add_row(
                 Text(backend_label),
-                self._active_build_cell(backend, cpp_ref),
-                status_cell,
+                self._active_build_cell(current),
+                self._backend_status_cell(backend, builds, current, cpp_ref),
                 *table.action_cells(backend),
                 key=backend,
             )
@@ -1388,11 +1447,11 @@ class BuildsScreen(CockpitScreenBase):
         disappears while the tab stays open, and hides it entirely (A2) when there is nothing
         to report."""
         self._foreign_builds = build_step.find_foreign_builds(self.host_profile)
-        btn = self.query_one("#btn-foreign-builds", Button)
+        btn = self.query_one("#btn-unmanaged-builds", Button)
         if not self._foreign_builds:
             btn.display = False
             return
-        btn.label = f"Foreign builds ({len(self._foreign_builds)})"
+        btn.label = f"Unmanaged builds ({len(self._foreign_builds)})"
         btn.display = True
 
     def _foreign_builds_text(self) -> str:
@@ -1412,6 +1471,9 @@ class BuildsScreen(CockpitScreenBase):
         return Text(f"update available ({_short(result['latest'])})", style="bold yellow")
 
     def _update_action_buttons_state(self) -> None:
+        """Absent when there's nothing to apply, not disabled-and-greyed (plans/07 Phase 2 item
+        2) — the same `display` on/off idiom `_refresh_foreign_builds_button` already uses for
+        `#btn-unmanaged-builds`, not a second mechanism invented here."""
         if not self.is_mounted:
             return
         can_update_cpp = bool(
@@ -1421,7 +1483,7 @@ class BuildsScreen(CockpitScreenBase):
         )
         btn = self.query("#btn-update-to-latest")
         if btn:
-            btn.first(Button).disabled = not can_update_cpp
+            btn.first(Button).display = can_update_cpp
         can_update_swap = bool(
             self._llama_swap_check
             and self._llama_swap_check.get("ok")
@@ -1429,7 +1491,7 @@ class BuildsScreen(CockpitScreenBase):
         )
         swap_btn = self.query("#btn-swap-update-to-latest")
         if swap_btn:
-            swap_btn.first(Button).disabled = not can_update_swap
+            swap_btn.first(Button).display = can_update_swap
 
     # ------------------------------------------------------------------ per-row action dispatch
 
@@ -1462,21 +1524,51 @@ class BuildsScreen(CockpitScreenBase):
 
     # ------------------------------------------------------------------ button dispatch
 
+    def _jump_to_swap_unit(self) -> None:
+        """plans/07 Phase 3 (d): switch to System > Systemd and open llama-swap.service's unit
+        file. SystemdScreen keys its rows by unit name and already renders a unit file through
+        InfoModal (`_view_unitfile`), so this reuses that rather than growing a second viewer.
+
+        The not-found path is the one worth handling: the operator's hide-list can exclude the
+        unit, and on a host without systemd the table is empty entirely. Saying so beats
+        switching to a tab where nothing is selected and leaving them to guess."""
+        from cockpit.screens.systemd import SystemdScreen
+
+        unit = self._swap_unit_name
+        if not unit:
+            self.notify("llama-swap's unit name is not known yet", severity="warning")
+            return
+        try:
+            systemd_screen = self.app.query_one(SystemdScreen)
+        except NoMatches:
+            self.notify("Systemd tab is not available on this host", severity="warning")
+            return
+        if not systemd_screen.known_unit(unit):
+            self.notify(
+                f"{unit} is not in the Systemd list — it may be hidden there, or not installed",
+                severity="warning",
+            )
+            return
+        self.app.query_one("#main-tabs", TabbedContent).active = "system"
+        self.app.query_one("#system-tabs", TabbedContent).active = "systemd"
+        systemd_screen.open_unit_file(unit)
+
     async def on_button_pressed(self, event: Button.Pressed) -> None:
         button_id = event.button.id or ""
-        if button_id == "btn-check-updates":
-            self._run_update_check()
-        elif button_id == "btn-update-to-latest":
+        if button_id == "btn-swap-see-process":
+            self._jump_to_swap_unit()
+            return
+        if button_id == "btn-update-to-latest":
             self._confirm_and_update_to_latest()
         elif button_id == "btn-change-version":
             self._confirm_and_change_version()
         elif button_id == "btn-build-log":
             self._open_log_modal("Build log")
-        elif button_id == "btn-foreign-builds":
-            self.app.push_screen(InfoModal("Foreign builds", self._foreign_builds_text()))
+        elif button_id == "btn-unmanaged-builds":
+            self.app.push_screen(InfoModal("Unmanaged builds", self._foreign_builds_text()))
         elif button_id == "btn-swap-update-to-latest":
             self._confirm_and_update_swap()
-        elif button_id == "btn-add-deployment":
+        elif button_id == "btn-add-build":
             self._confirm_and_add_deployment()
 
     def _open_log_modal(self, title: str) -> None:
@@ -1492,31 +1584,71 @@ class BuildsScreen(CockpitScreenBase):
 
     @work
     async def _confirm_and_update_to_latest(self) -> None:
-        """Writes llama_cpp.ref to the SHA the last check found upstream. Does not build —
-        that is a separate act the operator takes per backend from the table (plans/05 Phase 2
-        item 3)."""
+        """Writes llama_cpp.ref to the SHA the last check found upstream, then fetches the
+        local checkout to that ref — operator decision §0d-1: "Update to latest" bumps the pin
+        AND fetches, so the local source genuinely matches, root + network, behind the
+        build-log modal like a build. It does not build or rebuild any backend — that stays a
+        separate, per-row act from the table."""
         check = self._llama_cpp_check
         if not check or not check.get("ok") or not check.get("update_available"):
-            self.notify("no update to apply — run 'Check for Updates' first", severity="warning")
+            self.notify("no update to apply — the automatic check hasn't found one", severity="warning")
             return
         old_ref = self.manifest.get("llama_cpp", {}).get("ref", "")
         new_ref = check["latest"]
         message = (
             f"Update llama.cpp version {_short(old_ref)} → {_short(new_ref)} "
             f"(latest as of {check.get('latest_date', 'unknown date')})? "
-            "Writes manifest.yaml; does not build."
+            "Writes manifest.yaml and fetches the source to this ref. Does not build."
         )
-        confirmed = await self.app.push_screen_wait(ConfirmModal(message, confirm_label="Update Version", danger=True))
-        if not confirmed:
+        if not await self.confirm(
+            message, confirm_label="Update to latest", mutates_system=True, requires_root=True
+        ):
             return
         self._write_pin(new_ref)
-        # We know the relationship without a network call: the pin now equals what the last
-        # check called "latest", so update_available flips locally — on_refresh_requested's
-        # no-network contract stays intact, this is just reflecting what we already learned.
-        self._llama_cpp_check = {**check, "pinned": new_ref, "update_available": False}
-        self._refresh_backends_table()
-        self._update_action_buttons_state()
-        self.notify(f"llama.cpp pin updated to {_short(new_ref)}")
+        self._log_buffer = []
+        self._open_log_modal("Fetching llama.cpp source")
+        self._run_cpp_fetch(new_ref, check)
+
+    @work(thread=True)
+    def _run_cpp_fetch(self, new_ref: str, check: dict) -> None:
+        """Off-thread half of `_confirm_and_update_to_latest`: fetches the checkout to `new_ref`
+        via `build_step.fetch_checkout` (a thin, `Runner`-driven wrapper around the already-
+        idempotent `_ensure_checkout` — never called on the screen's own privileged_runner
+        directly outside a worker, same discipline `_run_build` follows)."""
+        handler = _BuildLogHandler(self)
+        provision_logger = logging.getLogger("provision")
+        prior_level = provision_logger.level
+        if provision_logger.level == logging.NOTSET or provision_logger.level > logging.INFO:
+            provision_logger.setLevel(logging.INFO)
+        provision_logger.addHandler(handler)
+
+        pr = self.privileged_runner
+        runner = Runner(dry_run=pr.dry_run, sudo=pr.sudo, on_output=self._on_build_output)
+        try:
+            build_step.fetch_checkout(
+                runner,
+                self.manifest.get("llama_cpp", {}).get("repo", ""),
+                new_ref,
+                build_step.checkout_dir_for(self.host_profile),
+            )
+        except SystemExit as e:
+            self.app.call_from_thread(self.app.notify, f"fetch failed: {e}", severity="error")
+            return
+        except Exception as e:
+            self.app.call_from_thread(self.app.notify, f"fetch failed: {e}", severity="error")
+            return
+        finally:
+            provision_logger.removeHandler(handler)
+            provision_logger.setLevel(prior_level)
+        # Re-derived from the new pin, not asserted (plans/07 §0a: the old code hand-set
+        # update_available=False here, which read "up to date" as a claim about the machine
+        # when nothing had been fetched). new_ref is always check["latest"], so this comes out
+        # False by construction — but it is computed, so a future caller of this method with a
+        # ref that ISN'T check["latest"] gets the right answer instead of a stale assumption.
+        self.app.call_from_thread(self._apply_cpp_check_result, {
+            **check, "pinned": new_ref, "update_available": new_ref != check.get("latest"),
+        })
+        self.app.call_from_thread(self.app.notify, f"llama.cpp source fetched at {_short(new_ref)}")
 
     @work
     async def _confirm_and_update_swap(self) -> None:
@@ -1728,49 +1860,43 @@ class BuildsScreen(CockpitScreenBase):
             self._log_modal.append(msg)
 
     # ------------------------------------------------------------------ upstream version check (network, off main thread)
+    #
+    # plans/07 Phase 2: the manual "Check for Updates" button is gone. Each component checks
+    # itself automatically, cache-served within update_check._VIEW_CACHE_TTL_S (15 minutes),
+    # from on_tab_shown — every time this tab becomes visible, not once. Two independent
+    # methods, two independent cache entries: llama-swap no longer piggybacks on llama.cpp's
+    # button, which is what made "press the button under llama.cpp, and llama-swap's line also
+    # changes" counterintuitive. Neither is ever called from on_refresh_requested — 'r' stays
+    # network-free.
 
     @work(thread=True)
-    def _run_update_check(self, *, notify_result: bool = True, force: bool = True) -> None:
-        """`force=False` is served from update_check's 24h cache. Opening this tab used to fire
-        two GitHub calls every time, against a 60/hour unauthenticated budget — enough to start
-        returning 403s that rendered as "couldn't check" and read like a network fault. The
-        button below always forces, because that is what pressing it means."""
-        self.app.call_from_thread(self._set_checking_status, True)
+    def _check_cpp_for_view(self) -> None:
         try:
-            results = update_check.check_all(self.manifest, force=force)
-            result_cpp, result_swap = results["llama_cpp"], results["llama_swap"]
+            result = update_check.check_llama_cpp_for_view(self.manifest)
         except Exception as e:
-            self.app.call_from_thread(self.app.notify, f"version check failed: {e}", severity="error")
-            self.app.call_from_thread(self._set_checking_status, False)
+            self.app.call_from_thread(self.app.notify, f"llama.cpp version check failed: {e}", severity="error")
             return
-        self.app.call_from_thread(self._apply_update_check_results, result_cpp, result_swap)
-        if notify_result:
-            if not result_cpp.get("ok") or not result_swap.get("ok"):
-                self.app.call_from_thread(
-                    self.app.notify, "version check completed with errors", severity="warning"
-                )
-            elif result_cpp.get("update_available") or result_swap.get("update_available"):
-                self.app.call_from_thread(self.app.notify, "updates available for upstream components")
-            else:
-                self.app.call_from_thread(self.app.notify, "upstream components are up to date")
-        self.app.call_from_thread(self._set_checking_status, False)
+        self.app.call_from_thread(self._apply_cpp_check_result, result)
 
-    def _set_checking_status(self, checking: bool) -> None:
+    @work(thread=True)
+    def _check_swap_for_view(self) -> None:
+        try:
+            result = update_check.check_llama_swap_for_view(self.manifest)
+        except Exception as e:
+            self.app.call_from_thread(self.app.notify, f"llama-swap version check failed: {e}", severity="error")
+            return
+        self.app.call_from_thread(self._apply_swap_check_result, result)
+
+    def _apply_cpp_check_result(self, result: dict) -> None:
         if not self.is_mounted:
             return
-        btn = self.query("#btn-check-updates")
-        if btn:
-            btn.first(Button).disabled = checking
-        if checking:
-            self._llama_cpp_check = None
-            self._llama_swap_check = None
-            self._refresh_backends_table()
-            self._update_action_buttons_state()
+        self._llama_cpp_check = result
+        self._refresh_backends_table()
+        self._update_action_buttons_state()
 
-    def _apply_update_check_results(self, result_cpp: dict, result_swap: dict) -> None:
+    def _apply_swap_check_result(self, result: dict) -> None:
         if not self.is_mounted:
             return
-        self._llama_cpp_check = result_cpp
-        self._llama_swap_check = result_swap
+        self._llama_swap_check = result
         self._refresh_backends_table()
         self._update_action_buttons_state()

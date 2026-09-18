@@ -217,6 +217,18 @@ class SystemdScreen(CockpitScreenBase):
         content = scripts_step.journal_tail(unit, runner=self.privileged_runner)
         self.app.call_from_thread(self.app.push_screen, InfoModal(f"journalctl -u {unit}", content))
 
+    def open_unit_file(self, unit: str) -> None:
+        """Public entry point for another screen to show one unit's file — the Backends tab's
+        "(see process)" affordance (plans/07 Phase 3). Exists so that caller does not reach into
+        `_view_unitfile`, which is a private @work method; `known_unit` lets it check first
+        rather than silently opening nothing."""
+        self._view_unitfile(unit)
+
+    def known_unit(self, unit: str) -> bool:
+        """True when `unit` is in the table this screen last loaded — false if the operator has
+        it hidden, or systemd is not present and the table is empty."""
+        return unit in self._units
+
     @work(thread=True)
     def _view_unitfile(self, unit: str) -> None:
         content = systemd.unit_source(unit)

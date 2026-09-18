@@ -848,6 +848,19 @@ class CockpitScreenBase(Widget):
         """
         self.on_refresh_requested()
 
+    def on_tab_shown(self) -> None:
+        """Runs every time this tab becomes the visible one — every activation, not once
+        (distinct from `on_first_view`, which `ensure_first_view` latches to a single run per
+        app session; that latch and this method's contract are unrelated and neither changes
+        the other). Default no-op.
+
+        For cheap, cache-served work that should look fresh each time the operator switches
+        back to this tab — e.g. an upstream check served from a short TTL — never for the kind
+        of work `on_refresh_requested`'s no-network contract exists to keep off the global 'r'
+        binding. `CockpitApp._load_visible_screens` calls this immediately after
+        `ensure_first_view()` for every on-screen screen, on every `TabbedContent.TabActivated`,
+        including the first time a tab is shown."""
+
     def ensure_first_view(self) -> bool:
         """Run on_first_view() once, the first time this tab becomes visible.
 
