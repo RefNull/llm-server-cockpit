@@ -926,6 +926,38 @@ def verify_fetch_checkout_idempotent() -> None:
     print("verify_build_pin: fetch_checkout runs no git command on a second call at the same ref — OK")
 
 
+def verify_fetch_checkout_existing_dir() -> None:
+    """When checkout_dir already exists and has .git, fetch_checkout must fetch and checkout
+    rather than attempt git clone, even if _git_head is None."""
+    calls: list[list[str]] = []
+
+    class _CapRunner(Runner):
+        def run(self, cmd, **kwargs):
+            calls.append(list(cmd))
+            return None
+
+        def mkdir(self, path):
+            return None
+
+    with tempfile.TemporaryDirectory() as td:
+        checkout_dir = Path(td) / "src" / "llama.cpp"
+        (checkout_dir / ".git").mkdir(parents=True)
+
+        orig_git_head = build_step._git_head
+        build_step._git_head = lambda d: None
+        try:
+            runner = _CapRunner()
+            ref = "deadbeef" * 5
+            build_step.fetch_checkout(runner, "https://github.com/example/llama.cpp", ref, checkout_dir)
+            assert not any("clone" in c for c in calls), f"git clone was run on existing checkout: {calls}"
+            assert any("fetch" in c for c in calls), f"fetch was not run on existing checkout: {calls}"
+            assert any("checkout" in c for c in calls), f"checkout was not run on existing checkout: {calls}"
+        finally:
+            build_step._git_head = orig_git_head
+
+    print("verify_build_pin: fetch_checkout on existing repo fetches without cloning — OK")
+
+
 def verify_missing_manifest_fails_with_remedy() -> None:
     """A missing manifest.yaml must fail with ValidationError naming the remedy:
     copying manifest.example.yaml."""
@@ -1142,6 +1174,7 @@ def main() -> None:
     verify_four_status_states()
     verify_update_does_not_make_stale_build_read_up_to_date()
     verify_fetch_checkout_idempotent()
+    verify_fetch_checkout_existing_dir()
     print("verify_build_pin: all checks passed")
 
 

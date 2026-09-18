@@ -45,13 +45,20 @@ def _needed_backends(host_profile: dict[str, Any]) -> list[str]:
 
 def _git_head(checkout_dir: Path) -> str | None:
     """Read-only — safe to call regardless of --dry-run."""
-    if not (checkout_dir / ".git").is_dir():
+    git_dir = checkout_dir / ".git"
+    if not git_dir.exists():
         return None
-    result = subprocess.run(
-        ["git", "-C", str(checkout_dir), "rev-parse", "HEAD"],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-    )
-    return result.stdout.strip() if result.returncode == 0 else None
+    cmd = ["git", "-c", "safe.directory=*", "-C", str(checkout_dir), "rev-parse", "HEAD"]
+    try:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except (FileNotFoundError, OSError):
+        pass
+    return None
 
 
 def _ensure_checkout(runner: Runner, repo: str, ref: str, checkout_dir: Path) -> None:
@@ -59,15 +66,25 @@ def _ensure_checkout(runner: Runner, repo: str, ref: str, checkout_dir: Path) ->
     if current == ref:
         log.info("build: checkout at %s already at pinned ref %s, skipping clone/fetch", checkout_dir, ref)
         return
-    if current is None:
-        runner.mkdir(checkout_dir.parent)
-        runner.run(["git", "clone", repo, str(checkout_dir)])
-    else:
-        log.info("build: checkout at %s is at %s, fetching pinned ref %s", checkout_dir, current, ref)
-        # GitHub serves arbitrary commit SHAs directly, so this reaches `ref` even if it
-        # isn't the tip of any branch — no need to fetch full history/refs.
-        runner.run(["git", "-C", str(checkout_dir), "fetch", "origin", ref])
-    runner.run(["git", "-C", str(checkout_dir), "checkout", ref])
+    git_dir = checkout_dir / ".git"
+    is_git_repo = git_dir.exists()
+    if not is_git_repo:
+        if checkout_dir.is_dir() and any(checkout_dir.iterdir()):
+            log.warning("build: %s exists without .git; initializing git in place", checkout_dir)
+            runner.run(["git", "-c", "safe.directory=*", "-C", str(checkout_dir), "init"])
+            runner.run(["git", "-c", "safe.directory=*", "-C", str(checkout_dir), "remote", "add", "origin", repo], check=False)
+            runner.run(["git", "-c", "safe.directory=*", "-C", str(checkout_dir), "remote", "set-url", "origin", repo])
+        else:
+            runner.mkdir(checkout_dir.parent)
+            runner.run(["git", "-c", "safe.directory=*", "clone", repo, str(checkout_dir)])
+            runner.run(["git", "-c", "safe.directory=*", "-C", str(checkout_dir), "checkout", ref])
+            return
+
+    log.info("build: checkout at %s is at %s, fetching pinned ref %s", checkout_dir, current or "unknown", ref)
+    # GitHub serves arbitrary commit SHAs directly, so this reaches `ref` even if it
+    # isn't the tip of any branch — no need to fetch full history/refs.
+    runner.run(["git", "-c", "safe.directory=*", "-C", str(checkout_dir), "fetch", "origin", ref])
+    runner.run(["git", "-c", "safe.directory=*", "-C", str(checkout_dir), "checkout", ref])
 
 
 def fetch_checkout(runner: Runner, repo: str, ref: str, checkout_dir: Path) -> None:

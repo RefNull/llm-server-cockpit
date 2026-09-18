@@ -1680,6 +1680,7 @@ class BuildsScreen(CockpitScreenBase):
             message, confirm_label="Update llama-swap", mutates_system=True, requires_root=True
         ):
             return
+        self._log_buffer = []
         self._open_log_modal(f"Updating llama-swap to {new_version}")
         self._run_swap_update(new_version, check)
 
