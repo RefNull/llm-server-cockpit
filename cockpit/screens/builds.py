@@ -39,6 +39,7 @@ from provision import schema
 from provision.common import Runner
 from provision.steps import build as build_step
 from provision.steps import swap as swap_step
+from provision.steps import sysinfo
 
 log = logging.getLogger("provision")
 
@@ -836,11 +837,24 @@ class AddDeploymentModal(ModalScreen[tuple[str, str, list[str], str] | None]):
         self.manifest = manifest
 
     def compose(self) -> ComposeResult:
-        gpu_options = [(g["id"], g["id"]) for g in self.host_profile.get("gpus", [])]
+        try:
+            pci = sysinfo.read_pci_gpus()
+        except Exception:
+            pci = []
+        seen: dict[str, int] = {}
+        gpu_options: list[tuple[str, str]] = []
+        for gpu in self.host_profile.get("gpus", []):
+            vendor = gpu.get("vendor", "")
+            ordinal = seen.get(vendor, 0)
+            seen[vendor] = ordinal + 1
+            matches = [n for n in pci if vendor and vendor.lower() in n.lower()]
+            name = matches[ordinal] if ordinal < len(matches) else None
+            gpu_options.append((f"{gpu['id']} — {name}" if name else gpu["id"], gpu["id"]))
+
         backend_options = [(b, b) for b in sorted(self.manifest.get("backends", {}).keys())]
         with Vertical(id="deployment-dialog"):
             with Horizontal(id="deployment-header"):
-                yield Static("Add Build", id="deployment-title")
+                yield Static("Add backend", id="deployment-title")
                 yield Button("×", id="deployment-close", classes="close-button", variant="error")
             with VerticalScroll(id="deployment-body"):
                 with Horizontal(classes="form-row"):
@@ -857,9 +871,7 @@ class AddDeploymentModal(ModalScreen[tuple[str, str, list[str], str] | None]):
                     yield Static("", id="deployment-build-command")
                 yield Static("", id="deployment-error")
             with Horizontal(classes="action-row-primary"):
-                yield Button("Add & build", id="btn-deployment-add-build", variant="primary", classes="thin-button")
-                yield Button("Add & download", id="btn-deployment-add-download", classes="thin-button")
-                yield Button("Add", id="btn-deployment-add", classes="thin-button")
+                yield Button("Add", id="btn-deployment-add", variant="primary", classes="thin-button")
                 yield Button("Cancel", id="btn-deployment-cancel", classes="thin-button")
 
     def on_mount(self) -> None:
@@ -908,10 +920,6 @@ class AddDeploymentModal(ModalScreen[tuple[str, str, list[str], str] | None]):
             self.dismiss(None)
         elif event.button.id == "btn-deployment-add":
             self._select(action="add")
-        elif event.button.id == "btn-deployment-add-build":
-            self._select(action="build")
-        elif event.button.id == "btn-deployment-add-download":
-            self._select(action="download")
 
     def _select(self, action: str = "add") -> None:
         gpu_id = self.query_one("#f-deployment-gpu", Select).value
@@ -947,7 +955,7 @@ class DownloadPrebuiltModal(ModalScreen[dict[str, Any] | None]):
         align: center middle;
     }
     #prebuilt-dialog {
-        width: 76;
+        width: 90%;
         height: 85%;
         border: thick $background 80%;
         background: $surface;
@@ -961,12 +969,27 @@ class DownloadPrebuiltModal(ModalScreen[dict[str, Any] | None]):
         width: 1fr;
         text-style: bold;
     }
-    #prebuilt-summary {
-        color: $text-muted;
+    #prebuilt-release-row {
         height: auto;
         margin-bottom: $space-normal;
     }
-    #prebuilt-release-row {
+    #prebuilt-release-row .form-label {
+        width: 10;
+        margin-top: 1;
+    }
+    #f-prebuilt-release {
+        width: 32;
+        margin-right: 1;
+    }
+    #f-prebuilt-tag {
+        width: 1fr;
+        min-width: 20;
+        margin-right: 1;
+    }
+    #btn-prebuilt-load-tag {
+        min-width: 10;
+    }
+    #prebuilt-tag-status {
         height: auto;
         margin-bottom: $space-normal;
     }
@@ -974,11 +997,8 @@ class DownloadPrebuiltModal(ModalScreen[dict[str, Any] | None]):
         height: 1fr;
         margin-bottom: $space-normal;
     }
-    #prebuilt-options-group {
-        height: auto;
-        margin-bottom: $space-normal;
-    }
-    #prebuilt-manual-row {
+    #prebuilt-summary {
+        color: $text-muted;
         height: auto;
         margin-bottom: $space-normal;
     }
@@ -1003,31 +1023,27 @@ class DownloadPrebuiltModal(ModalScreen[dict[str, Any] | None]):
         self.gpu_id = gpu_id
         self._releases: list[dict[str, Any]] = []
         self._current_assets: list[dict[str, Any]] = []
+        self._current_tag: str = ""
         self._selected_asset: dict[str, Any] | None = None
 
     def compose(self) -> ComposeResult:
-        known_backends = sorted(self.manifest.get("backends", {}).keys())
-        backend_options = [(b, b) for b in known_backends]
+        title = f"Download Prebuilt llama.cpp — {self.target_backend}" if self.target_backend else "Download Prebuilt llama.cpp"
+        if self.gpu_id:
+            title += f" ({self.gpu_id})"
         with Vertical(id="prebuilt-dialog"):
             with Horizontal(id="prebuilt-header"):
-                yield Static("Download Prebuilt llama.cpp", id="prebuilt-title")
+                yield Static(title, id="prebuilt-title")
                 yield Button("×", id="prebuilt-close", classes="close-button", variant="error")
-            yield Static("Detecting system hardware...", id="prebuilt-summary")
-            with Horizontal(id="prebuilt-release-row", classes="form-row"):
+            with Horizontal(id="prebuilt-release-row", classes="inline-row"):
                 yield Static("Release", classes="form-label")
                 yield Select([], id="f-prebuilt-release", allow_blank=True, classes="form-field")
+                yield Input(placeholder="or release tag (e.g. b11040)", id="f-prebuilt-tag")
+                yield Button("Load tag", id="btn-prebuilt-load-tag", classes="thin-button")
+            yield Static("", id="prebuilt-tag-status")
             table = SingleClickDataTable(id="prebuilt-table", zebra_stripes=True)
             table.cursor_type = "row"
             yield table
-            with Vertical(id="prebuilt-options-group"):
-                with Horizontal(classes="form-row"):
-                    yield Static("Target backend", classes="form-label")
-                    yield Select(backend_options, id="f-prebuilt-backend", allow_blank=True, classes="form-field")
-                yield Checkbox("Include CUDA runtime libraries (cudart)", id="f-prebuilt-cudart", value=True)
-                yield Checkbox("Update manifest.yaml ref to this release", id="f-prebuilt-pin", value=True)
-            with Horizontal(id="prebuilt-manual-row", classes="inline-row"):
-                yield Input(placeholder="or release tag (e.g. b11040)", id="f-prebuilt-tag")
-                yield Button("Load Tag", id="btn-prebuilt-load-tag", classes="thin-button")
+            yield Static("Select a prebuilt asset above.", id="prebuilt-summary")
             yield Static("", id="prebuilt-error")
             with Horizontal(classes="action-row-primary"):
                 yield Button("Download & Install", id="btn-prebuilt-download", variant="primary", classes="thin-button")
@@ -1035,28 +1051,10 @@ class DownloadPrebuiltModal(ModalScreen[dict[str, Any] | None]):
 
     def on_mount(self) -> None:
         table = self.query_one("#prebuilt-table", SingleClickDataTable)
-        table.add_column("Backend", width=14)
-        table.add_column("Asset file", width=34)
-        table.add_column("Size", width=9)
-        table.add_column("Match", width=15)
-        table.add_action_column(TableAction("select", "Select"))
-
-        arch = update_check.detect_host_arch()
-        cuda_ver = update_check.detect_host_cuda_version()
-        gpus = self.host_profile.get("gpus", [])
-        gpu_desc = f"{len(gpus)} GPU(s)"
-        if cuda_ver:
-            gpu_desc += f" (CUDA {cuda_ver})"
-        pinned = _short(self.manifest.get("llama_cpp", {}).get("ref"))
-        self.query_one("#prebuilt-summary", Static).update(
-            f"Host: Linux {arch} · Hardware: {gpu_desc} · Pinned ref: {pinned}"
-        )
-
-        if self.target_backend:
-            try:
-                self.query_one("#f-prebuilt-backend", Select).value = self.target_backend
-            except Exception:
-                pass
+        table.add_column("Asset file", width=58)
+        table.add_column("Size", width=12)
+        table.add_column("Status", width=12)
+        table.add_action_column(TableAction("select", "Select", width=10))
 
         self._fetch_releases()
 
@@ -1093,101 +1091,87 @@ class DownloadPrebuiltModal(ModalScreen[dict[str, Any] | None]):
 
     def _load_release_tag(self, tag: str) -> None:
         rel = next((r for r in self._releases if r.get("tag_name") == tag), None)
-        raw_assets = (rel or {}).get("assets", [])
-        arch = update_check.detect_host_arch()
+        raw_assets = (rel or {}).get("assets", []) if rel else []
 
-        if raw_assets:
-            parsed = update_check.parse_release_assets(raw_assets, host_arch=arch)
-        else:
+        if not raw_assets:
             repo = self.manifest.get("llama_cpp", {}).get("repo", "https://github.com/ggml-org/llama.cpp")
-            parsed = [
+            raw_assets = [
                 {
-                    "name": f"llama-{tag}-bin-ubuntu-cuda-12.8-{arch}.tar.gz",
+                    "name": f"llama-{tag}-bin-ubuntu-cuda-12.8-x64.tar.gz",
                     "size": 160 * 1024 * 1024,
-                    "browser_download_url": update_check.fallback_asset_url(repo, tag, f"llama-{tag}-bin-ubuntu-cuda-12.8-{arch}.tar.gz"),
-                    "backend": "cuda",
-                    "cuda_version": "12.8",
-                    "arch": arch,
-                    "tag": tag,
-                    "is_cudart": False,
-                    "label": "CUDA 12.8",
-                    "companion_cudart": {
-                        "name": f"cudart-llama-{tag}-bin-ubuntu-cuda-12.8-{arch}.tar.gz",
-                        "browser_download_url": update_check.fallback_asset_url(repo, tag, f"cudart-llama-{tag}-bin-ubuntu-cuda-12.8-{arch}.tar.gz"),
-                    },
+                    "browser_download_url": update_check.fallback_asset_url(repo, tag, f"llama-{tag}-bin-ubuntu-cuda-12.8-x64.tar.gz"),
                 },
                 {
-                    "name": f"llama-{tag}-bin-ubuntu-vulkan-{arch}.tar.gz",
+                    "name": f"cudart-llama-{tag}-bin-ubuntu-cuda-12.8-x64.tar.gz",
+                    "size": 120 * 1024 * 1024,
+                    "browser_download_url": update_check.fallback_asset_url(repo, tag, f"cudart-llama-{tag}-bin-ubuntu-cuda-12.8-x64.tar.gz"),
+                },
+                {
+                    "name": f"llama-{tag}-bin-ubuntu-vulkan-x64.tar.gz",
                     "size": 30 * 1024 * 1024,
-                    "browser_download_url": update_check.fallback_asset_url(repo, tag, f"llama-{tag}-bin-ubuntu-vulkan-{arch}.tar.gz"),
-                    "backend": "vulkan",
-                    "cuda_version": None,
-                    "arch": arch,
-                    "tag": tag,
-                    "is_cudart": False,
-                    "label": "VULKAN",
-                    "companion_cudart": None,
+                    "browser_download_url": update_check.fallback_asset_url(repo, tag, f"llama-{tag}-bin-ubuntu-vulkan-x64.tar.gz"),
                 },
                 {
-                    "name": f"llama-{tag}-bin-ubuntu-{arch}.tar.gz",
+                    "name": f"llama-{tag}-bin-ubuntu-x64.tar.gz",
                     "size": 16 * 1024 * 1024,
-                    "browser_download_url": update_check.fallback_asset_url(repo, tag, f"llama-{tag}-bin-ubuntu-{arch}.tar.gz"),
-                    "backend": "cpu",
-                    "cuda_version": None,
-                    "arch": arch,
-                    "tag": tag,
-                    "is_cudart": False,
-                    "label": "CPU",
-                    "companion_cudart": None,
+                    "browser_download_url": update_check.fallback_asset_url(repo, tag, f"llama-{tag}-bin-ubuntu-x64.tar.gz"),
                 },
             ]
 
-        self._current_assets = parsed
-        recommended = update_check.find_recommended_asset(parsed, self.host_profile, self.target_backend)
-        self._selected_asset = recommended or (parsed[0] if parsed else None)
-
-        if self._selected_asset:
-            target_be = self.target_backend or self._selected_asset.get("backend")
-            if target_be:
-                try:
-                    self.query_one("#f-prebuilt-backend", Select).value = target_be
-                except Exception:
-                    pass
-
+        self._current_tag = tag
+        self._current_assets = raw_assets
+        self._selected_asset = None
         self._refresh_table()
+        if self.is_mounted:
+            self.query_one("#prebuilt-tag-status", Static).update(
+                Text.from_markup(f"[green]✓ Loaded release {tag} ({len(raw_assets)} assets)[/green]")
+            )
 
     def _refresh_table(self) -> None:
         table = self.query_one("#prebuilt-table", SingleClickDataTable)
         table.clear()
-        recommended = update_check.find_recommended_asset(self._current_assets, self.host_profile, self.target_backend)
 
         for a in self._current_assets:
-            key = a["name"]
-            is_rec = recommended and (a["name"] == recommended["name"])
-            match_str = "[green](Recommended)[/green]" if is_rec else ("[blue]Compatible[/blue]" if a.get("arch") == update_check.detect_host_arch() else "")
-            size_mb = f"{a.get('size', 0) / (1024 * 1024):.0f} MB"
+            name = a.get("name", "")
+            size = a.get("size", 0)
+            if size >= 1024 * 1024:
+                size_str = f"{size / (1024 * 1024):.1f} MB"
+            elif size >= 1024:
+                size_str = f"{size / 1024:.1f} KB"
+            else:
+                size_str = f"{size} B"
+
+            is_selected = (self._selected_asset and self._selected_asset.get("name") == name)
+            status_text = Text("● Selected", style="bold green") if is_selected else Text("")
+
             table.add_row(
-                Text(a.get("label") or a.get("backend", "").upper()),
-                Text(a.get("name", "")),
-                Text(size_mb),
-                Text.from_markup(match_str),
-                *table.action_cells(key),
-                key=key,
+                Text(name),
+                Text(size_str),
+                status_text,
+                *table.action_cells(name),
+                key=name,
             )
 
     def _on_table_action_invoked(self, event: TableActionInvoked) -> None:
         event.stop()
-        match = next((a for a in self._current_assets if a["name"] == event.row_key), None)
+        self._select_asset_by_name(event.row_key)
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        if event.data_table.id == "prebuilt-table" and event.row_key.value:
+            self._select_asset_by_name(event.row_key.value)
+
+    def _select_asset_by_name(self, name: str) -> None:
+        match = next((a for a in self._current_assets if a["name"] == name), None)
         if match:
             self._selected_asset = match
-            target_be = self.target_backend or match.get("backend")
-            if target_be:
-                try:
-                    self.query_one("#f-prebuilt-backend", Select).value = target_be
-                except Exception:
-                    pass
-            cudart_box = self.query_one("#f-prebuilt-cudart", Checkbox)
-            cudart_box.value = bool(match.get("companion_cudart"))
+            size = match.get("size", 0)
+            size_mb = f"{size / (1024 * 1024):.1f} MB" if size >= 1024 * 1024 else f"{size / 1024:.1f} KB"
+            target_str = f" for {self.target_backend}" if self.target_backend else ""
+            self.query_one("#prebuilt-summary", Static).update(
+                f"Selected: {name} ({size_mb}){target_str}"
+            )
+            self._set_error("")
+            self._refresh_table()
 
     def _set_error(self, message: str) -> None:
         if self.is_mounted:
@@ -1199,37 +1183,80 @@ class DownloadPrebuiltModal(ModalScreen[dict[str, Any] | None]):
         elif event.button.id == "btn-prebuilt-load-tag":
             tag = self.query_one("#f-prebuilt-tag", Input).value.strip()
             if tag:
-                self._load_release_tag(tag)
+                self._handle_load_custom_tag(tag)
         elif event.button.id == "btn-prebuilt-download":
             self._confirm_selection()
+
+    def _handle_load_custom_tag(self, tag: str) -> None:
+        rel = next((r for r in self._releases if r.get("tag_name") == tag), None)
+        if rel:
+            self.query_one("#f-prebuilt-release", Select).value = tag
+            self._load_release_tag(tag)
+            return
+
+        self.query_one("#prebuilt-tag-status", Static).update(
+            Text.from_markup(f"[dim]Fetching release {tag} from GitHub...[/dim]")
+        )
+        self._fetch_single_tag(tag)
+
+    @work(thread=True)
+    def _fetch_single_tag(self, tag: str) -> None:
+        repo = self.manifest.get("llama_cpp", {}).get("repo", "https://github.com/ggml-org/llama.cpp")
+        res = update_check.fetch_release_by_tag(repo, tag)
+        if not res.get("ok"):
+            self.app.call_from_thread(self._on_custom_tag_failed, tag, res.get("error", "not found"))
+            return
+        release = res["release"]
+        self.app.call_from_thread(self._on_custom_tag_loaded, tag, release)
+
+    def _on_custom_tag_loaded(self, tag: str, release: dict[str, Any]) -> None:
+        if not self.is_mounted:
+            return
+        self._releases.insert(0, release)
+        options: list[tuple[str, str]] = []
+        for r in self._releases:
+            t = r.get("tag_name") or ""
+            d = (r.get("published_at") or "")[:10]
+            options.append((f"{t} ({d})" if d else t, t))
+        sel = self.query_one("#f-prebuilt-release", Select)
+        sel.set_options(options)
+        sel.value = tag
+        self._load_release_tag(tag)
+
+    def _on_custom_tag_failed(self, tag: str, error: str) -> None:
+        if not self.is_mounted:
+            return
+        self.query_one("#prebuilt-tag-status", Static).update(
+            Text.from_markup(f"[bold red]✗ Release '{tag}' not found: {error}[/bold red]")
+        )
 
     def _confirm_selection(self) -> None:
         if not self._selected_asset:
             self._set_error("select an asset from the table")
             return
-        backend = self.query_one("#f-prebuilt-backend", Select).value
-        if backend is Select.BLANK or not backend:
-            self._set_error("select a target backend")
+        backend = self.target_backend
+        if not backend:
+            self._set_error("target backend missing")
             return
-        include_cudart = self.query_one("#f-prebuilt-cudart", Checkbox).value
-        update_pin = self.query_one("#f-prebuilt-pin", Checkbox).value
 
         repo = self.manifest.get("llama_cpp", {}).get("repo", "https://github.com/ggml-org/llama.cpp")
-        tag = self._selected_asset.get("tag") or "prebuilt"
-        asset_url = self._selected_asset.get("browser_download_url") or update_check.fallback_asset_url(repo, tag, self._selected_asset["name"])
+        tag = self._current_tag or "prebuilt"
+        asset_name = self._selected_asset["name"]
+        asset_url = self._selected_asset.get("browser_download_url") or update_check.fallback_asset_url(repo, tag, asset_name)
 
-        cudart_url = None
-        companion = self._selected_asset.get("companion_cudart")
-        if include_cudart and companion:
-            cudart_url = companion.get("browser_download_url") or update_check.fallback_asset_url(repo, tag, companion["name"])
+        companion_name = f"cudart-{asset_name}"
+        companion = next((a for a in self._current_assets if a.get("name") == companion_name), None)
+        cudart_url = companion.get("browser_download_url") if companion else None
+        if not cudart_url and companion:
+            cudart_url = update_check.fallback_asset_url(repo, tag, companion_name)
 
         self.dismiss({
             "backend": str(backend),
-            "asset_name": self._selected_asset["name"],
+            "asset_name": asset_name,
             "asset_url": asset_url,
             "cudart_url": cudart_url,
             "tag": tag,
-            "update_pin": update_pin,
+            "update_pin": False,
             "gpu_id": self.gpu_id,
         })
 
@@ -1316,8 +1343,7 @@ class BackendDetailModal(ModalScreen[None]):
         self.app_ref = app_ref
 
     def _title(self) -> str:
-        prefix = "EX. " if self._recipe().get("example") else ""
-        return f"{prefix}llama.cpp ({self.backend})"
+        return f"llama.cpp ({self.backend})"
 
     def compose(self) -> ComposeResult:
         with Vertical(id="detail-dialog"):
@@ -1430,7 +1456,6 @@ class BackendDetailModal(ModalScreen[None]):
             f"Update backends.{self.backend}.cmake_flags in manifest.yaml?\n"
             f"- old: {' '.join(old_flags)}\n"
             f"+ new: {' '.join(new_flags)}"
-            + ("\nThis clears the EX. (stock example) mark on this recipe." if was_example else "")
         )
         confirmed = await self.app.push_screen_wait(
             ConfirmModal(message, confirm_label="Save flags", danger=True)
@@ -1572,13 +1597,20 @@ class BuildsScreen(CockpitScreenBase):
             # what's on this host that this toolkit doesn't manage" — the operator's 2026-09-18
             # QA report.
             with Horizontal(classes="action-row-secondary"):
-                yield Button("Add build", id="btn-add-build", classes="thin-button")
-                yield Button("Download prebuilt", id="btn-download-prebuilt", classes="thin-button")
+                yield Button("Add backend", id="btn-add-backend", classes="thin-button")
                 # Hidden by default (DEFAULT_CSS) until _refresh_backends_table finds something —
                 # a scan result behind a button (A2), not an always-visible block, and never
                 # rescanned on click (DESIGN.md §3.0: the scan itself stays in the refresh path).
                 yield Button("Unmanaged builds", id="btn-unmanaged-builds", classes="thin-button")
                 yield Button("Build log", id="btn-build-log", classes="thin-button")
+
+    @staticmethod
+    def _backend_from_row_key(row_key: str) -> str:
+        return row_key.split(":", 1)[1] if ":" in row_key else row_key
+
+    @staticmethod
+    def _gpu_from_row_key(row_key: str) -> str | None:
+        return row_key.split(":", 1)[0] if ":" in row_key else None
 
     def on_mount(self) -> None:
         no_backends = self.query("#no-backends")
@@ -1587,43 +1619,45 @@ class BuildsScreen(CockpitScreenBase):
         backends_table = self.query_one("#backends-table", SingleClickDataTable)
         backends_table.cursor_type = "row"
         backends_table.zebra_stripes = True
-        # The section title already says "llama.cpp" — this column is just the backend name,
-        # with an "EX. " prefix on a still-stock recipe (manifest.yaml backends.<name>.example).
-        # "EX. vulkan" is the longest at 10 chars; width 14 leaves headroom.
-        backends_table.add_column("Backend", width=14)
-        # "build3 · 481c65f09" is 19 chars (identity and version, now separable — Phase 1);
-        # width 20 fits it and "not built".
-        backends_table.add_column("Active build", width=20)
-        # 14 + 20 + 32 + 9 + 8 + 10 = 93 content, render 93 + 2*6 = 105 (DESIGN.md §4.4,
-        # updated in Phase 3 to add [ Builds ]). "update available (d1d3c33ab1)" is 29 chars
-        # and fits; the failure case ("couldn't check (HTTP Error 403: rate limit exceeded)")
-        # is unchanged text and can now clip earlier than at the old width=35 — an accepted
-        # trade for the column budget this phase asks for, not something silently widened back.
-        backends_table.add_column("Status", width=32)
+        # 8 columns: GPU (6) + Backend (9) + Active build (15) + Status (18) + Build (9)
+        # + Prebuilt (12) + Edit (8) + Historical builds (21) = 98 content width.
+        # Total render width = 98 + 2*8 = 114 (strictly <= 115 budget, DESIGN.md §4.2/§4.4).
+        backends_table.add_column("GPU", width=6)
+        backends_table.add_column("Backend", width=9)
+        backends_table.add_column("Active build", width=15)
+        backends_table.add_column("Status", width=18)
         backends_table.add_action_column(
             TableAction(
                 "build",
-                "Build",  # always "Build" (A8) — the confirm dialog says whether it's a rebuild
-                width=9,  # len("Build") + 4
+                "Build",
+                width=9,
                 confirm=self._build_confirm_message,
                 requires_root=True,
-                available=lambda row_key: row_key in self.backends,
+                available=lambda row_key: self._backend_from_row_key(row_key) in self.backends,
+            )
+        )
+        backends_table.add_action_column(
+            TableAction(
+                "prebuilt",
+                "Prebuilt",
+                width=12,
+                available=lambda row_key: self._backend_from_row_key(row_key) in self.backends,
             )
         )
         backends_table.add_action_column(
             TableAction(
                 "info",
-                "Edit",  # relabelled from "Info" this phase; id/handler/modal are Phase 3's
-                width=8,  # len("Edit") + 4
-                available=lambda row_key: row_key in self.backends,
+                "Edit",
+                width=8,
+                available=lambda row_key: self._backend_from_row_key(row_key) in self.backends,
             )
         )
         backends_table.add_action_column(
             TableAction(
                 "builds",
-                "Builds",  # opens BuildsListModal, scoped to this row's backend (Phase 3, A7)
-                width=10,  # len("Builds") + 4
-                available=lambda row_key: row_key in self.backends,
+                "Historical builds",
+                width=21,
+                available=lambda row_key: self._backend_from_row_key(row_key) in self.backends,
             )
         )
 
@@ -1690,15 +1724,16 @@ class BuildsScreen(CockpitScreenBase):
         the same function `_build_backend` uses to configure the real build, so this is
         provably what will run, not a description of it. The `[ Build ]` column is always
         "Build" (A8); this confirm is the one place that still says "Rebuild" when it is one."""
+        backend = self._backend_from_row_key(row_key)
         ref = self.manifest.get("llama_cpp", {}).get("ref", "")
-        label = "Rebuild" if self._is_rebuild(row_key, ref) else "Build"
-        recipe = self.manifest.get("backends", {}).get(row_key, {})
-        prefix = Path(self.host_profile["paths"]["prefix_root"]) / row_key
+        label = "Rebuild" if self._is_rebuild(backend, ref) else "Build"
+        recipe = self.manifest.get("backends", {}).get(backend, {})
+        prefix = Path(self.host_profile["paths"]["prefix_root"]) / backend
         checkout_dir = build_step.checkout_dir_for(self.host_profile)
-        argv = build_step.resolve_cmake_argv(row_key, recipe, checkout_dir, prefix)
+        argv = build_step.resolve_cmake_argv(backend, recipe, checkout_dir, prefix)
         cmd = " ".join(shlex.quote(a) for a in argv)
         return (
-            f"{label} llama.cpp ({row_key}) at version {_short(ref)}?\n{cmd}\n"
+            f"{label} llama.cpp ({backend}) at version {_short(ref)}?\n{cmd}\n"
             f"Installs to {prefix}. This can take several minutes."
         )
 
@@ -1777,24 +1812,29 @@ class BuildsScreen(CockpitScreenBase):
         if no_backends:
             no_backends.first().display = not bool(self.backends)
 
+        deployments: list[tuple[str, str]] = []
+        for gpu in self.host_profile.get("gpus", []):
+            gpu_id = gpu.get("id", "gpu0")
+            for backend in gpu.get("backends", []):
+                deployments.append((gpu_id, backend))
+
+        # Always sort by GPU, then by backend (grouping GPU deployments together)
+        deployments.sort(key=lambda item: (item[0], item[1]))
+
         table = self.query_one("#backends-table", SingleClickDataTable)
         table.clear()
-        for backend in self.backends:
-            # One list_builds() call serves both cells (plans/07 Phase 1 item 4) — this used to
-            # be two per row (one inside the old _active_build_cell, a second the Status column
-            # never even needed because it just copied the global check).
+        for gpu_id, backend in deployments:
             builds = build_step.list_builds(self.host_profile, backend)
             current = self._current_of(builds)
-            # "EX. " marks a still-stock recipe (manifest.yaml backends.<name>.example) — see
-            # BackendDetailModal's Edit view for what it means and how it clears.
-            is_example = bool(self.manifest.get("backends", {}).get(backend, {}).get("example"))
-            backend_label = f"{'EX. ' if is_example else ''}{backend}"
+            backend_label = backend
+            row_key = f"{gpu_id}:{backend}"
             table.add_row(
+                Text(gpu_id),
                 Text(backend_label),
                 self._active_build_cell(current),
                 self._backend_status_cell(backend, builds, current, cpp_ref),
-                *table.action_cells(backend),
-                key=backend,
+                *table.action_cells(row_key),
+                key=row_key,
             )
 
         self._refresh_foreign_builds_button()
@@ -1857,9 +1897,11 @@ class BuildsScreen(CockpitScreenBase):
     # ------------------------------------------------------------------ per-row action dispatch
 
     async def handle_table_action(self, action_id: str, row_key: str, table: DataTable) -> None:
+        backend = self._backend_from_row_key(row_key)
+        gpu_id = self._gpu_from_row_key(row_key)
         if action_id == "info":
             self.app.push_screen(
-                BackendDetailModal(self.host_profile, self.manifest, row_key, self.repo_root, self.app_ref)
+                BackendDetailModal(self.host_profile, self.manifest, backend, self.repo_root, self.app_ref)
             )
             return
         if action_id == "builds":
@@ -1868,12 +1910,16 @@ class BuildsScreen(CockpitScreenBase):
             # callback refreshes because Activate repoints `current`, which `Active build`
             # reports; without it the table would still show the previous build.
             self.app.push_screen(
-                BuildsListModal(self.host_profile, row_key, self.privileged_runner),
+                BuildsListModal(self.host_profile, backend, self.privileged_runner),
                 callback=lambda _: self._refresh_backends_table(),
             )
             return
         if action_id == "build":
-            self._start_backend_build(row_key)
+            self._start_backend_build(backend)
+            return
+        if action_id == "prebuilt":
+            self._open_download_prebuilt_modal(target_backend=backend, gpu_id=gpu_id)
+            return
 
     def _start_backend_build(self, backend: str) -> None:
         if self._building_backends:
@@ -1931,10 +1977,8 @@ class BuildsScreen(CockpitScreenBase):
             self.app.push_screen(InfoModal("Unmanaged builds", self._foreign_builds_text()))
         elif button_id == "btn-swap-update-to-latest":
             self._confirm_and_update_swap()
-        elif button_id == "btn-add-build":
+        elif button_id == "btn-add-backend":
             self._confirm_and_add_deployment()
-        elif button_id == "btn-download-prebuilt":
-            self._open_download_prebuilt_modal()
 
     def _open_log_modal(self, title: str) -> None:
         buffer = list(self._log_buffer)
@@ -2213,31 +2257,16 @@ class BuildsScreen(CockpitScreenBase):
         recipe_flags = self.manifest.get("backends", {}).get(backend, {}).get("cmake_flags", [])
         flags_changed = (edited_flags != recipe_flags)
 
-        if action == "download":
-            # For download, bind the deployment first and launch DownloadPrebuiltModal
-            pass
-        elif action == "build":
-            action_desc = (
-                f"Bind backend {backend!r} to GPU {gpu_id!r} and build llama.cpp?"
-                if not is_already_bound
-                else f"Build llama.cpp ({backend}) on GPU {gpu_id!r}?"
-            )
-            confirmed = await self.confirm(
-                action_desc, confirm_label="Build", mutates_system=True, requires_root=True
-            )
-            if not confirmed:
-                return
-        else:  # "add"
-            action_desc = (
-                f"Bind backend {backend!r} to GPU {gpu_id!r} in hosts/{self.app_ref.host_name}.yaml?"
-                if not is_already_bound
-                else f"Save cmake_flags for backend {backend!r} in manifest.yaml?"
-            )
-            confirmed = await self.app.push_screen_wait(
-                ConfirmModal(action_desc, confirm_label="Save" if is_already_bound else "Add", danger=True)
-            )
-            if not confirmed:
-                return
+        action_desc = (
+            f"Bind backend {backend!r} to GPU {gpu_id!r} in hosts/{self.app_ref.host_name}.yaml?"
+            if not is_already_bound
+            else f"Save cmake_flags for backend {backend!r} in manifest.yaml?"
+        )
+        confirmed = await self.app.push_screen_wait(
+            ConfirmModal(action_desc, confirm_label="Save" if is_already_bound else "Add", danger=True)
+        )
+        if not confirmed:
+            return
 
         manifest_path = getattr(self.app_ref, "manifest_path", self.repo_root / "manifest.yaml")
         if flags_changed and manifest_path.exists():
@@ -2267,11 +2296,6 @@ class BuildsScreen(CockpitScreenBase):
             self.notify(f"backend {backend!r} bound to {gpu_id!r} — hosts/{self.app_ref.host_name}.yaml written")
         elif flags_changed:
             self.notify(f"flags updated for backend {backend!r} — manifest.yaml written")
-
-        if action == "build":
-            self._start_backend_build(backend)
-        elif action == "download":
-            self._open_download_prebuilt_modal(target_backend=backend, gpu_id=gpu_id)
 
     def _open_download_prebuilt_modal(
         self, target_backend: str | None = None, gpu_id: str | None = None

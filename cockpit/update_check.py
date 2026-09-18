@@ -154,6 +154,35 @@ def check_releases(repo_url: str, *, force: bool = False, limit: int = 20) -> di
     return {"ok": True, "releases": releases}
 
 
+def fetch_release_by_tag(repo_url: str, tag: str) -> dict[str, Any]:
+    """Fetch metadata for a single specific GitHub release tag.
+    Returns {"ok": True, "release": {...}} or {"ok": False, "error": str}.
+    """
+    repo = _repo_path(repo_url)
+    clean_tag = tag.strip()
+    try:
+        r = _get_json(f"https://api.github.com/repos/{repo}/releases/tags/{clean_tag}")
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    if not isinstance(r, dict):
+        return {"ok": False, "error": "invalid response from GitHub API"}
+    release = {
+        "tag_name": r.get("tag_name") or clean_tag,
+        "published_at": r.get("published_at"),
+        "name": r.get("name") or r.get("tag_name") or clean_tag,
+        "assets": [
+            {
+                "name": a.get("name"),
+                "size": a.get("size", 0),
+                "browser_download_url": a.get("browser_download_url"),
+            }
+            for a in r.get("assets", [])
+            if isinstance(a, dict) and a.get("name")
+        ],
+    }
+    return {"ok": True, "release": release}
+
+
 _LINUX_ARCH_MAP = {
     "x86_64": "x64",
     "amd64": "x64",
