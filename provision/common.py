@@ -193,6 +193,7 @@ class Runner:
             return
         if self.sudo:
             self.run(["mkdir", "-p", "-m", format(mode, "04o"), str(path)])
+            self.run(["chmod", format(mode, "04o"), str(path)], check=False)
             return
         path.mkdir(parents=True, mode=mode, exist_ok=True)
 

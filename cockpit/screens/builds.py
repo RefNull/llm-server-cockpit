@@ -1638,7 +1638,22 @@ class BuildsScreen(CockpitScreenBase):
             self._confirm_and_add_deployment()
 
     def _open_log_modal(self, title: str) -> None:
-        modal = BuildLogModal(title, self._log_buffer)
+        buffer = list(self._log_buffer)
+        if not buffer and hasattr(self, "host_profile") and self.host_profile:
+            # Fall back to persisted build.log from active or newest build
+            for backend in self.backends:
+                builds = build_step.list_builds(self.host_profile, backend)
+                for b in builds:
+                    log_path = build_step.build_log_path(self.host_profile, backend, b["id"])
+                    if log_path.is_file():
+                        try:
+                            buffer = [f"(loaded persisted log from {log_path})\n"] + log_path.read_text().splitlines()
+                            break
+                        except Exception:
+                            pass
+                if buffer:
+                    break
+        modal = BuildLogModal(title, buffer)
         self._log_modal = modal
         self.app.push_screen(modal, callback=lambda _: self._clear_log_modal(modal))
 
@@ -1916,8 +1931,8 @@ class BuildsScreen(CockpitScreenBase):
                 if not is_already_bound
                 else f"Build llama.cpp ({backend}) on GPU {gpu_id!r}?"
             )
-            confirmed = await self.app.push_screen_wait(
-                ConfirmModal(action_desc, confirm_label="Build", danger=True)
+            confirmed = await self.confirm(
+                action_desc, confirm_label="Build", mutates_system=True, requires_root=True
             )
             if not confirmed:
                 return
@@ -1983,10 +1998,24 @@ class BuildsScreen(CockpitScreenBase):
                 backends=backends, force=force,
             )
         except SystemExit as e:
+            self.app.call_from_thread(
+                self._append_build_log,
+                f"\n[FAILED] Build failed for {', '.join(backends)}: {e}\nClose this modal to inspect.",
+            )
             self.app.call_from_thread(self.app.notify, f"build failed: {e}", severity="error")
         except Exception as e:  # never let a build-time exception crash the whole TUI
+            self.app.call_from_thread(
+                self._append_build_log,
+                f"\n[FAILED] Build failed for {', '.join(backends)}: {e}\nClose this modal to inspect.",
+            )
             self.app.call_from_thread(self.app.notify, f"build failed: {e}", severity="error")
         else:
+            self.app.call_from_thread(
+                self._append_build_log,
+                f"\n[DONE] Build completed successfully for {', '.join(backends)}!\n"
+                "Smoke test passed. Active build symlink updated.\n"
+                "Close this modal to continue.",
+            )
             self.app.call_from_thread(self.app.notify, "build finished")
         finally:
             provision_logger.removeHandler(handler)

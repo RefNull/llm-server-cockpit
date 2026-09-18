@@ -47,23 +47,27 @@ def ensure_smoke_model(host_profile: dict[str, Any], fixture: dict[str, Any], ru
     if dest.exists():
         return dest
 
-    venv_python = state_dir / "venv-hf" / "bin" / "python"
-    if not venv_python.exists():
-        if runner.dry_run:
-            log.info("build: smoke model not cached and venv-hf not present yet — nothing to download under --dry-run")
-            return dest
-        sys.exit(
-            f"build: smoke-test model not cached at {dest} and no hf venv at {venv_python} — "
-            "run `provision hf` first (build depends on hf in the step dependency order)"
-        )
+    if runner.dry_run:
+        log.info("build: smoke model not cached — nothing to download under --dry-run")
+        return dest
 
     runner.mkdir(dest_dir)
-    download = (
-        "from huggingface_hub import hf_hub_download; "
-        f"hf_hub_download(repo_id={fixture['repo_id']!r}, filename={fixture['quant_file']!r}, "
-        f"local_dir={str(dest_dir)!r})"
-    )
-    runner.run([str(venv_python), "-c", download])
+    venv_python = state_dir / "venv-hf" / "bin" / "python"
+    if venv_python.exists():
+        download = (
+            "from huggingface_hub import hf_hub_download; "
+            f"hf_hub_download(repo_id={fixture['repo_id']!r}, filename={fixture['quant_file']!r}, "
+            f"local_dir={str(dest_dir)!r})"
+        )
+        runner.run([str(venv_python), "-c", download])
+    else:
+        # Fallback to direct curl download from Hugging Face when provision hf has not been run
+        url = f"https://huggingface.co/{fixture['repo_id']}/resolve/main/{fixture['quant_file']}"
+        log.info("build: venv-hf not present; downloading smoke model directly from %s", url)
+        runner.run(["curl", "-fsSL", "-o", str(dest), url])
+
+    if dest.exists():
+        runner.run(["chmod", "0644", str(dest)])
     return dest
 
 

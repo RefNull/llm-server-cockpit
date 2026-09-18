@@ -192,28 +192,70 @@ def resolve_build_dir(host_profile: dict[str, Any], backend: str, build_id: str)
     return Path(host_profile["paths"]["prefix_root"]) / backend / build_id
 
 
-def allocate_build_dir(host_profile: dict[str, Any], backend: str) -> Path:
-    """A fresh, never-before-used directory for a new build of this backend: prefix_root/
-    <backend>/build<N>, N = one past the highest existing build<N> (never a filled gap, so
-    it can never collide with a directory pruning left behind). Read-only — it only inspects
-    what is already on disk; nothing is created until the caller actually writes into it
-    (Runner.write_file's own mkdir(parents=True) does that), so this is dry-run-safe by
-    having nothing to gate.
+def extract_manifest_tag(manifest_path: Path, ref: str) -> str | None:
+    """Extract trailing comment tag like `# b10903` from manifest.yaml for this ref."""
+    if not manifest_path.is_file():
+        return None
+    try:
+        text = manifest_path.read_text()
+        m = re.search(r"ref:\s*([0-9a-fA-F]{7,40})\s*#\s*(b\d+)", text)
+        if m and (m.group(1).startswith(ref) or ref.startswith(m.group(1))):
+            return m.group(2)
+    except OSError:
+        pass
+    return None
 
-    Directories not matching build<N> — a legacy `<sha>` build, or `current` itself, which is
-    a symlink and therefore already excluded — are ignored for the purpose of choosing N;
-    they are still visible to list_builds().
+
+def git_tag_for_ref(checkout_dir: Path, ref: str) -> str | None:
+    """Check git tags pointing at ref if local repo checkout exists."""
+    git_dir = checkout_dir / ".git"
+    if not git_dir.exists():
+        return None
+    try:
+        res = subprocess.run(
+            ["git", "-c", "safe.directory=*", "-C", str(checkout_dir), "tag", "--points-at", ref],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=5,
+        )
+        if res.returncode == 0:
+            for line in res.stdout.splitlines():
+                line = line.strip()
+                if re.match(r"^b\d+$", line):
+                    return line
+    except Exception:
+        pass
+    return None
+
+
+def allocate_build_dir(
+    host_profile: dict[str, Any],
+    backend: str,
+    ref: str = "",
+    tag: str | None = None,
+) -> Path:
+    """Install directory for a build of this backend: prefix_root/<backend>/build-<tag_or_ref>.
+    Uses the release tag (e.g. build-b11037) or short commit SHA (e.g. build-481c65f091).
+    Rebuilding the same version updates in place rather than creating build1, build2, etc.
     """
     backend_dir = Path(host_profile["paths"]["prefix_root"]) / backend
-    max_n = 0
-    if backend_dir.is_dir():
-        for d in backend_dir.iterdir():
-            if not d.is_dir() or d.is_symlink():
-                continue
-            m = _BUILD_DIR_RE.match(d.name)
-            if m:
-                max_n = max(max_n, int(m.group(1)))
-    return backend_dir / f"build{max_n + 1}"
+    if tag:
+        clean_tag = tag if not tag.startswith("build-") else tag.removeprefix("build-")
+        build_id = f"build-{clean_tag}"
+    elif ref:
+        if re.match(r"^b\d+$", ref):
+            build_id = f"build-{ref}"
+        else:
+            build_id = f"build-{ref[:10]}"
+    else:
+        max_n = 0
+        if backend_dir.is_dir():
+            for d in backend_dir.iterdir():
+                if not d.is_dir() or d.is_symlink():
+                    continue
+                m = _BUILD_DIR_RE.match(d.name)
+                if m:
+                    max_n = max(max_n, int(m.group(1)))
+        build_id = f"build{max_n + 1}"
+    return backend_dir / build_id
 
 
 def _read_build_metadata(build_dir: Path) -> dict[str, Any] | None:
@@ -266,9 +308,11 @@ def _write_build_record(
         "outcome": outcome,  # "smoke_pass" | "smoke_failed" | "build_failed"
         "detail": detail[:2000],
     }
-    runner.write_file(build_dir / "build-info.json", json.dumps(record, indent=2) + "\n")
+    runner.write_file(build_dir / "build-info.json", json.dumps(record, indent=2) + "\n", mode=0o644)
     if log_lines:
-        runner.write_file(build_dir / "build.log", "\n".join(log_lines) + "\n")
+        runner.write_file(build_dir / "build.log", "\n".join(log_lines) + "\n", mode=0o644)
+    if not runner.dry_run:
+        runner.run(["chmod", "-R", "a+rX", str(build_dir)], check=False)
 
 
 def _find_matching_build(host_profile: dict[str, Any], backend: str, ref: str) -> Path | None:
@@ -362,6 +406,8 @@ def _build_backend(
             if str(cuda_dir) not in cur_path.split(os.pathsep):
                 build_env["PATH"] = f"{cuda_dir}{os.pathsep}{cur_path}"
 
+    runner.mkdir(prefix.parent, mode=0o755)
+
     # cmake --install over hand-copying build-<backend>/bin/: llama.cpp's CMakeLists.txt
     # ships standard install() targets for llama-cli/llama-server/libllama, so this gives a
     # complete, correct prefix layout regardless of which targets a given backend produces.
@@ -397,6 +443,12 @@ def _build_backend(
             env=build_env,
             unset_env=unset_vars,
         )
+
+    if not runner.dry_run:
+        prefix_root = prefix.parent.parent
+        backend_dir = prefix.parent
+        runner.run(["chmod", "a+rx", str(prefix_root), str(backend_dir)], check=False)
+        runner.run(["chmod", "-R", "a+rX", str(prefix)], check=False)
 
 
 def _prune_old_builds(prefix_root: Path, backend: str, retain: int, runner: Runner) -> None:
@@ -603,6 +655,13 @@ def run(
     ref = manifest["llama_cpp"]["ref"]
     retain = host_profile["retain_builds"]
 
+    manifest_path = repo_root / "manifest.yaml"
+    tag = (
+        extract_manifest_tag(manifest_path, ref)
+        or git_tag_for_ref(checkout_dir, ref)
+        or (ref if re.match(r"^b\d+$", ref) else None)
+    )
+
     failed: list[str] = []
     for backend in backends:
         log.info("build: === backend %s ===", backend)
@@ -619,12 +678,7 @@ def run(
             prefix = matched
             log.info("build[%s]: %s already built and sane at %s, skipping build", backend, ref, prefix)
         else:
-            # A fresh directory per build (never the same one twice, even at the same ref)
-            # is the whole point of this phase — see resolve_build_dir/allocate_build_dir's
-            # docstrings. Capture this build's output here, around the call, rather than
-            # inside _build_backend: that keeps _build_backend's signature — and its two
-            # direct callers in smoke/verify_build_pin.py — unchanged.
-            prefix = allocate_build_dir(host_profile, backend)
+            prefix = allocate_build_dir(host_profile, backend, ref=ref, tag=tag)
             original_on_output = runner.on_output
 
             def _capture(line: str, _orig=original_on_output) -> None:

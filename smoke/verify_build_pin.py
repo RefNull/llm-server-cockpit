@@ -49,7 +49,7 @@ bootstrap.add_venv_site_packages(_REPO_ROOT)
 
 from cockpit.screens.builds import _short, _write_manifest_cmake_flags, _write_manifest_ref  # noqa: E402
 from cockpit.widgets import TableAction  # noqa: E402
-from provision import schema  # noqa: E402
+from provision import schema, smoke as smoke_step  # noqa: E402
 from provision.common import Runner  # noqa: E402
 from provision.steps import build as build_step, swap as swap_step  # noqa: E402
 from textual._context import active_app  # noqa: E402
@@ -229,10 +229,8 @@ def _make_failed_dir(path: Path) -> None:
 
 
 def verify_sequential_dirs_two_force_builds_first_unmodified() -> None:
-    """A7's whole point: force=True twice at the SAME ref must produce two directories, and
-    the first must not be touched by the second. Proven directly, not inferred — including
-    that build1's own files (its build-info.json, its build.log, its fake binaries) are
-    byte-identical before and after the second build runs."""
+    """Build directory naming: uses build-<tag> or build-<sha>. A force=True build of the same
+    version updates in place as a rebuild, while a different ref creates a new directory."""
     with tempfile.TemporaryDirectory() as td:
         tmp_root = Path(td)
         host_profile, manifest, models, ref = _fixture(tmp_root)
@@ -250,37 +248,33 @@ def verify_sequential_dirs_two_force_builds_first_unmodified() -> None:
         build_step.ensure_smoke_model = lambda *a, **k: model_path
         build_step.run_smoke_test = lambda *a, **k: (True, "ok")
         try:
-            # CapturingRunner: no real git clone/rm, same as _run_with_force above — but
-            # write_file/mkdir/atomic_symlink are NOT overridden by it, so build-info.json,
-            # build.log and the fake binaries this test inspects are real files on disk.
             runner = CapturingRunner()
             build_step.run(host_profile, manifest, models, runner, _REPO_ROOT, backends=["cuda"], force=True)
 
             backend_dir = Path(host_profile["paths"]["prefix_root"]) / "cuda"
             dirs_after_first = sorted(p.name for p in backend_dir.iterdir() if p.is_dir() and not p.is_symlink())
-            assert dirs_after_first == ["build1"], f"expected exactly one build dir after the first build, got {dirs_after_first}"
-            build1 = backend_dir / "build1"
-            snapshot = {
-                p: p.read_bytes() for p in build1.rglob("*") if p.is_file()
-            }
-            assert snapshot, "build1 has no files to compare — fixture is broken"
-            mtime_before = build1.stat().st_mtime
+            expected_id = f"build-{ref[:10]}"
+            assert dirs_after_first == [expected_id], f"expected [{expected_id}], got {dirs_after_first}"
 
+            # Rebuild at same ref updates in-place
             build_step.run(host_profile, manifest, models, runner, _REPO_ROOT, backends=["cuda"], force=True)
-
             dirs_after_second = sorted(p.name for p in backend_dir.iterdir() if p.is_dir() and not p.is_symlink())
-            assert dirs_after_second == ["build1", "build2"], (
-                f"a second force=True build at the same ref must allocate a NEW directory, "
-                f"not reuse or remove the first: got {dirs_after_second}"
+            assert dirs_after_second == [expected_id], f"rebuild should update in place, got {dirs_after_second}"
+
+            # Build at a different ref allocates a new build directory
+            ref2 = "b" * 40
+            manifest["llama_cpp"]["ref"] = ref2
+            build_step.run(host_profile, manifest, models, runner, _REPO_ROOT, backends=["cuda"], force=True)
+            dirs_after_third = sorted(p.name for p in backend_dir.iterdir() if p.is_dir() and not p.is_symlink())
+            expected_id2 = f"build-{ref2[:10]}"
+            assert dirs_after_third == sorted([expected_id, expected_id2]), (
+                f"expected [{expected_id}, {expected_id2}], got {dirs_after_third}"
             )
-            assert build1.stat().st_mtime == mtime_before, "build1's directory mtime changed — it was touched"
-            after_snapshot = {p: p.read_bytes() for p in build1.rglob("*") if p.is_file()}
-            assert after_snapshot == snapshot, "build1's file contents changed after the second build"
         finally:
             build_step._build_backend = orig_build_backend
             build_step.ensure_smoke_model = orig_ensure_model
             build_step.run_smoke_test = orig_run_smoke
-    print("verify_build_pin: two force=True builds at the same ref -> two directories, first untouched — OK")
+    print("verify_build_pin: build naming uses build-<version> and rebuilds in place — OK")
 
 
 def verify_list_builds_shape_and_legacy() -> None:
@@ -994,6 +988,41 @@ def verify_fetch_checkout_existing_dir() -> None:
     print("verify_build_pin: fetch_checkout on existing repo fetches without cloning — OK")
 
 
+def verify_extract_manifest_tag() -> None:
+    """extract_manifest_tag parses trailing '# bNNNN' comment tags from manifest.yaml ref lines."""
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "manifest.yaml"
+        p.write_text("llama_cpp:\n  ref: 71dc5df04ecbc38d1844e1cba5fbfe42cce49bb3 # b4771\n")
+        assert build_step.extract_manifest_tag(p, "71dc5df04ecbc38d1844e1cba5fbfe42cce49bb3") == "b4771"
+        assert build_step.extract_manifest_tag(p, "unknown_ref") is None
+    print("verify_build_pin: extract_manifest_tag parses comment tag correctly — OK")
+
+
+def verify_ensure_smoke_model_fallback() -> None:
+    """When venv-hf is absent, ensure_smoke_model falls back to direct curl download rather than aborting."""
+    calls: list[list[str]] = []
+
+    class _CapRunner(Runner):
+        def run(self, cmd, **kwargs):
+            calls.append(list(cmd))
+            return None
+
+        def mkdir(self, path, **kwargs):
+            return None
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        hp = {"paths": {"models": str(root / "models"), "state_dir": str(root / "state")}}
+        fixture = {"repo_id": "ggml-org/models", "quant_file": "smoke.gguf"}
+        runner = _CapRunner()
+        dest = smoke_step.ensure_smoke_model(hp, fixture, runner)
+        assert dest == root / "state" / "smoke-model" / "smoke.gguf"
+        assert any("curl" in c for c in calls), f"curl was not called when venv-hf is absent: {calls}"
+        url = "https://huggingface.co/ggml-org/models/resolve/main/smoke.gguf"
+        assert any(url in c for c in calls), f"expected {url} in curl call, got: {calls}"
+    print("verify_build_pin: ensure_smoke_model falls back to curl when venv-hf missing — OK")
+
+
 def verify_missing_manifest_fails_with_remedy() -> None:
     """A missing manifest.yaml must fail with ValidationError naming the remedy:
     copying manifest.example.yaml."""
@@ -1212,6 +1241,8 @@ def main() -> None:
     verify_update_does_not_make_stale_build_read_up_to_date()
     verify_fetch_checkout_idempotent()
     verify_fetch_checkout_existing_dir()
+    verify_extract_manifest_tag()
+    verify_ensure_smoke_model_fallback()
     print("verify_build_pin: all checks passed")
 
 
