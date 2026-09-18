@@ -229,7 +229,10 @@ def try_load_host_profile(path: Path, manifest: dict | None = None) -> dict | No
 
 def load_manifest(path: Path) -> dict:
     if not path.exists():
-        raise ValidationError(f"no manifest at {path}")
+        raise ValidationError(
+            f"no manifest at {path} — create manifest.yaml for this machine "
+            "(copy manifest.example.yaml to get started)"
+        )
     data = _load_yaml(path)
     validate_manifest_dict(data, source=str(path))
     return data

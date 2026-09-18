@@ -31,6 +31,7 @@ sys.path.insert(0, str(_REPO_ROOT))
 
 try:
     from cockpit.app import CockpitApp  # noqa: E402
+    from provision.schema import ValidationError  # noqa: E402
 except ImportError as e:
     sys.exit(
         f"missing dependency ({e}). Set up the tool's venv first:\n"
@@ -60,7 +61,12 @@ def main() -> None:
         # even though --sudo is still in argv.
         os.execvp("sudo", ["sudo", "-E", sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]])
 
-    CockpitApp(host=args.host).run()
+    try:
+        app = CockpitApp(host=args.host)
+    except ValidationError as e:
+        sys.exit(f"error: {e}")
+
+    app.run()
 
 
 if __name__ == "__main__":

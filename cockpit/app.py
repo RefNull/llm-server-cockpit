@@ -177,17 +177,23 @@ class CockpitApp(App):
     # 120 while CockpitHeader's side margin was 2; moving that margin to $space-edge moved this.
     HORIZONTAL_BREAKPOINTS: ClassVar[list[tuple[int, str]]] = [(0, "-narrow"), (121, "-wide")]
 
-    def __init__(self, host: str | None = None) -> None:
+    def __init__(self, host: str | None = None, manifest_path: Path | None = None) -> None:
         super().__init__()
         self.register_theme(AMBER_THEME)
         self.theme = "cockpit-amber"
         self.host_name = host or socket.gethostname()
         self.repo_root = REPO_ROOT
+        if manifest_path is not None:
+            self.manifest_path = Path(manifest_path)
+        elif self.host_name == "example":
+            self.manifest_path = REPO_ROOT / "manifest.example.yaml"
+        else:
+            self.manifest_path = REPO_ROOT / "manifest.yaml"
         # Manifest first: try_load_host_profile validates gpus[].backends against
         # manifest["backends"] (provision/schema.py), so it needs the manifest already loaded.
         # This does not change the first-run case — try_load_host_profile returns None before
         # ever consulting the manifest when hosts/<host>.yaml does not exist yet.
-        self.manifest = schema.load_manifest(REPO_ROOT / "manifest.yaml")
+        self.manifest = schema.load_manifest(self.manifest_path)
         self.host_profile = schema.try_load_host_profile(REPO_ROOT / "hosts" / f"{self.host_name}.yaml", self.manifest)
         if self.host_profile is not None:
             try:
@@ -285,7 +291,7 @@ class CockpitApp(App):
         until the app restarts.
         """
         try:
-            self.manifest = schema.load_manifest(self.repo_root / "manifest.yaml")
+            self.manifest = schema.load_manifest(self.manifest_path)
         except schema.ValidationError as e:
             self.notify(f"manifest.yaml error: {e}", severity="error")
 

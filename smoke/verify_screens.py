@@ -504,7 +504,7 @@ async def _assert_backend_detail_modal(app: CockpitApp, pilot, context: str) -> 
     host_profile = copy.deepcopy(app.host_profile)
     host_profile["paths"]["prefix_root"] = "/opt/llm-server/builds"
     backend = "cuda"
-    assert backend in app.manifest.get("backends", {}), "fixture assumption: manifest.yaml has no 'cuda' backend"
+    assert backend in app.manifest.get("backends", {}), "fixture assumption: manifest.example.yaml has no 'cuda' backend"
 
     modal = BackendDetailModal(host_profile, app.manifest, backend, app.repo_root, app)
     app.push_screen(modal)

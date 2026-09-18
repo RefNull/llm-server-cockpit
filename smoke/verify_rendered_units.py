@@ -281,7 +281,7 @@ def check_systemd_metacharacter_escaping() -> None:
 def check_llama_swap_config() -> None:
     """config.yaml is llama-swap's, not systemd's — `${PORT}` there is a llama-swap placeholder
     that must survive verbatim. The systemd escaping above must never reach this file."""
-    manifest = schema.load_manifest(_REPO_ROOT / "manifest.yaml")
+    manifest = schema.load_manifest(_REPO_ROOT / "manifest.example.yaml")
     host_profile = schema.load_host_profile(_REPO_ROOT / "hosts" / "example.yaml", manifest)
     models = schema.load_models(_REPO_ROOT / "models.example.yaml", host_profile, manifest)
 

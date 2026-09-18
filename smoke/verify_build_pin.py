@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Phase 2 verification (plans/05-qa-remediation-pass.md), extended by the 2026-09-18
-follow-up: manifest.yaml pin-write and cmake_flags-write safety, force=True/False build
+follow-up: manifest pin-write and cmake_flags-write safety, force=True/False build
 semantics, and the shared cmake-composition function the follow-up introduced.
 
-Things nothing else in the repo checked before this phase made manifest.yaml writable from
+Things nothing else in the repo checked before this phase made manifest files writable from
 the cockpit for the first time:
 
 1. The header comment block and the `# bNNNNN` trailing comment on llama_cpp.ref must survive a
@@ -71,11 +71,11 @@ class CapturingRunner(Runner):
 
 
 def verify_manifest_roundtrip() -> None:
-    """manifest.yaml's header comment block and the ref: line's trailing comment survive a pin
+    """manifest.example.yaml's header comment block and the ref: line's trailing comment survive a pin
     write, and nothing else in the file changes."""
-    original = (_REPO_ROOT / "manifest.yaml").read_text()
+    original = (_REPO_ROOT / "manifest.example.yaml").read_text()
     header = original.split("llama_cpp:")[0]
-    assert header.startswith("# Version pins"), "fixture assumption broken: manifest.yaml's own header changed"
+    assert header.startswith("# Version pins"), "fixture assumption broken: manifest.example.yaml's own header changed"
 
     with tempfile.TemporaryDirectory() as td:
         # Case 1: a new ref with a known comment (the "Change version" / resolved-release path).
@@ -99,7 +99,7 @@ def verify_manifest_roundtrip() -> None:
         assert new_ref in after2, "new ref was not written"
         _assert_only_ref_line_changed(original, after2)
 
-    print("verify_build_pin: manifest.yaml header + trailing comment survive a pin write — OK")
+    print("verify_build_pin: manifest header + trailing comment survive a pin write — OK")
 
 
 def _assert_only_ref_line_changed(before: str, after: str) -> None:
@@ -121,11 +121,11 @@ def verify_write_manifest_ref_rejects_non_sha() -> None:
     means a build id can now reach this function through a caller that forgot to resolve it to
     a real ref first. Before this guard, `_MANIFEST_REF_RE` only constrained the *existing*
     line being replaced — an incoming non-SHA `new_ref` substituted cleanly and reported
-    success while writing garbage into manifest.yaml's `ref:` line. This is exactly the class of
+    success while writing garbage into manifest ref: line. This is exactly the class of
     bug the contract calls out as needing to have been seen failing, so it is asserted first."""
-    original = (_REPO_ROOT / "manifest.yaml").read_text()
+    original = (_REPO_ROOT / "manifest.example.yaml").read_text()
     with tempfile.TemporaryDirectory() as td:
-        tmp = Path(td) / "manifest.yaml"
+        tmp = Path(td) / "manifest.example.yaml"
         tmp.write_text(original)
         before = tmp.read_text()
 
@@ -557,18 +557,18 @@ def verify_cmake_flags_roundtrip_order_independent() -> None:
 
 
 def verify_cmake_flags_roundtrip_real_manifest() -> None:
-    """The real manifest.yaml: header, every sibling backend, and cuda's own apt_packages
+    """The manifest.example.yaml: header, every sibling backend, and cuda's own apt_packages
     comment must survive a cmake_flags rewrite targeting cuda. Also covers the 2026-09-18
     follow-up's `example: true` mark: a plain rewrite (clear_example=False, the default)
     must leave it in place — the mark means "still stock", and this call doesn't claim to
     know whether the new flags are still stock or not, so it must not touch the key."""
-    original = (_REPO_ROOT / "manifest.yaml").read_text()
+    original = (_REPO_ROOT / "manifest.example.yaml").read_text()
     header = original.split("llama_cpp:")[0]
     assert "example: true" in original.split("vulkan:")[0].split("cuda:")[1], (
-        "fixture assumption broken: manifest.yaml's cuda recipe no longer has example: true"
+        "fixture assumption broken: manifest.example.yaml's cuda recipe no longer has example: true"
     )
     with tempfile.TemporaryDirectory() as td:
-        tmp = Path(td) / "manifest.yaml"
+        tmp = Path(td) / "manifest.example.yaml"
         tmp.write_text(original)
         new_flags = ["-DGGML_CUDA=ON", "-DGGML_NATIVE=OFF", "-DLLAMA_BUILD_TESTS=OFF"]
         _write_manifest_cmake_flags(tmp, "cuda", new_flags)
@@ -588,7 +588,7 @@ def verify_cmake_flags_roundtrip_real_manifest() -> None:
         assert "481c65f091f74c5e7089dd0a3a1cc6b50cced31e  # b10903" in after, (
             "llama_cpp.ref was disturbed by a cmake_flags-only rewrite"
         )
-    print("verify_build_pin: real manifest.yaml survives a cmake_flags rewrite, example: true intact — OK")
+    print("verify_build_pin: real manifest survives a cmake_flags rewrite, example: true intact — OK")
 
 
 def verify_example_mark_cleared_on_request() -> None:
@@ -596,10 +596,10 @@ def verify_example_mark_cleared_on_request() -> None:
     cuda's block, and only cuda's — every sibling backend's own `example: true` (rocm,
     vulkan, sycl all ship one) must survive untouched, proving the removal is bounded to
     the target backend's block the same way the cmake_flags rewrite itself is."""
-    original = (_REPO_ROOT / "manifest.yaml").read_text()
+    original = (_REPO_ROOT / "manifest.example.yaml").read_text()
     header = original.split("llama_cpp:")[0]
     with tempfile.TemporaryDirectory() as td:
-        tmp = Path(td) / "manifest.yaml"
+        tmp = Path(td) / "manifest.example.yaml"
         tmp.write_text(original)
         new_flags = ["-DGGML_CUDA=ON", "-DGGML_NATIVE=OFF", "-DLLAMA_BUILD_TESTS=OFF"]
         _write_manifest_cmake_flags(tmp, "cuda", new_flags, clear_example=True)
@@ -638,7 +638,7 @@ def _minimal_valid_host_profile(backends: list[str]) -> dict:
 
 
 def verify_backend_names_derive_from_manifest() -> None:
-    """2026-09-18 operator QA: a backend recipe added only to manifest.yaml (not one of the
+    """2026-09-18 operator QA: a backend recipe added only to a manifest (not one of the
     historical cuda/rocm/vulkan/sycl four) must be immediately bindable — validate_host_
     profile_dict must accept it when given that manifest's backends, and still reject a name
     in no manifest at all. Also proves the documented no-manifest contract: known_backends=
@@ -668,7 +668,7 @@ def verify_backend_names_derive_from_manifest() -> None:
     schema.validate_host_profile_dict(profile_bogus, known_backends=None)
 
     print(
-        "verify_build_pin: backend names derive from manifest.yaml — a manifest-only backend "
+        "verify_build_pin: backend names derive from manifest — a manifest-only backend "
         "is accepted, an unknown one is rejected, and known_backends=None defers (doesn't "
         "fall back) — OK"
     )
@@ -677,7 +677,7 @@ def verify_backend_names_derive_from_manifest() -> None:
 def verify_cmake_flags_write_aborts_on_bad_backend() -> None:
     """No block to find -> raise, never write a null/partial result."""
     with tempfile.TemporaryDirectory() as td:
-        tmp = Path(td) / "manifest.yaml"
+        tmp = Path(td) / "manifest.example.yaml"
         tmp.write_text(_FIXTURE_APT_FIRST)
         before = tmp.read_text()
         try:
@@ -694,13 +694,13 @@ def verify_cmake_flags_write_aborts_on_bad_backend() -> None:
 
 def verify_resolve_cmake_argv_matches_build() -> None:
     """resolve_cmake_argv/resolve_cmake_flags are what BackendDetailModal and the Build confirm
-    now display — this locks their output for the manifest.yaml backends actually in use
+    now display — this locks their output for the manifest backends actually in use
     (cuda, vulkan) so a future change to the composition is a visible diff here, not silent
     drift between 'what is shown' and 'what runs' (there is only one function now; this test
     is a regression guard on its shape, not a drift detector between two copies)."""
     import yaml as _yaml
 
-    manifest_dict = _yaml.safe_load((_REPO_ROOT / "manifest.yaml").read_text())
+    manifest_dict = _yaml.safe_load((_REPO_ROOT / "manifest.example.yaml").read_text())
     host_profile = {"paths": {"state_dir": "/var/lib/llm-server", "prefix_root": "/opt/llm-server/builds"}}
     checkout_dir = build_step.checkout_dir_for(host_profile)
     assert checkout_dir == Path("/var/lib/llm-server/src/llama.cpp")
@@ -924,7 +924,24 @@ def verify_fetch_checkout_idempotent() -> None:
     print("verify_build_pin: fetch_checkout runs no git command on a second call at the same ref — OK")
 
 
+def verify_missing_manifest_fails_with_remedy() -> None:
+    """A missing manifest.yaml must fail with ValidationError naming the remedy:
+    copying manifest.example.yaml."""
+    with tempfile.TemporaryDirectory() as td:
+        missing_path = Path(td) / "manifest.yaml"
+        raised = False
+        try:
+            schema.load_manifest(missing_path)
+        except schema.ValidationError as e:
+            raised = True
+            msg = str(e)
+            assert "manifest.example.yaml" in msg, f"remedy missing from error: {msg!r}"
+        assert raised, "load_manifest succeeded for a non-existent manifest"
+    print("verify_build_pin: missing manifest.yaml fails with remedy — OK")
+
+
 def main() -> None:
+    verify_missing_manifest_fails_with_remedy()
     verify_manifest_roundtrip()
     verify_write_manifest_ref_rejects_non_sha()
     verify_force_flag()
