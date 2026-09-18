@@ -131,7 +131,7 @@ Cockpit starts in **dry-run mode** by default to prevent accidental mutations. K
 
 - **Dashboard**: Static system inventory — board, CPU, memory, OS, kernel and the accelerators declared in the host profile with their recorded driver versions — beside a standardised list of deployed services and whether each is running. Read-only, no controls. Deliberately **not** a monitor: no CPU/RAM/GPU utilization, live or on demand. Host monitoring belongs to a monitoring stack.
 - **First Setup / Settings**: Bootstraps a new host profile if missing. Configures network bindings, displays live VPN IPv4 resolution, inspects Wake-on-LAN hardware state, audits GPU driver drift against lockfiles, and configures systemd restart policies and scheduled timers.
-- **Installs**: Displays per-backend compilation status, versioned build directories (`/opt/llm-server-cockpit/builds/<backend>/<ref>`), one-click atomic rollback of the `current` symlink to retained builds, real-inference smoke test log history (`build-history.jsonl`), and upstream version comparison against pinned releases.
+- **Installs**: Two sections. *Llama-swap* shows its installed version, update status, binary path and systemd unit, with an update action. *Llama.cpp* shows the pinned version and one row per declared backend — its active build, upstream status, and per-row Build / Edit / Builds actions. Each build gets its own directory (`<prefix_root>/<backend>/build<N>`) carrying the config it was built with and its log, so a rebuild never overwrites its predecessor; the Builds list activates, inspects or removes them, and `current` is an atomic symlink flip.
 - **Deploy**: Model catalog management (`models.yaml`). Form inputs constrain GPU and backend selection strictly to hardware declared in the host profile. Features real-time `config.yaml` syntax preview, staging validation, and atomic service restart.
 - **Downloads**: View Hugging Face download status, trigger asynchronous GGUF snapshot downloads, verify checksums, and monitor storage utilization under `paths.models_dir`.
 
@@ -226,7 +226,7 @@ hf:
   token_env: HF_TOKEN
 ```
 
-**Where builds actually live.** Compiled backends go under `paths.prefix_root` only — `<prefix_root>/<backend>/<ref>`, activated by an atomic `current` symlink once a real-inference smoke test passes. This toolkit never reads or writes `/opt/llama.cpp`, and the per-backend rows in the Installs tab are the backends declared in `gpus[].backends` above, **not filesystem discoveries**. A hand-built tree elsewhere on disk is reported read-only in a note beneath that table; it is never adopted, built, pruned, or executed.
+**Where builds actually live.** Compiled backends go under `paths.prefix_root` only — `<prefix_root>/<backend>/build<N>`, one directory per build, activated by an atomic `current` symlink once a real-inference smoke test passes. Each directory holds `build-info.json` (the ref built, the exact cmake flags and resolved argv used, outcome) and `build.log`, so what a build was made of survives the build. `retain_builds` is a disk budget over *installed* builds — failed attempts are kept separately and cheaply, and never evict a working build. This toolkit never reads or writes `/opt/llama.cpp`, and the per-backend rows in the Installs tab are the backends declared in `gpus[].backends` above, **not filesystem discoveries**. A hand-built tree elsewhere on disk is reported read-only in a note beneath that table; it is never adopted, built, pruned, or executed.
 
 ### 3. Model Catalog (`models.yaml`)
 
@@ -300,7 +300,7 @@ Every compiled `llama.cpp` backend binary must pass a live inference smoke test 
   llama-cli -m <model> -p "Q: What is the capital of France?\nA:" -n 32 -no-cnv --temp 0 -ngl 999
   ```
 - **Gate Criterion**: The test asserts exit code `0` and validates that `Paris` appears in the generated text.
-- **Safety Guarantee**: If inference fails or times out (300s), the `current` symlink is left pointing to the previous working build, the failure is logged to `build-history.jsonl`, and deployment terminates before touching the running service.
+- **Safety Guarantee**: If inference fails or times out (300s), the `current` symlink is left pointing to the previous working build, the failure is recorded in that build's own `build-info.json` alongside its `build.log`, and deployment terminates before touching the running service.
 
 ## Security & Privilege Model
 

@@ -1,6 +1,13 @@
 # Plan: QA Remediation Pass — build pipeline, WOL regression, add-model form
 
 Baseline: HEAD `af1985a` (`feat(deploy): llama-swap running status, and Start/Stop on Resident`).
+
+> **Superseded in part.** This plan describes `af1985a`..`63e1c45`. Its Phase 2 UI
+> decisions — the Version column, the floating version/source notes, the What/Where/How
+> detail modal, and the Retained Builds / Build History split — were reworked by
+> `plans/06-backends-rework.md` after operator QA on 2026-09-18 found the tab had
+> "ballooned". Its `build.py` line citations no longer match the file. The Phase 0
+> findings and the WOL, add-model-form and Dashboard work all still stand.
 Source: operator QA review of the running build on `haupe-server`, 2026-09-17, plus the
 `wol-fix-steps` repair transcript.
 

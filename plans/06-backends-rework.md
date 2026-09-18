@@ -69,6 +69,12 @@ operator would be told the pin changed when it did not.
 
 **Fix the validation regardless of A7**: `_write_manifest_ref` must reject a non-SHA.
 
+> **Correction, 2026-09-18.** Half of this was already fixed before Phase 3 reached it: the
+> `_populate_local` line now reads `b.get("version")`, changed in `d925e91`'s compat pass
+> when Phase 1 landed, which this section was written before and never updated. Phase 3's
+> worker found that and declined to claim the no-op. Only the `_write_manifest_ref` guard
+> was still outstanding; it landed in `cb34852`.
+
 ### 0c. Build logs are never persisted
 
 In-memory only, and **wiped at the start of every build** (`builds.py:1228` resets
