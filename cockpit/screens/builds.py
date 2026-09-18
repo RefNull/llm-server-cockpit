@@ -1,7 +1,7 @@
-"""Installs tab: per-backend llama.cpp build state, retained-build/rollback controls, and a
-manual upstream-version check. A thin view + confirm layer over provision.steps.build and
-cockpit.update_check — no build/rollback/version-check logic lives here, only rendering and
-the ConfirmModal gate in front of every mutating call.
+"""Installs tab: per-backend llama.cpp build state, a per-backend Builds list (activate/config/
+log/remove a specific build), and a manual upstream-version check. A thin view + confirm layer
+over provision.steps.build and cockpit.update_check — no build/rollback/version-check logic
+lives here, only rendering and the ConfirmModal gate in front of every mutating call.
 """
 from __future__ import annotations
 
@@ -22,7 +22,6 @@ from textual.widgets import Button, DataTable, Input, RichLog, Static, TextArea
 
 from cockpit import update_check
 from cockpit.widgets import (
-    CockpitDataTable,
     CockpitScreenBase,
     ConfirmModal,
     InfoModal,
@@ -54,9 +53,27 @@ def _short(ref: str | None) -> str:
 # Phase 2 item 8).
 _MANIFEST_REF_RE = re.compile(r"^(\s*ref:\s*)([0-9a-fA-F]{7,40})(\s*#.*)?$", re.MULTILINE)
 
+# Same bound _MANIFEST_REF_RE already puts on the *existing* line, and the same convention
+# ChangeVersionModal._select_manual uses for a pasted ref — one definition of "looks like a
+# commit SHA", not a second one invented here.
+_SHA_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
+
 
 def _write_manifest_ref(path: Path, new_ref: str, new_comment: str | None = None) -> None:
-    """Rewrite manifest.yaml's `llama_cpp.ref` line in place, byte-identical otherwise."""
+    """Rewrite manifest.yaml's `llama_cpp.ref` line in place, byte-identical otherwise.
+
+    Validates `new_ref` BEFORE touching the file (plans/06 §0b, a live bug): `_MANIFEST_REF_RE`
+    only ever constrained the line being *replaced*, never the incoming value, so a caller that
+    handed this a build directory id (e.g. "build3" — meaningful since Phase 1, when a build's
+    directory name stopped being its version) would substitute cleanly and report success while
+    writing a non-SHA into manifest.yaml's `ref:` line. Same validate-before-write discipline
+    `_write_manifest_llama_swap_version` already uses for its own pin.
+    """
+    if not _SHA_RE.fullmatch(new_ref):
+        raise ValueError(
+            f"{new_ref!r} does not look like a commit SHA (expected 7-40 hex chars) — "
+            "refusing to write manifest.yaml"
+        )
     text = path.read_text()
 
     def _sub(m: re.Match[str]) -> str:
@@ -318,215 +335,211 @@ class BuildLogModal(ModalScreen[None]):
             self.dismiss(None)
 
 
-class BuildHistoryModal(ModalScreen[None]):
-    """Modal displaying recent build history entries."""
+class BuildsListModal(ModalScreen[None]):
+    """One backend's build inventory (plans/06 Phase 3, A7) — replaces both the old
+    RetainedBuildsModal (rollback/remove) and BuildHistoryModal (a separate, JSONL-backed view
+    of the same builds under a different name). Scoped to one backend, opened from that row's
+    `[ Builds ]` action, which is what removes the need for a Backend column here and is why
+    this fits inside a modal dialog where the always-visible two-backend combined table used to
+    need 115 cells: one row per build_step.list_builds() entry, not one per (backend, build).
 
-    BINDINGS = [("escape", "dismiss_modal", "Close")]
+    Per row: the build's directory id, the version it was built at, whether it is active and
+    sane (one Status cell — "active"/"built"/"NOT SANE", never "retained": operator decision
+    plans/06 §0h-1, pruning is automatic and not a thing the operator manages), its outcome and
+    timestamp, and four actions:
+      - Activate: build_step.rollback() by id — never by version (plans/06 §0a: a build's
+        directory id is what identifies it now, its version is a separate, non-unique field).
+      - Config: the build's own build-info.json (ref, cmake_flags, argv, outcome, timestamp) —
+        the operator's "link to respective build's config as it was used" — via InfoModal.
+      - Log: the persisted compile log (build_step.build_log_path) — the operator's "and build
+        log" — via InfoModal. Distinct from BuildLogModal, which is the *live* transcript of a
+        build in progress; this reads whatever Phase 1 already wrote to disk for a past build.
+      - Remove: manual "this build is known-bad, delete it now" — distinct from
+        _prune_old_builds' automatic disk-space budget, which stays silent and untouched by this
+        modal. Guarded against removing whatever `current` points at (build_step.remove_build
+        re-checks this itself; _can_remove is the UI-level mirror of the same guard, not a
+        substitute for it).
 
-    DEFAULT_CSS = """
-    BuildHistoryModal {
-        align: center middle;
-    }
-    #history-dialog {
-        width: 90%;
-        height: 80%;
-        border: thick $background 80%;
-        background: $surface;
-        padding: $space-normal $space-section;
-    }
-    #history-header {
-        height: auto;
-        margin-bottom: $space-normal;
-    }
-    #history-title {
-        width: 1fr;
-        text-style: bold;
-    }
-    #history-table {
-        height: 1fr;
-        margin-bottom: $space-normal;
-    }
-    """
-
-    def __init__(self, host_profile: dict, backends: list[str]) -> None:
-        super().__init__()
-        self.host_profile = host_profile
-        self.backends = backends
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="history-dialog"):
-            with Horizontal(id="history-header"):
-                yield Static("Recent Build History", id="history-title")
-                yield Button("×", id="history-close", classes="close-button", variant="error")
-            table = CockpitDataTable(id="history-table", zebra_stripes=True)
-            table.cursor_type = "row"
-            yield table
-            with Horizontal(classes="action-row-secondary"):
-                yield Button("Close", id="btn-history-close-bottom", classes="thin-button")
-
-    def on_mount(self) -> None:
-        table = self.query_one("#history-table", CockpitDataTable)
-        table.add_column("Backend", width=12)
-        table.add_column("Timestamp (UTC)", width=22)
-        table.add_column("Outcome", width=16)
-        table.add_column("Detail", width=40)
-
-        all_history: list[tuple[str, dict]] = []
-        for backend in self.backends:
-            history = build_step.read_build_history(self.host_profile, backend, limit=10)
-            for h in history:
-                all_history.append((backend, h))
-        all_history.sort(key=lambda item: item[1].get("timestamp") or "", reverse=True)
-
-        for backend, h in all_history[:20]:
-            detail = h.get("detail") or ""
-            first_line = detail.splitlines()[0] if detail else ""
-            ts = (h.get("timestamp") or "")[:19].replace("T", " ")
-            outcome = h.get("outcome", "")
-            style = (
-                "green" if outcome == "smoke_pass"
-                else "bold red" if outcome in ("smoke_failed", "build_failed")
-                else ""
-            )
-            table.add_row(Text(backend), Text(ts), Text(outcome, style=style), Text(first_line))
-
-    def action_dismiss_modal(self) -> None:
-        self.dismiss(None)
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id in ("history-close", "btn-history-close-bottom"):
-            self.dismiss(None)
-
-
-class RetainedBuildsModal(ModalScreen[None]):
-    """Per-backend retained build inventory — previously an always-visible third DataTable on
-    the Installs tab (the DESIGN.md §3.1 "max 2 tables" violation named in the QA pass), now
-    behind a button so BuildsScreen itself composes only backends-table directly.
-
-    Rollback and Remove are per-row actions here rather than a cursor-select + action-row
-    button pair: each row already identifies one specific (backend, ref) build, which is
-    exactly the (backend, target_ref) pair build_step.rollback() needs — no separate selection
-    step to get wrong. Not a CockpitScreenBase (it's a ModalScreen, a different widget-tree
-    root), so it can't inherit CockpitScreenBase's TableActionInvoked handling — this modal
-    implements the same confirm-then-dispatch shape itself, same as every other modal in this
-    codebase that calls ConfirmModal directly (DESIGN.md §5's declarative-write idiom).
+    Not a CockpitScreenBase, same reason RetainedBuildsModal/ChangeVersionModal weren't: a
+    ModalScreen is a different widget-tree root, so this implements its own confirm-then-dispatch
+    for Activate/Remove rather than inheriting one; Config/Log fire without a confirm, being
+    read-only.
     """
 
     BINDINGS = [("escape", "dismiss_modal", "Close")]
 
     DEFAULT_CSS = """
-    RetainedBuildsModal {
+    BuildsListModal {
         align: center middle;
     }
-    #retained-dialog {
-        width: 90%;
+    #builds-list-dialog {
+        width: 95%;
         height: 80%;
         border: thick $background 80%;
         background: $surface;
         padding: $space-normal $space-section;
     }
-    #retained-header {
+    #builds-list-header {
         height: auto;
         margin-bottom: $space-normal;
     }
-    #retained-title {
+    #builds-list-title {
         width: 1fr;
         text-style: bold;
     }
-    #retained-table {
+    #builds-list-table {
         height: 1fr;
         margin-bottom: $space-normal;
     }
     """
 
-    def __init__(self, host_profile: dict, backends: list[str], runner: Runner) -> None:
+    def __init__(self, host_profile: dict, backend: str, runner: Runner) -> None:
         super().__init__()
         self.host_profile = host_profile
-        self.backends = backends
+        self.backend = backend
         self.runner = runner
-        # "backend:ref" -> build dict (+ "backend"), refreshed on every _refresh() call.
+        # build id -> the list_builds() dict for it, refreshed on every _refresh() call.
         self._builds: dict[str, dict] = {}
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="retained-dialog"):
-            with Horizontal(id="retained-header"):
-                yield Static("Retained Builds", id="retained-title")
-                yield Button("×", id="retained-close", classes="close-button", variant="error")
-            table = SingleClickDataTable(id="retained-table", zebra_stripes=True)
+        with Vertical(id="builds-list-dialog"):
+            with Horizontal(id="builds-list-header"):
+                yield Static(f"Builds — {self.backend}", id="builds-list-title")
+                yield Button("×", id="builds-list-close", classes="close-button", variant="error")
+            table = SingleClickDataTable(id="builds-list-table", zebra_stripes=True)
             table.cursor_type = "row"
             yield table
             with Horizontal(classes="action-row-secondary"):
-                yield Button("Close", id="btn-retained-close-bottom", classes="thin-button")
+                yield Button("Close", id="btn-builds-list-close-bottom", classes="thin-button")
 
     def on_mount(self) -> None:
-        table = self.query_one("#retained-table", SingleClickDataTable)
-        table.add_column("Backend", width=12)
-        table.add_column("Ref", width=14)
-        table.add_column("Status", width=12)
-        table.add_column("Integrity", width=12)
+        table = self.query_one("#builds-list-table", SingleClickDataTable)
+        # Measured, not projected (DESIGN.md §4.4: a modal table is budgeted against its own
+        # dialog, not the 115-cell screen). At 121x30 this dialog is 114 cells wide, and
+        # 10+13+10+16 + four action columns (12+10+7+10) = 88 content, render 88 + 2*8 = 104.
+        # A first pass carried a separate "Outcome" column and rendered 116 — two cells wider
+        # than the dialog it lives in, which would have put [ Remove ] out of reach at the one
+        # breakpoint §4.2 requires to fit. Status and Outcome described overlapping facts
+        # ("NOT SANE" and "build_failed" never disagree), so they are one column.
+        table.add_column("Build", width=10)
+        table.add_column("Status", width=13)
+        table.add_column("Version", width=10)
+        table.add_column("When", width=16)
         table.add_action_column(
             TableAction(
-                "rollback",
-                "Rollback",
-                confirm="Roll back {row}? Points 'current' at this already-built prefix — "
+                "activate",
+                "Activate",
+                confirm="Activate {row}? Points 'current' at this already-built prefix — "
                 "no rebuild, no re-smoke-test.",
-                available=self._can_rollback,
+                available=self._can_activate,
             )
         )
+        table.add_action_column(TableAction("config", "Config", available=self._has_build))
+        table.add_action_column(TableAction("log", "Log", available=self._has_build))
         table.add_action_column(
             TableAction(
                 "remove",
                 "Remove",
                 destructive=True,
-                confirm="Delete retained build {row}? Frees disk space; cannot be undone.",
+                confirm="Remove build {row}? Frees disk space; cannot be undone.",
                 available=self._can_remove,
             )
         )
         self._refresh()
 
-    def _can_rollback(self, row_key: str) -> bool:
+    def _has_build(self, row_key: str) -> bool:
+        return row_key in self._builds
+
+    def _can_activate(self, row_key: str) -> bool:
         build = self._builds.get(row_key)
         return bool(build) and not build["current"] and build["sane"]
 
     def _can_remove(self, row_key: str) -> bool:
+        # Mirrors build_step.remove_build's own guard (the one that actually matters — this is
+        # only the UI-level reflection of it, so a stale row can never fire an action the
+        # function itself would refuse).
         build = self._builds.get(row_key)
         return bool(build) and not build["current"]
 
     def _refresh(self) -> None:
         if not self.is_mounted:
             return
-        table = self.query_one("#retained-table", SingleClickDataTable)
+        table = self.query_one("#builds-list-table", SingleClickDataTable)
         table.clear()
         self._builds.clear()
-        for backend in self.backends:
-            for b in build_step.list_builds(self.host_profile, backend):
-                key = f"{backend}:{b.get('id', '')}"
-                self._builds[key] = {**b, "backend": backend}
-                current_cell = Text("current", style="bold green") if b.get("current") else Text("retained", style="dim")
-                sane_cell = Text("ok", style="green") if b.get("sane") else Text("NOT SANE", style="bold red")
-                table.add_row(
-                    Text(backend),
-                    Text(_short(b.get("version", ""))),
-                    current_cell,
-                    sane_cell,
-                    *table.action_cells(key),
-                    key=key,
-                )
+        for b in build_step.list_builds(self.host_profile, self.backend):
+            key = b["id"]
+            self._builds[key] = b
+            # One column, because "not sane" and a failed outcome are the same event seen
+            # from two sides. Outcome wins when it says the build failed — "build failed" tells
+            # the operator what to open the log for; "NOT SANE" only says something is missing.
+            outcome = b.get("outcome") or ""
+            if b["current"]:
+                status_cell = Text("active", style="bold green")
+            elif outcome == "build_failed":
+                status_cell = Text("build failed", style="bold red")
+            elif outcome == "smoke_failed":
+                status_cell = Text("smoke failed", style="bold red")
+            elif not b["sane"]:
+                status_cell = Text("NOT SANE", style="bold red")
+            else:
+                status_cell = Text("built", style="dim")
+            when = (b.get("timestamp") or "")[:16].replace("T", " ") or "-"
+            table.add_row(
+                Text(_short(key)),
+                status_cell,
+                Text(_short(b.get("version", ""))),
+                Text(when),
+                *table.action_cells(key),
+                key=key,
+            )
 
     def action_dismiss_modal(self) -> None:
         self.dismiss(None)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id in ("retained-close", "btn-retained-close-bottom"):
+        if event.button.id in ("builds-list-close", "btn-builds-list-close-bottom"):
             self.dismiss(None)
+
+    def _show_config(self, build_id: str) -> None:
+        meta = build_step.read_build_metadata(self.host_profile, self.backend, build_id)
+        if meta is None:
+            content = "no config recorded — this build predates per-build metadata (build-info.json)."
+        else:
+            lines = [
+                f"ref: {meta.get('ref', '')}",
+                f"outcome: {meta.get('outcome', '')}",
+                f"timestamp: {meta.get('timestamp', '')}",
+                "cmake_flags:",
+                *(f"  {f}" for f in meta.get("cmake_flags", [])),
+                "argv:",
+                "  " + " ".join(shlex.quote(a) for a in meta.get("argv", [])),
+            ]
+            content = "\n".join(lines)
+        self.app.push_screen(InfoModal(f"Config — {self.backend} {build_id}", escape_markup(content)))
+
+    def _show_log(self, build_id: str) -> None:
+        log_path = build_step.build_log_path(self.host_profile, self.backend, build_id)
+        content = log_path.read_text() if log_path.is_file() else "no log persisted for this build."
+        self.app.push_screen(InfoModal(f"Build log — {self.backend} {build_id}", escape_markup(content)))
 
     @work
     async def _on_table_action_invoked(self, event: TableActionInvoked) -> None:
         event.stop()
+        build = self._builds.get(event.row_key)
+        if build is None:
+            return
+        if event.action.id == "config":
+            self._show_config(build["id"])
+            return
+        if event.action.id == "log":
+            self._show_log(build["id"])
+            return
         message = event.action.confirm_message(event.row_key)
         if message is not None:
-            # Both actions write under prefix_root (/opt/...), so this modal repeats
-            # CockpitScreenBase.confirm's root gate — it can't inherit it, being a ModalScreen.
+            # Both remaining actions (activate, remove) write under prefix_root (/opt/...), so
+            # this modal repeats CockpitScreenBase.confirm's root gate — it can't inherit it,
+            # being a ModalScreen.
             needs_sudo = os.geteuid() != 0
             confirmed = await self.app.push_screen_wait(
                 ConfirmModal(
@@ -542,36 +555,35 @@ class RetainedBuildsModal(ModalScreen[None]):
                 if elevated is None:
                     return
                 self.runner = elevated
-        build = self._builds.get(event.row_key)
-        if build is None:
-            return
-        if event.action.id == "rollback":
-            self._run_rollback(build["backend"], build["id"])
+        if event.action.id == "activate":
+            self._run_activate(build["id"])
         elif event.action.id == "remove":
-            self._run_remove(build["backend"], build["id"])
+            self._run_remove(build["id"])
 
     @work(thread=True)
-    def _run_rollback(self, backend: str, ref: str) -> None:
+    def _run_activate(self, build_id: str) -> None:
         try:
-            build_step.rollback(self.host_profile, backend, ref, self.runner)
+            build_step.rollback(self.host_profile, self.backend, build_id, self.runner)
         except SystemExit as e:
-            self.app.call_from_thread(self.app.notify, f"rollback failed: {e}", severity="error")
+            self.app.call_from_thread(self.app.notify, f"activate failed: {e}", severity="error")
             return
         except Exception as e:
-            self.app.call_from_thread(self.app.notify, f"rollback failed: {e}", severity="error")
+            self.app.call_from_thread(self.app.notify, f"activate failed: {e}", severity="error")
             return
-        self.app.call_from_thread(self.app.notify, f"{backend}: current now points at {_short(ref)}")
+        self.app.call_from_thread(self.app.notify, f"{self.backend}: current now points at {build_id}")
         self.app.call_from_thread(self._refresh)
 
     @work(thread=True)
-    def _run_remove(self, backend: str, ref: str) -> None:
-        target = Path(self.host_profile["paths"]["prefix_root"]) / backend / ref
+    def _run_remove(self, build_id: str) -> None:
         try:
-            self.runner.run(["rm", "-rf", str(target)])
+            build_step.remove_build(self.host_profile, self.backend, build_id, self.runner)
+        except SystemExit as e:
+            self.app.call_from_thread(self.app.notify, f"remove failed: {e}", severity="error")
+            return
         except Exception as e:
             self.app.call_from_thread(self.app.notify, f"remove failed: {e}", severity="error")
             return
-        self.app.call_from_thread(self.app.notify, f"{backend}: removed retained build {_short(ref)}")
+        self.app.call_from_thread(self.app.notify, f"{self.backend}: removed build {build_id}")
         self.app.call_from_thread(self._refresh)
 
 
@@ -580,13 +592,21 @@ class ChangeVersionModal(ModalScreen[str | None]):
 
     Always dismisses with a resolved commit SHA (or None on cancel) — never a bare tag — so the
     caller can write it straight into manifest.yaml's `ref:` line. Sources, in the order the
-    operator asked for ("go back" first): build-history outcomes and on-disk retained builds
-    (both already carry real SHAs), then upstream releases (network, backgrounded so opening the
-    modal never blocks on it — a release's tag is resolved to a SHA lazily, only if it's the one
-    picked), plus a manual SHA entry for anything not already known locally.
+    operator asked for ("go back" first): on-disk installed builds (list_builds(), which already
+    carries a real SHA per build's own build-info.json since Phase 1), then upstream releases
+    (network, backgrounded so opening the modal never blocks on it — a release's tag is resolved
+    to a SHA lazily, only if it's the one picked), plus a manual SHA entry for anything not
+    already known locally.
+
+    build-history.jsonl (build_step.read_build_history) used to be a third local source here,
+    for a ref that was built and later pruned. Dropped in plans/06 Phase 3: that file has had no
+    writer since Phase 1 folded per-run history into each build's own build-info.json, so it is
+    frozen legacy data — carrying a reader for a file nothing writes, to populate rows nothing
+    new will ever add to, is the "Cost of existing" the kit's contract calls out. A ref built
+    before the migration and since pruned is still reachable via manual SHA entry below.
 
     Not a CockpitScreenBase — a ModalScreen is a different widget-tree root, same reason
-    RetainedBuildsModal implements its own confirm-free select-and-dismiss dispatch here. The
+    BuildsListModal implements its own confirm-free select-and-dismiss dispatch here. The
     confirm step belongs to the caller (BuildsScreen._confirm_and_change_version): it is the
     same confirm §3's "Update to latest" already uses, and this modal's only job is to return a
     ref.
@@ -684,16 +704,15 @@ class ChangeVersionModal(ModalScreen[str | None]):
             )
 
     def _populate_local(self, table: SingleClickDataTable) -> None:
+        # build-history.jsonl is no longer read here (plans/06 Phase 3 — see class docstring):
+        # every installed build already carries a real SHA via list_builds(), and that file has
+        # had no writer since Phase 1.
         for backend in self.backends:
-            for h in build_step.read_build_history(self.host_profile, backend, limit=10):
-                ref = h.get("ref") or ""
-                if ref:
-                    self._add_row(ref, "history", f"{backend}: {h.get('outcome', '')}", kind="sha")
             for b in build_step.list_builds(self.host_profile, backend):
                 ref = b.get("version") or ""
                 if not ref:
                     continue
-                state = "current" if b.get("current") else "retained"
+                state = "current" if b.get("current") else "built"
                 if not b.get("sane"):
                     state += " NOT SANE"
                 self._add_row(ref, "installed", f"{backend}: {state}", kind="sha")
@@ -756,26 +775,26 @@ class ChangeVersionModal(ModalScreen[str | None]):
 
 
 class BackendDetailModal(ModalScreen[None]):
-    """Read/write detail view for one backend row on the Installs table — the operator's
-    2026-09-18 QA report: given a row that just says "llama.cpp (vulkan)", what is it, why is
-    it that way, how do I redefine its parameters, where does it point on disk, and how do I
-    control its build flags. Answers all of that in one place, plus makes cmake_flags
-    editable (plans/05-qa-remediation-pass.md Phase 2 follow-up, item 3):
+    """Edit view for one backend row on the Installs table (plans/06 Phase 3, A6) — a plain
+    field:value form, not the earlier What/Where/How narrative the operator asked to have
+    removed ("simply instead list fields and their respective value"): Backend, GPU, Build
+    status, Build location, then — bottom-weighted, since this is the one thing an operator
+    actually edits here — the editable cmake_flags TextArea followed by the read-only Build
+    command it produces. Retained-build detail (which build is current, what each one's config
+    and log were) moved out of this modal entirely; it lives in BuildsListModal now, reachable
+    from the table's own `[ Builds ]` action, not nested inside Edit.
 
-    - **what**: the backend name and which GPU(s) in the host profile declare it.
-    - **where**: `prefix_root/<backend>/`, the `current` symlink target, every retained ref
-      (`build_step.list_builds`).
-    - **how**: the effective cmake command line via `build_step.resolve_cmake_argv` — the
-      same function `_build_backend` calls to configure the real build, so this is provably
-      what runs, not a description of it — plus `apt_packages`/`build_env`/`source_script`.
-    - **where it's defined**: `manifest.yaml` → `backends.<name>.cmake_flags`, named
-      explicitly so the operator knows where to look outside this modal too.
+    The Build command line is recomputed on every `TextArea.Changed` through
+    `build_step.resolve_cmake_argv` — the same function `_build_backend` calls to configure the
+    real build — against the *unsaved* text in the box, so it can never drift from what saving
+    (and then building) would actually run, and it reflects an edit before the operator commits
+    to it.
 
-    cmake_flags is the one editable field: a TextArea, one flag per line, confirmed with
+    cmake_flags is the one editable field: one flag per line, confirmed with
     `ConfirmModal(danger=True)` old -> new (DESIGN.md §5's declarative-write idiom), written
     by `_write_manifest_cmake_flags` — a targeted block rewrite, never `yaml.safe_dump`.
 
-    Not a CockpitScreenBase, same reason RetainedBuildsModal/ChangeVersionModal aren't: a
+    Not a CockpitScreenBase, same reason BuildsListModal/ChangeVersionModal aren't: a
     ModalScreen is a different widget-tree root, so this implements its own confirm-then-write
     dispatch rather than inheriting one.
     """
@@ -804,14 +823,19 @@ class BackendDetailModal(ModalScreen[None]):
     #detail-body {
         height: 1fr;
     }
-    #detail-body Static {
-        margin-bottom: $space-normal;
-    }
     #detail-flags-group {
         height: auto;
+        margin-bottom: $space-normal;
     }
     #f-detail-cmake-flags {
         height: 5;
+    }
+    #detail-command-group {
+        height: auto;
+        margin-bottom: $space-normal;
+    }
+    #detail-build-command {
+        color: $text-muted;
     }
     #detail-error {
         color: $error;
@@ -838,12 +862,24 @@ class BackendDetailModal(ModalScreen[None]):
                 yield Static(self._title(), id="detail-title")
                 yield Button("×", id="detail-close", classes="close-button", variant="error")
             with VerticalScroll(id="detail-body"):
-                yield Static(id="detail-what")
-                yield Static(id="detail-where")
-                yield Static(id="detail-how")
+                with Horizontal(classes="form-row"):
+                    yield Static("Backend", classes="form-label")
+                    yield Static(id="detail-backend", classes="form-field")
+                with Horizontal(classes="form-row"):
+                    yield Static("GPU", classes="form-label")
+                    yield Static(id="detail-gpu", classes="form-field")
+                with Horizontal(classes="form-row"):
+                    yield Static("Build status", classes="form-label")
+                    yield Static(id="detail-build-status", classes="form-field")
+                with Horizontal(classes="form-row"):
+                    yield Static("Build location", classes="form-label")
+                    yield Static(id="detail-build-location", classes="form-field")
                 with Vertical(id="detail-flags-group"):
-                    yield Static(f"backends.{escape_markup(self.backend)}.cmake_flags — one flag per line:")
+                    yield Static("cmake_flags", classes="form-label")
                     yield TextArea(id="f-detail-cmake-flags")
+                with Vertical(id="detail-command-group"):
+                    yield Static("Build command", classes="form-label")
+                    yield Static(id="detail-build-command")
                 yield Static("", id="detail-error")
             with Horizontal(classes="action-row-primary"):
                 yield Button("Save flags", id="btn-detail-save", variant="primary", classes="thin-button")
@@ -858,63 +894,50 @@ class BackendDetailModal(ModalScreen[None]):
     def _populate_detail(self) -> None:
         recipe = self._recipe()
         self.query_one("#detail-title", Static).update(self._title())
+
         gpus = [
             f"{g.get('id', '?')} ({g.get('vendor', '?')})"
             for g in self.host_profile.get("gpus", [])
             if self.backend in g.get("backends", [])
         ]
-        host_name = escape_markup(getattr(self.app_ref, "host_name", "?"))
-        example_line = (
-            "\nThis is a stock example recipe, shipped as-is with the repo — editing "
-            "cmake_flags below and saving clears this mark." if recipe.get("example") else ""
-        )
-        self.query_one("#detail-what", Static).update(
-            "[b]What[/]\n"
-            f"Backend: {escape_markup(self.backend)}\n"
-            f"Declared by: {escape_markup(', '.join(gpus)) or '(no GPU declares it)'} "
-            f"— hosts/{host_name}.yaml"
-            f"{example_line}"
-        )
+        self.query_one("#detail-backend", Static).update(escape_markup(self.backend))
+        self.query_one("#detail-gpu", Static).update(escape_markup(", ".join(gpus)) or "(none)")
 
         prefix_root = Path(self.host_profile["paths"]["prefix_root"])
         backend_dir = prefix_root / self.backend
-        current_link = backend_dir / "current"
-        current_target = current_link.resolve() if current_link.is_symlink() else None
-        builds = build_step.list_builds(self.host_profile, self.backend)
-        retained_lines = "\n".join(
-            f"  {b['id']} ({_short(b['version'])}){' (current)' if b['current'] else ''}{'' if b['sane'] else ' NOT SANE'}"
-            for b in builds
-        ) or "  (nothing built yet)"
-        self.query_one("#detail-where", Static).update(
-            "[b]Where[/]\n"
-            f"Install root: {escape_markup(str(backend_dir))}/\n"
-            f"'current' -> {escape_markup(str(current_target)) if current_target else '(not set)'}\n"
-            f"Retained builds:\n{escape_markup(retained_lines)}"
+        current = next(
+            (b for b in build_step.list_builds(self.host_profile, self.backend) if b.get("current")),
+            None,
         )
+        status = f"{current['id']} active" if current else "not built"
+        self.query_one("#detail-build-status", Static).update(escape_markup(status))
+        self.query_one("#detail-build-location", Static).update(escape_markup(f"{backend_dir}/"))
 
-        ref = self.manifest.get("llama_cpp", {}).get("ref", "")
+        self.query_one("#f-detail-cmake-flags", TextArea).text = "\n".join(recipe.get("cmake_flags", []))
+        self._update_build_command()
+
+    def _current_flags(self) -> list[str]:
+        return [
+            line.strip()
+            for line in self.query_one("#f-detail-cmake-flags", TextArea).text.splitlines()
+            if line.strip()
+        ]
+
+    def _update_build_command(self) -> None:
+        """Recomputes the displayed Build command from whatever is in the cmake_flags TextArea
+        right now — including an unsaved edit — through the same `resolve_cmake_argv` the real
+        build calls, so the display can never drift from what saving-and-building would run.
+        Named to avoid `_render`, which collides with `Widget._render()` (DESIGN.md §9 note)."""
+        recipe = {**self._recipe(), "cmake_flags": self._current_flags()}
         prefix = Path(self.host_profile["paths"]["prefix_root"]) / self.backend
         checkout_dir = build_step.checkout_dir_for(self.host_profile)
         argv = build_step.resolve_cmake_argv(self.backend, recipe, checkout_dir, prefix)
         cmd = " ".join(shlex.quote(a) for a in argv)
-        extra = []
-        apt_packages = recipe.get("apt_packages") or []
-        if apt_packages:
-            extra.append(f"apt_packages: {', '.join(apt_packages)}")
-        build_env = recipe.get("build_env") or {}
-        if build_env:
-            extra.append("build_env: " + ", ".join(f"{k}={v}" for k, v in build_env.items()))
-        source_script = recipe.get("source_script")
-        if source_script:
-            extra.append(f"sourced before configure+build: {source_script}")
-        extra_lines = ("\n".join(extra) + "\n") if extra else ""
-        self.query_one("#detail-how", Static).update(
-            "[b]How[/]\n"
-            f"{escape_markup(cmd)}\n{escape_markup(extra_lines)}"
-            f"Defined in manifest.yaml -> backends.{escape_markup(self.backend)}.cmake_flags"
-        )
+        self.query_one("#detail-build-command", Static).update(escape_markup(cmd))
 
-        self.query_one("#f-detail-cmake-flags", TextArea).text = "\n".join(recipe.get("cmake_flags", []))
+    def on_text_area_changed(self, event: TextArea.Changed) -> None:
+        if event.text_area.id == "f-detail-cmake-flags":
+            self._update_build_command()
 
     def _set_error(self, message: str) -> None:
         self.query_one("#detail-error", Static).update(escape_markup(message))
@@ -930,11 +953,7 @@ class BackendDetailModal(ModalScreen[None]):
 
     @work
     async def _confirm_and_save_flags(self) -> None:
-        new_flags = [
-            line.strip()
-            for line in self.query_one("#f-detail-cmake-flags", TextArea).text.splitlines()
-            if line.strip()
-        ]
+        new_flags = self._current_flags()
         if not new_flags:
             self._set_error("cmake_flags cannot be emptied — at least one flag is required")
             return
@@ -1086,8 +1105,6 @@ class BuildsScreen(CockpitScreenBase):
             # 2026-09-18 QA report: the bind lives in Settings -> GPU Topology's "Add GPU" form
             # (gpus[].backends). Not a second GPU-editing form — that stays the only one.
             with Horizontal(classes="action-row-secondary"):
-                yield Button("Retained Builds", id="btn-retained-builds", classes="thin-button")
-                yield Button("Build History", id="btn-build-history", classes="thin-button")
                 yield Button("Build log", id="btn-build-log", classes="thin-button")
                 # Hidden by default (DEFAULT_CSS) until _refresh_backends_table finds something —
                 # a scan result behind a button (A2), not an always-visible block, and never
@@ -1105,11 +1122,11 @@ class BuildsScreen(CockpitScreenBase):
         # "build3 · 481c65f09" is 19 chars (identity and version, now separable — Phase 1);
         # width 20 fits it and "not built".
         backends_table.add_column("Active build", width=20)
-        # 14 + 20 + 32 + 9 + 8 = 83 content, render 83 + 2*5 = 93 (DESIGN.md §4.4). "update
-        # available (d1d3c33ab1)" is 29 chars and fits; the failure case ("couldn't check
-        # (HTTP Error 403: rate limit exceeded)") is unchanged text and can now clip earlier
-        # than at the old width=35 — an accepted trade for the column budget this phase asks
-        # for, not something silently widened back.
+        # 14 + 20 + 32 + 9 + 8 + 10 = 93 content, render 93 + 2*6 = 105 (DESIGN.md §4.4,
+        # updated in Phase 3 to add [ Builds ]). "update available (d1d3c33ab1)" is 29 chars
+        # and fits; the failure case ("couldn't check (HTTP Error 403: rate limit exceeded)")
+        # is unchanged text and can now clip earlier than at the old width=35 — an accepted
+        # trade for the column budget this phase asks for, not something silently widened back.
         backends_table.add_column("Status", width=32)
         backends_table.add_action_column(
             TableAction(
@@ -1126,6 +1143,14 @@ class BuildsScreen(CockpitScreenBase):
                 "info",
                 "Edit",  # relabelled from "Info" this phase; id/handler/modal are Phase 3's
                 width=8,  # len("Edit") + 4
+                available=lambda row_key: row_key in self.backends,
+            )
+        )
+        backends_table.add_action_column(
+            TableAction(
+                "builds",
+                "Builds",  # opens BuildsListModal, scoped to this row's backend (Phase 3, A7)
+                width=10,  # len("Builds") + 4
                 available=lambda row_key: row_key in self.backends,
             )
         )
@@ -1310,6 +1335,16 @@ class BuildsScreen(CockpitScreenBase):
                 BackendDetailModal(self.host_profile, self.manifest, row_key, self.repo_root, self.app_ref)
             )
             return
+        if action_id == "builds":
+            # Scoped to this row's backend — that scoping is what keeps the modal's table
+            # inside its dialog budget (DESIGN.md §4.4) without a Backend column. The dismiss
+            # callback refreshes because Activate repoints `current`, which `Active build`
+            # reports; without it the table would still show the previous build.
+            self.app.push_screen(
+                BuildsListModal(self.host_profile, row_key, self.privileged_runner),
+                callback=lambda _: self._refresh_backends_table(),
+            )
+            return
         if action_id != "build":
             return
         if self._building_backends:
@@ -1331,10 +1366,6 @@ class BuildsScreen(CockpitScreenBase):
             self._confirm_and_update_to_latest()
         elif button_id == "btn-change-version":
             self._confirm_and_change_version()
-        elif button_id == "btn-build-history":
-            self.app.push_screen(BuildHistoryModal(self.host_profile, self.backends))
-        elif button_id == "btn-retained-builds":
-            self.app.push_screen(RetainedBuildsModal(self.host_profile, self.backends, self.runner))
         elif button_id == "btn-build-log":
             self._open_log_modal("Build log")
         elif button_id == "btn-foreign-builds":

@@ -116,6 +116,33 @@ def _assert_only_ref_line_changed(before: str, after: str) -> None:
     )
 
 
+def verify_write_manifest_ref_rejects_non_sha() -> None:
+    """plans/06 §0b: a live bug, since Phase 1's build-directory scheme (`build3`, not a SHA)
+    means a build id can now reach this function through a caller that forgot to resolve it to
+    a real ref first. Before this guard, `_MANIFEST_REF_RE` only constrained the *existing*
+    line being replaced — an incoming non-SHA `new_ref` substituted cleanly and reported
+    success while writing garbage into manifest.yaml's `ref:` line. This is exactly the class of
+    bug the contract calls out as needing to have been seen failing, so it is asserted first."""
+    original = (_REPO_ROOT / "manifest.yaml").read_text()
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td) / "manifest.yaml"
+        tmp.write_text(original)
+        before = tmp.read_text()
+
+        raised = False
+        try:
+            _write_manifest_ref(tmp, "build7")
+        except ValueError:
+            raised = True
+        assert raised, "_write_manifest_ref accepted 'build7' — a build directory id, not a SHA"
+        assert tmp.read_text() == before, "a rejected write must not touch the file at all"
+
+        sha = "c" * 40
+        _write_manifest_ref(tmp, sha)
+        assert f"ref: {sha}" in tmp.read_text(), "_write_manifest_ref rejected a valid 40-hex SHA"
+    print("verify_build_pin: _write_manifest_ref rejects a build id, accepts a 40-hex SHA — OK")
+
+
 def _fixture(tmp_root: Path) -> tuple[dict, dict, dict, str]:
     host_profile = {
         "paths": {
@@ -367,6 +394,46 @@ def verify_rollback_rejects_traversal() -> None:
         # A legitimate id is still accepted, to prove the guard isn't over-broad.
         build_step.rollback(host_profile, "cuda", "build1", CapturingRunner())
     print("verify_build_pin: rollback() rejects path traversal, absolute paths, and separators — OK")
+
+
+def verify_remove_build_rejects_traversal_and_current() -> None:
+    """remove_build() gets the same path hardening rollback() got in d925e91 (plans/06 Phase 3
+    item — closing the HANDOVER.md deviation where the cockpit used to inline `rm -rf` with no
+    validation at all), plus its own guard: it must refuse to delete whichever build `current`
+    points at, since that would break the symlink swap.py's generated config depends on."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp_root = Path(td)
+        host_profile, manifest, models, ref = _fixture(tmp_root)
+        backend_dir = Path(host_profile["paths"]["prefix_root"]) / "cuda"
+        current = backend_dir / "build1"
+        retained = backend_dir / "build2"
+        _write_fake_prefix(current)
+        _write_fake_prefix(retained)
+        (backend_dir / "current").symlink_to(current)
+
+        for bad in ("../../etc", "/etc/passwd", "sub/dir", "..", "."):
+            try:
+                build_step.remove_build(host_profile, "cuda", bad, CapturingRunner())
+                raised = False
+            except SystemExit:
+                raised = True
+            assert raised, f"remove_build() accepted an invalid build_id: {bad!r}"
+
+        try:
+            build_step.remove_build(host_profile, "cuda", "build1", CapturingRunner())
+            raised = False
+        except SystemExit:
+            raised = True
+        assert raised, "remove_build() deleted the build 'current' points at"
+        assert current.is_dir(), "the current build was removed from disk despite the guard"
+
+        runner = CapturingRunner()
+        build_step.remove_build(host_profile, "cuda", "build2", runner)
+        assert any(
+            len(c) == 3 and c[0] == "rm" and c[1] == "-rf" and Path(c[2]).resolve() == retained.resolve()
+            for c in runner.run_calls
+        ), f"remove_build() did not rm -rf the retained build: {runner.run_calls}"
+    print("verify_build_pin: remove_build() rejects traversal and refuses to remove the current build — OK")
 
 
 def verify_metadata_roundtrip_and_dry_run_writes_nothing() -> None:
@@ -700,11 +767,13 @@ def verify_table_action_confirm_callable() -> None:
 
 def main() -> None:
     verify_manifest_roundtrip()
+    verify_write_manifest_ref_rejects_non_sha()
     verify_force_flag()
     verify_sequential_dirs_two_force_builds_first_unmodified()
     verify_list_builds_shape_and_legacy()
     verify_prune_disk_budget_is_sane_builds_only()
     verify_rollback_rejects_traversal()
+    verify_remove_build_rejects_traversal_and_current()
     verify_metadata_roundtrip_and_dry_run_writes_nothing()
     verify_cmake_flags_roundtrip_order_independent()
     verify_cmake_flags_roundtrip_real_manifest()

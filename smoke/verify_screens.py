@@ -458,6 +458,41 @@ async def _assert_edit_model_modal(app: CockpitApp, pilot, context: str) -> None
     _assert_buttons_in_bounds(app, f"{context} EditModelModal")
 
 
+async def _assert_builds_list_modal(app: CockpitApp, pilot, context: str) -> None:
+    """BuildsListModal's table is budgeted against its own dialog, not the 115-cell screen
+    (DESIGN.md §4.4). Nothing else checks that: _assert_table_widths_in_budget only sees
+    on-screen tables and measures them against 115, so a modal table two cells too wide for
+    its dialog passes every other gate while its rightmost action column is unreachable.
+
+    That is not hypothetical — this modal shipped at render 116 inside a 114-cell dialog,
+    putting [ Remove ] out of reach at exactly the breakpoint §4.2 requires tables to fit.
+    Below the breakpoint the table is allowed to scroll (§4.2), so only -wide is asserted."""
+    from cockpit.screens.builds import BuildsListModal
+
+    if "-wide" not in app.screen.classes:
+        return
+    screen = app.query_one("BuildsScreen")
+    modal = BuildsListModal(screen.host_profile, screen.backends[0], screen.runner)
+    app.push_screen(modal)
+    await pilot.pause(0.3)
+    try:
+        dialog = app.screen.query_one("#builds-list-dialog")
+        table = app.screen.query_one("#builds-list-table")
+        assert table.fixed_columns == 0, f"[{context}] builds-list-table pins a column (DESIGN.md §4.2)"
+        columns = list(table.ordered_columns)
+        render = sum(c.width for c in columns) + 2 * len(columns)
+        assert render <= dialog.region.width, (
+            f"[{context}] builds-list-table renders {render} cells inside a "
+            f"{dialog.region.width}-cell dialog — its rightmost action column is unreachable"
+        )
+        assert app.screen.region.contains_region(dialog.region), (
+            f"[{context}] BuildsListModal dialog {dialog.region} escapes the screen"
+        )
+    finally:
+        app.pop_screen()
+        await pilot.pause(0.2)
+
+
 async def _assert_backend_detail_modal(app: CockpitApp, pilot, context: str) -> None:
     """plans/05-qa-remediation-pass.md follow-up (operator QA 2026-09-18) —
     BackendDetailModal carries paths and a flag list, both long-content shapes the add-model
@@ -482,7 +517,11 @@ async def _assert_backend_detail_modal(app: CockpitApp, pilot, context: str) -> 
         f"this check exists to catch"
     )
 
-    field_ids = ("#detail-what", "#detail-where", "#detail-how", "#f-detail-cmake-flags",
+    # The What/Where/How blocks were replaced by plain field:value rows in plans/06 Phase 3 —
+    # the operator's objection was to prose headings, not to the information. Same containment
+    # contract either way; only the ids moved.
+    field_ids = ("#detail-backend", "#detail-gpu", "#detail-build-status",
+                 "#detail-build-location", "#f-detail-cmake-flags", "#detail-build-command",
                  "#btn-detail-save", "#btn-detail-close-bottom")
     for widget_id in field_ids:
         widget = app.screen.query_one(widget_id)
@@ -587,6 +626,7 @@ async def verify_geometry_and_export_screenshots() -> None:
                     await _assert_edit_model_modal(app, pilot, f"{name} @ {w}x{h}")
                 if name == "builds":
                     await _assert_backend_detail_modal(app, pilot, f"{name} @ {w}x{h}")
+                    await _assert_builds_list_modal(app, pilot, f"{name} @ {w}x{h}")
                 if name == "settings_services":
                     await _assert_wol_form_wiring(app, pilot, f"{name} @ {w}x{h}")
                     await _assert_root_gate(app, pilot, f"{name} @ {w}x{h}")

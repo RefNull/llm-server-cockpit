@@ -434,27 +434,63 @@ def list_builds(host_profile: dict[str, Any], backend: str) -> list[dict[str, An
     return result
 
 
+def _resolve_build_dir_strict(host_profile: dict[str, Any], backend: str, build_id: str, *, verb: str) -> Path:
+    """Shared path validation for every action that takes an operator-supplied build id and
+    touches disk with it (`rollback`, `remove_build`) — one place to get this right rather than
+    two copies that could drift. `build_id` must be a bare directory name, one level directly
+    under prefix_root/<backend>/ — never an absolute path or one containing a path separator,
+    and never "." or "..". Checked on the raw string before any Path join: Path(base) /
+    "/etc/passwd" silently discards `base` and evaluates to "/etc/passwd", so the join itself
+    cannot be trusted to enforce this. `verb` only shapes the error message (e.g. "roll back",
+    "remove").
+    """
+    if os.path.isabs(build_id) or "/" in build_id or "\\" in build_id or build_id in (".", ".."):
+        sys.exit(f"build: invalid build id {build_id!r} — must be a bare directory name")
+    prefix_root = Path(host_profile["paths"]["prefix_root"]).resolve()
+    backend_dir = prefix_root / backend
+    target = (backend_dir / build_id).resolve()
+    if target.parent != backend_dir:
+        sys.exit(f"build: {build_id!r} does not resolve to a build directly under {backend_dir}")
+    return target
+
+
 def rollback(host_profile: dict[str, Any], backend: str, target_ref: str, runner: Runner) -> None:
     """Point `current` at an already-built, retained prefix — no rebuild. Skips re-smoke-testing:
     this build already passed its smoke test to get built in the first place, and the binary
     hasn't changed since; if that's not good enough, rebuild that ref instead of rolling back.
 
-    target_ref must be a bare directory name, one level directly under prefix_root/<backend>/
-    — never an absolute path or one containing a path separator, and never "." or "..". This
-    is checked on the raw string before any Path join: Path(base) / "/etc/passwd" silently
-    discards `base` and evaluates to "/etc/passwd", so the join itself cannot be trusted to
-    enforce this.
+    target_ref must be a bare directory name — see _resolve_build_dir_strict for the exact
+    validation.
     """
-    if os.path.isabs(target_ref) or "/" in target_ref or "\\" in target_ref or target_ref in (".", ".."):
-        sys.exit(f"build: invalid build id {target_ref!r} — must be a bare directory name")
-    prefix_root = Path(host_profile["paths"]["prefix_root"]).resolve()
-    backend_dir = prefix_root / backend
-    target = (backend_dir / target_ref).resolve()
-    if target.parent != backend_dir:
-        sys.exit(f"build: {target_ref!r} does not resolve to a build directly under {backend_dir}")
+    target = _resolve_build_dir_strict(host_profile, backend, target_ref, verb="roll back")
     if not _prefix_ready(target):
         sys.exit(f"build: cannot roll back {backend!r} to {target_ref!r} — {target} is missing or not a sane build")
+    backend_dir = target.parent
     runner.atomic_symlink(backend_dir / "current", target)
+
+
+def remove_build(host_profile: dict[str, Any], backend: str, build_id: str, runner: Runner) -> None:
+    """Delete one retained build directory outright — the cockpit's manual "this build is
+    known-bad, remove it now" action, distinct from _prune_old_builds' automatic disk-space
+    budget. Closes a known deviation (HANDOVER.md): the cockpit used to inline `rm -rf` at the
+    call site with no argument validation at all; this gives it the same path hardening
+    `rollback` got in d925e91 rather than carrying that gap into a second modal.
+
+    Refuses to remove the build `current` points at — deleting it out from under a running
+    llama-swap would break the symlink swap.py's generated config depends on. Rolling back (or
+    rebuilding) first is the only way to remove it; that ordering is enforced by the caller
+    (BuildsListModal._can_remove) but re-checked here too, since this function is the one thing
+    that actually deletes data and must not trust a UI guard alone.
+    """
+    target = _resolve_build_dir_strict(host_profile, backend, build_id, verb="remove")
+    backend_dir = target.parent
+    current_link = backend_dir / "current"
+    current_target = current_link.resolve() if current_link.is_symlink() else None
+    if target == current_target:
+        sys.exit(f"build: refusing to remove {backend!r} build {build_id!r} — it is the current build")
+    if not target.is_dir():
+        sys.exit(f"build: cannot remove {backend!r} build {build_id!r} — {target} does not exist")
+    runner.run(["rm", "-rf", str(target)])
 
 
 def run(
