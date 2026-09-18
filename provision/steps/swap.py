@@ -60,8 +60,11 @@ def _install_llama_swap(host_profile: dict[str, Any], manifest: dict[str, Any], 
     runner.mkdir(workdir)
     tarball = workdir / asset
     try:
+        log.info("swap: downloading %s from %s", asset, url)
         runner.run(["curl", "-fsSL", "-o", str(tarball), url], capture=True)
+        log.info("swap: extracting %s", asset)
         runner.run(["tar", "-xzf", str(tarball), "-C", str(workdir)], capture=True)
+        log.info("swap: installing binary to %s", _BINARY_PATH)
         runner.run(["install", "-m", "0755", str(workdir / "llama-swap"), str(_BINARY_PATH)], capture=True)
     except subprocess.CalledProcessError as e:
         detail = (e.output or "").strip()
@@ -78,7 +81,7 @@ def _install_llama_swap(host_profile: dict[str, Any], manifest: dict[str, Any], 
                 f"swap: installed llama-swap at {_BINARY_PATH} but `-version` does not report pinned "
                 f"{version!r} (got {new_version!r})"
             )
-        log.info("swap: installed llama-swap %s", version)
+        log.info("swap: installed and verified llama-swap at %s (%s)", _BINARY_PATH, new_version.splitlines()[0])
     return _BINARY_PATH
 
 
@@ -392,12 +395,15 @@ def reconcile_service(runner: Runner) -> str:
         # complete on its own; whether a systemd unit happens to supervise it is a separate
         # question. Refusing the update because no unit exists made a binary swap depend on a
         # service, which is backwards — reported by the operator on 2026-09-18.
+        log.info("swap: %s unit not installed on this host (deploy gateway to configure service)", _UNIT_NAME)
         return "no-unit"
     if state == "":
         return "unknown"
     if _is_active(_UNIT_NAME):
+        log.info("swap: restarting %s", _UNIT_NAME)
         _systemctl(runner, "restart", _UNIT_NAME)
         return "restarted"
+    log.info("swap: enabling and starting %s", _UNIT_NAME)
     _systemctl(runner, "enable", "--now", _UNIT_NAME)
     return "started"
 

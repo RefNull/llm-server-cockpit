@@ -220,9 +220,10 @@ def check_llama_cpp_for_view(manifest: dict[str, Any], *, force: bool = False) -
     `check_all`'s 24h cache and of llama-swap's own view check: each upstream component gets
     its own check now, rather than one button firing both (which is what made the old
     "Check for Updates" button counterintuitive sitting under the llama.cpp section)."""
+    expected_pin = (manifest.get("llama_cpp") or {}).get("ref")
     if not force:
         cached = _read_view_cache("llama_cpp")
-        if cached is not None:
+        if cached is not None and (expected_pin is None or cached.get("pinned") == expected_pin):
             return cached
     result = check_llama_cpp(manifest)
     if result.get("ok"):
@@ -233,9 +234,10 @@ def check_llama_cpp_for_view(manifest: dict[str, Any], *, force: bool = False) -
 def check_llama_swap_for_view(manifest: dict[str, Any], *, force: bool = False) -> dict[str, Any]:
     """`check_llama_swap`'s own-component counterpart to `check_llama_cpp_for_view` — see that
     function's docstring."""
+    expected_pin = (manifest.get("llama_swap") or {}).get("version")
     if not force:
         cached = _read_view_cache("llama_swap")
-        if cached is not None:
+        if cached is not None and (expected_pin is None or cached.get("pinned") == expected_pin):
             return cached
     result = check_llama_swap(manifest)
     if result.get("ok"):

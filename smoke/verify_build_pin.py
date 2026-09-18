@@ -1036,6 +1036,7 @@ def verify_swap_update_transaction_and_state() -> None:
     """BuildsScreen._run_swap_update passes target_manifest to install_pinned_binary, writes
     manifest.yaml only on success, updates update_check view cache, and updates UI state."""
     from cockpit.screens.builds import BuildsScreen
+    from cockpit import update_check
 
     class _FakeApp:
         def __init__(self) -> None:
@@ -1051,6 +1052,9 @@ def verify_swap_update_transaction_and_state() -> None:
         root = Path(td)
         manifest_path = root / "manifest.yaml"
         shutil.copyfile(_REPO_ROOT / "manifest.example.yaml", manifest_path)
+
+        real_cache_path = update_check._CACHE_PATH
+        update_check._CACHE_PATH = root / "upstream.update-cache.yaml"
 
         fake_app = _FakeApp()
         token = active_app.set(fake_app)
@@ -1106,6 +1110,7 @@ def verify_swap_update_transaction_and_state() -> None:
             assert screen._llama_swap_check["pinned"] == "v256"
             assert any("llama-swap updated to v256 — service restarted" in n for n in fake_app.notifications)
         finally:
+            update_check._CACHE_PATH = real_cache_path
             swap_step.install_pinned_binary = orig_install
             swap_step.reconcile_service = orig_reconcile
             active_app.reset(token)

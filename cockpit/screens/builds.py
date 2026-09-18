@@ -1680,6 +1680,7 @@ class BuildsScreen(CockpitScreenBase):
             message, confirm_label="Update llama-swap", mutates_system=True, requires_root=True
         ):
             return
+        self._open_log_modal(f"Updating llama-swap to {new_version}")
         self._run_swap_update(new_version, check)
 
     def _manifest_path(self) -> Path:
@@ -1692,16 +1693,28 @@ class BuildsScreen(CockpitScreenBase):
 
     @work(thread=True)
     def _run_swap_update(self, new_version: str, check: dict) -> None:
+        handler = _BuildLogHandler(self)
+        provision_logger = logging.getLogger("provision")
+        prior_level = provision_logger.level
+        if provision_logger.level == logging.NOTSET or provision_logger.level > logging.INFO:
+            provision_logger.setLevel(logging.INFO)
+        provision_logger.addHandler(handler)
+
+        pr = self.privileged_runner
+        runner = Runner(dry_run=pr.dry_run, sudo=pr.sudo, on_output=self._on_build_output)
         target_manifest = copy.deepcopy(self.manifest)
         target_manifest.setdefault("llama_swap", {})["version"] = new_version
         try:
-            swap_step.install_pinned_binary(self.host_profile, target_manifest, self.privileged_runner)
+            swap_step.install_pinned_binary(self.host_profile, target_manifest, runner)
         except SystemExit as e:
             self.app.call_from_thread(self.app.notify, f"llama-swap update failed: {e}", severity="error")
             return
         except Exception as e:
             self.app.call_from_thread(self.app.notify, f"llama-swap update failed: {e}", severity="error")
             return
+        finally:
+            provision_logger.removeHandler(handler)
+            provision_logger.setLevel(prior_level)
 
         manifest_file = self._manifest_path()
         try:
@@ -1738,7 +1751,7 @@ class BuildsScreen(CockpitScreenBase):
         tail = {
             "restarted": " — service restarted",
             "started": " — service enabled and started",
-            "no-unit": " — no llama-swap.service on this host, so nothing was restarted",
+            "no-unit": " (binary installed at /usr/local/bin; service not yet deployed)",
             "unknown": " — could not reach systemd to restart the service",
         }.get(service_state, "")
         self.app.notify(f"llama-swap updated to {new_version}{tail}")
