@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import copy
 import os
+import shutil
 import socket
 import subprocess
 from pathlib import Path
@@ -955,6 +956,16 @@ class SettingsScreen(CockpitScreenBase):
         hostname = self.host_profile["hostname"] if self.host_profile else self.app_ref.host_name
         return self.repo_root / "hosts" / f"{hostname}.yaml"
 
+    def _ensure_manifest_copied(self) -> None:
+        """On first run, copy manifest.example.yaml to manifest.yaml verbatim if manifest.yaml
+        does not exist yet. Never overwrite an existing manifest.yaml (§0e-1, plans/08)."""
+        target = self.repo_root / "manifest.yaml"
+        template = self.repo_root / "manifest.example.yaml"
+        if not target.exists() and template.exists():
+            shutil.copyfile(template, target)
+            if hasattr(self.app, "manifest_path"):
+                self.app.manifest_path = target
+
     @work
     async def _confirm_and_save_profile(self) -> None:
         candidate, err = self._build_profile_candidate()
@@ -974,10 +985,13 @@ class SettingsScreen(CockpitScreenBase):
         if not confirmed:
             return
 
+        is_first_run = self.host_profile is None
         content = yaml.safe_dump(candidate, sort_keys=False)
         target_path = self._host_profile_path()
         target_path.parent.mkdir(parents=True, exist_ok=True)
         target_path.write_text(content, encoding="utf-8")
+        if is_first_run:
+            self._ensure_manifest_copied()
 
         self.host_profile = candidate
         self._render_gpu_list()
@@ -1009,10 +1023,13 @@ class SettingsScreen(CockpitScreenBase):
         if not confirmed:
             return
 
+        is_first_run = self.host_profile is None
         content = yaml.safe_dump(candidate, sort_keys=False)
         target_path = self._host_profile_path()
         target_path.parent.mkdir(parents=True, exist_ok=True)
         target_path.write_text(content, encoding="utf-8")
+        if is_first_run:
+            self._ensure_manifest_copied()
 
         self.host_profile = candidate
         self._render_gpu_list()

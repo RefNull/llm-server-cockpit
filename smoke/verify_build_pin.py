@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -940,8 +941,48 @@ def verify_missing_manifest_fails_with_remedy() -> None:
     print("verify_build_pin: missing manifest.yaml fails with remedy — OK")
 
 
+def verify_first_run_creates_manifest_verbatim() -> None:
+    """Phase 3: on first run with no manifest.yaml, setup produces one byte-identical to
+    the template including comments. Running setup twice does not overwrite an edited
+    manifest.yaml."""
+    from cockpit.screens.settings import SettingsScreen
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        template = _REPO_ROOT / "manifest.example.yaml"
+        shutil.copyfile(template, root / "manifest.example.yaml")
+        (root / "hosts").mkdir()
+
+        class _FakeSettingsScreen:
+            def __init__(self, repo_root: Path):
+                self.repo_root = repo_root
+                self.app = None
+
+            _ensure_manifest_copied = SettingsScreen._ensure_manifest_copied
+
+        fake_screen = _FakeSettingsScreen(root)
+        target = root / "manifest.yaml"
+        assert not target.exists()
+
+        # 1. First run creates manifest.yaml verbatim
+        fake_screen._ensure_manifest_copied()
+        assert target.exists()
+        assert target.read_bytes() == template.read_bytes(), "copied manifest is not byte-identical to template"
+
+        # 2. Edit manifest.yaml
+        edited_content = target.read_text() + "\n# custom edit\n"
+        target.write_text(edited_content)
+
+        # 3. Second run does not overwrite edited manifest.yaml
+        fake_screen._ensure_manifest_copied()
+        assert target.read_text() == edited_content, "second setup run overwrote edited manifest.yaml"
+
+    print("verify_build_pin: first run creates manifest verbatim, second run preserves edits — OK")
+
+
 def main() -> None:
     verify_missing_manifest_fails_with_remedy()
+    verify_first_run_creates_manifest_verbatim()
     verify_manifest_roundtrip()
     verify_write_manifest_ref_rejects_non_sha()
     verify_force_flag()

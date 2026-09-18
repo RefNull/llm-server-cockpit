@@ -183,9 +183,12 @@ class CockpitApp(App):
         self.theme = "cockpit-amber"
         self.host_name = host or socket.gethostname()
         self.repo_root = REPO_ROOT
+        profile_path = REPO_ROOT / "hosts" / f"{self.host_name}.yaml"
         if manifest_path is not None:
             self.manifest_path = Path(manifest_path)
         elif self.host_name == "example":
+            self.manifest_path = REPO_ROOT / "manifest.example.yaml"
+        elif not (REPO_ROOT / "manifest.yaml").exists() and not profile_path.exists() and (REPO_ROOT / "manifest.example.yaml").exists():
             self.manifest_path = REPO_ROOT / "manifest.example.yaml"
         else:
             self.manifest_path = REPO_ROOT / "manifest.yaml"
@@ -194,7 +197,7 @@ class CockpitApp(App):
         # This does not change the first-run case — try_load_host_profile returns None before
         # ever consulting the manifest when hosts/<host>.yaml does not exist yet.
         self.manifest = schema.load_manifest(self.manifest_path)
-        self.host_profile = schema.try_load_host_profile(REPO_ROOT / "hosts" / f"{self.host_name}.yaml", self.manifest)
+        self.host_profile = schema.try_load_host_profile(profile_path, self.manifest)
         if self.host_profile is not None:
             try:
                 self.models = schema.load_models(REPO_ROOT / "models.yaml", self.host_profile, self.manifest)

@@ -101,6 +101,7 @@ python3 -m venv .venv
 Initialize local deployment configurations from templates:
 
 ```bash
+cp manifest.example.yaml manifest.yaml
 cp hosts/example.yaml hosts/$(hostname).yaml
 cp models.example.yaml models.yaml
 ```
