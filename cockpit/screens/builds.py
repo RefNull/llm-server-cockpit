@@ -1683,6 +1683,21 @@ class BuildsScreen(CockpitScreenBase):
 
     @work(thread=True)
     def _run_swap_update(self, new_version: str) -> None:
+        # Preflight before anything mutates. install_pinned_binary() + restart_or_start()
+        # deliberately never install the unit file — only swap.run() does, because writing it
+        # also regenerates config.yaml, which is a deploy rather than an update. So on a host
+        # where llama-swap was never deployed, this used to bump the pin, swap the binary, and
+        # only then fail on `systemctl enable --now` with a bare exit 1 — leaving manifest.yaml
+        # claiming a version the machine had no service for. Checking first means a host that
+        # cannot finish the update is not half-updated by it.
+        if not swap_step.unit_installed():
+            self.app.call_from_thread(
+                self.app.notify,
+                "llama-swap has no systemd unit on this host — deploy it from LLM > Models "
+                "first. Nothing was changed.",
+                severity="warning",
+            )
+            return
         try:
             _write_manifest_llama_swap_version(self.repo_root / "manifest.yaml", new_version)
         except Exception as e:

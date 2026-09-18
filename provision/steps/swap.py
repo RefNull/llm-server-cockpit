@@ -331,6 +331,32 @@ def install_pinned_binary(host_profile: dict[str, Any], manifest: dict[str, Any]
     return _install_llama_swap(host_profile, manifest, runner)
 
 
+def unit_installed() -> bool:
+    """True when llama-swap's systemd unit file exists on this host.
+
+    `install_pinned_binary()` + `restart_or_start()` deliberately do not install it — only
+    run() does (_install_unit), because writing the unit also means regenerating config.yaml
+    and that is a full deploy, not an update. So a caller that only swaps the binary must
+    check this first: on a host where llama-swap was never deployed through this toolkit,
+    `systemctl enable --now` fails with a bare exit 1 and no explanation."""
+    return _UNIT_PATH.exists()
+
+
+def _systemctl(runner: Runner, *args: str) -> None:
+    """systemctl through Runner with its output captured, so a failure carries systemd's own
+    reason instead of just an exit code. Without capture=True the child inherits stdout/stderr,
+    which under the TUI means the message is painted over the screen and lost, leaving the
+    operator with "returned non-zero exit status 1" and nothing to act on."""
+    try:
+        runner.run(["systemctl", *args], capture=True)
+    except subprocess.CalledProcessError as e:
+        detail = (e.output or "").strip()
+        raise RuntimeError(
+            f"systemctl {' '.join(args)} failed (exit {e.returncode})"
+            + (f": {detail}" if detail else " with no output")
+        ) from e
+
+
 def restart_or_start(runner: Runner) -> None:
     """Restart llama-swap if it's already running, otherwise start+enable it — without
     touching config.yaml or the unit file. Narrow counterpart to run()'s own tail (lines
@@ -338,10 +364,16 @@ def restart_or_start(runner: Runner) -> None:
     install_pinned_binary()) can bring the running service in line with it: without this,
     `_current_installed_version` would report the new pin while the running process still
     executes the old inode."""
+    if not unit_installed():
+        raise RuntimeError(
+            f"{_UNIT_NAME} is not installed at {_UNIT_PATH} — llama-swap has never been "
+            "deployed on this host. Deploy it from LLM > Models first; updating the binary "
+            "cannot start a service that has no unit file."
+        )
     if _is_active(_UNIT_NAME):
-        runner.run(["systemctl", "restart", _UNIT_NAME])
+        _systemctl(runner, "restart", _UNIT_NAME)
     else:
-        runner.run(["systemctl", "enable", "--now", _UNIT_NAME])
+        _systemctl(runner, "enable", "--now", _UNIT_NAME)
 
 
 def _sync_timer_pair(
