@@ -154,9 +154,9 @@ class SettingsScreen(CockpitScreenBase):
         self.repo_root = repo_root
         self.app_ref = app_ref
         # First-run only: in-memory GPU rows being built up before the profile exists —
-        # the schema requires gpus: minItems 1, so this always starts with one blank entry
-        # matching the previous single-GPU default (id=gpu0/vendor=nvidia/backends=cuda).
-        self._pending_gpus: list[dict[str, Any]] = [{"id": "gpu0", "vendor": "nvidia", "backends": ["cuda"]}]
+        # the schema requires gpus: minItems 1, so this starts with one GPU entry with no backends
+        # bound yet (operators bind backends per GPU via Add build in LLM > Backends).
+        self._pending_gpus: list[dict[str, Any]] = [{"id": "gpu0", "vendor": "nvidia", "backends": []}]
         # NIC name -> live MAC, refreshed by _populate_wol_form. Empty on a host without
         # sysfs (or in the first-run wizard, where the WOL form isn't composed at all).
         self._iface_macs: dict[str, str] = {}
@@ -225,7 +225,7 @@ class SettingsScreen(CockpitScreenBase):
                     yield Label("Vendor")
                     yield Select(_GPU_VENDOR_OPTIONS, id="gpu-add-vendor", allow_blank=False, value="nvidia")
                     yield Label(f"Backends (comma-separated: {self._backend_hint()})")
-                    yield Input(id="gpu-add-backends", placeholder="cuda")
+                    yield Input(id="gpu-add-backends", placeholder="e.g. cuda (optional)")
                     yield Static("", id="gpu-add-error", classes="error-text")
                     with Horizontal(classes="action-row-primary"):
                         yield Button("Save GPU", id="btn-gpu-save", classes="thin-button", variant="primary")
@@ -317,7 +317,7 @@ class SettingsScreen(CockpitScreenBase):
                         yield Label("Vendor")
                         yield Select(_GPU_VENDOR_OPTIONS, id="gpu-add-vendor", allow_blank=False, value="nvidia")
                         yield Label(f"Backends (comma-separated: {self._backend_hint()})")
-                        yield Input(id="gpu-add-backends", placeholder="cuda")
+                        yield Input(id="gpu-add-backends", placeholder="e.g. cuda (optional)")
                         yield Static("", id="gpu-add-error", classes="error-text")
                         with Horizontal(classes="action-row-primary"):
                             yield Button("Save GPU", id="btn-gpu-save", classes="thin-button", variant="primary")
@@ -474,8 +474,9 @@ class SettingsScreen(CockpitScreenBase):
         table = self.query_one("#gpu-table", CockpitDataTable)
         table.clear()
         for gpu in self._pending_gpus:
+            backends_str = ", ".join(gpu.get("backends", [])) or "—"
             table.add_row(
-                Text(gpu["id"]), Text(gpu["vendor"]), Text(", ".join(gpu["backends"])), Text("—"), key=gpu["id"]
+                Text(gpu["id"]), Text(gpu["vendor"]), Text(backends_str), Text("—"), key=gpu["id"]
             )
 
     def _render_gpu_list(self) -> None:
@@ -484,10 +485,11 @@ class SettingsScreen(CockpitScreenBase):
         if self.host_profile and "gpus" in self.host_profile:
             for gpu in self.host_profile["gpus"]:
                 status = self._driver_status_by_gpu.get(gpu["id"], self._driver_status_default)
+                backends_str = ", ".join(gpu.get("backends", [])) or "—"
                 table.add_row(
                     Text(gpu["id"]),
                     Text(gpu["vendor"]),
-                    Text(", ".join(gpu.get("backends", []))),
+                    Text(backends_str),
                     Text(status),
                     key=gpu["id"],
                 )
@@ -501,7 +503,7 @@ class SettingsScreen(CockpitScreenBase):
         next_id = f"gpu{existing_count}"
         self.query_one("#gpu-add-id", Input).value = next_id
         self.query_one("#gpu-add-vendor", Select).value = "nvidia"
-        self.query_one("#gpu-add-backends", Input).value = "cuda"
+        self.query_one("#gpu-add-backends", Input).value = ""
         self.query_one("#gpu-add-error", Static).update("")
         self.query_one("#gpu-add-id", Input).focus()
 
@@ -521,8 +523,6 @@ class SettingsScreen(CockpitScreenBase):
         if vendor is Select.BLANK or not vendor:
             return None, "Vendor is required"
         backends = [b.strip() for b in backends_raw.split(",") if b.strip()]
-        if not backends:
-            return None, "At least one backend is required (e.g. cuda)"
         known = sorted(self.manifest.get("backends", {}).keys())
         for b in backends:
             if b not in known:

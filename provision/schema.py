@@ -90,8 +90,8 @@ def validate_host_profile_dict(
         _require(g, ["id", "vendor", "backends"], f"{source}.gpus[{i}]")
         if g["vendor"] not in ("nvidia", "amd", "intel"):
             raise ValidationError(f"{source}.gpus[{i}].vendor: invalid vendor {g['vendor']!r}")
-        if not isinstance(g["backends"], list) or len(g["backends"]) == 0:
-            raise ValidationError(f"{source}.gpus[{i}].backends: must be a non-empty list")
+        if not isinstance(g["backends"], list):
+            raise ValidationError(f"{source}.gpus[{i}].backends: must be a list")
         if known_backends is not None:
             kb = frozenset(known_backends)
             for b in g["backends"]:

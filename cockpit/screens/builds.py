@@ -777,24 +777,11 @@ class ChangeVersionModal(ModalScreen[str | None]):
         self.app.call_from_thread(self.dismiss, sha)
 
 
-class AddDeploymentModal(ModalScreen[tuple[str, str] | None]):
-    """Binds an existing backend to an existing GPU (plans/06 Phase 4, A4) — the "Add
-    deployment" vector under the Installs table's llama.cpp section. Shell cloned from
-    ChangeVersionModal (nearest pick-one-and-dismiss precedent in this file), but this one has
-    no table: two `Select`s, both closed lists, so nothing typed here can name a GPU or a
-    backend that does not already exist.
-
-    Per operator decision (plans/06 §0h-2) this **never adds or renames a GPU** — Settings ->
-    GPU Topology stays the only editor for `gpus[]` itself, and the GPU `Select`'s options come
-    straight from `host_profile["gpus"]`. The backend `Select`'s options come from
-    `manifest["backends"].keys()` — the same source `settings.py`'s `_backend_hint`/
-    `_validate_gpu_form` derive from — so a backend with no `manifest.yaml` recipe is
-    structurally unselectable rather than merely rejected after the fact.
-
-    Only picks and validates the pairing; it does not write anything. The caller
-    (BuildsScreen._confirm_and_add_deployment) owns the schema re-validation, the confirm
-    step and the write — the same split ChangeVersionModal already has with
-    _confirm_and_change_version.
+class AddDeploymentModal(ModalScreen[tuple[str, str, list[str], bool] | None]):
+    """Binds a backend to a GPU and prepares its build configuration. Shell cloned from
+    BackendDetailModal and ChangeVersionModal: lets the operator select an existing GPU and
+    backend, view/customize cmake_flags, preview the exact cmake command line, and choose
+    to either save the deployment configuration or immediately compile via "Add & build".
     """
 
     BINDINGS = [("escape", "dismiss_modal", "Close")]
@@ -804,8 +791,8 @@ class AddDeploymentModal(ModalScreen[tuple[str, str] | None]):
         align: center middle;
     }
     #deployment-dialog {
-        width: 60;
-        height: auto;
+        width: 76;
+        height: 85%;
         border: thick $background 80%;
         background: $surface;
         padding: $space-normal $space-section;
@@ -817,6 +804,23 @@ class AddDeploymentModal(ModalScreen[tuple[str, str] | None]):
     #deployment-title {
         width: 1fr;
         text-style: bold;
+    }
+    #deployment-body {
+        height: 1fr;
+    }
+    #deployment-flags-group {
+        height: auto;
+        margin-bottom: $space-normal;
+    }
+    #f-deployment-cmake-flags {
+        height: 6;
+    }
+    #deployment-command-group {
+        height: auto;
+        margin-bottom: $space-normal;
+    }
+    #deployment-build-command {
+        color: $text-muted;
     }
     #deployment-error {
         color: $error;
@@ -835,18 +839,64 @@ class AddDeploymentModal(ModalScreen[tuple[str, str] | None]):
         backend_options = [(b, b) for b in sorted(self.manifest.get("backends", {}).keys())]
         with Vertical(id="deployment-dialog"):
             with Horizontal(id="deployment-header"):
-                yield Static("Add Deployment", id="deployment-title")
+                yield Static("Add Build", id="deployment-title")
                 yield Button("×", id="deployment-close", classes="close-button", variant="error")
-            with Horizontal(classes="form-row"):
-                yield Static("GPU", classes="form-label")
-                yield Select(gpu_options, id="f-deployment-gpu", allow_blank=True, classes="form-field")
-            with Horizontal(classes="form-row"):
-                yield Static("Backend", classes="form-label")
-                yield Select(backend_options, id="f-deployment-backend", allow_blank=True, classes="form-field")
-            yield Static("", id="deployment-error")
+            with VerticalScroll(id="deployment-body"):
+                with Horizontal(classes="form-row"):
+                    yield Static("GPU", classes="form-label")
+                    yield Select(gpu_options, id="f-deployment-gpu", allow_blank=True, classes="form-field")
+                with Horizontal(classes="form-row"):
+                    yield Static("Backend", classes="form-label")
+                    yield Select(backend_options, id="f-deployment-backend", allow_blank=True, classes="form-field")
+                with Vertical(id="deployment-flags-group"):
+                    yield Static("cmake_flags", classes="form-label")
+                    yield TextArea(id="f-deployment-cmake-flags")
+                with Vertical(id="deployment-command-group"):
+                    yield Static("Build command", classes="form-label")
+                    yield Static("", id="deployment-build-command")
+                yield Static("", id="deployment-error")
             with Horizontal(classes="action-row-primary"):
-                yield Button("Add", id="btn-deployment-add", variant="primary", classes="thin-button")
+                yield Button("Add & build", id="btn-deployment-add-build", variant="primary", classes="thin-button")
+                yield Button("Add", id="btn-deployment-add", classes="thin-button")
                 yield Button("Cancel", id="btn-deployment-cancel", classes="thin-button")
+
+    def on_mount(self) -> None:
+        self.query_one("#deployment-build-command", Static).update("(select a backend)")
+
+    def _update_build_command(self) -> None:
+        backend = self.query_one("#f-deployment-backend", Select).value
+        if backend is Select.BLANK or not backend:
+            self.query_one("#deployment-build-command", Static).update("(select a backend)")
+            return
+        flags = [
+            line.strip()
+            for line in self.query_one("#f-deployment-cmake-flags", TextArea).text.splitlines()
+            if line.strip()
+        ]
+        recipe = {**self.manifest.get("backends", {}).get(str(backend), {}), "cmake_flags": flags}
+        prefix = Path(self.host_profile.get("paths", {}).get("prefix_root", "/opt/llm-server/builds")) / str(backend)
+        try:
+            checkout_dir = build_step.checkout_dir_for(self.host_profile)
+            argv = build_step.resolve_cmake_argv(str(backend), recipe, checkout_dir, prefix)
+            cmd = " ".join(shlex.quote(a) for a in argv)
+            self.query_one("#deployment-build-command", Static).update(escape_markup(cmd))
+        except Exception as e:
+            self.query_one("#deployment-build-command", Static).update(escape_markup(f"(preview unavailable: {e})"))
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id == "f-deployment-backend":
+            backend = event.value
+            if backend is not Select.BLANK and backend:
+                recipe = self.manifest.get("backends", {}).get(str(backend), {})
+                flags = recipe.get("cmake_flags", [])
+                self.query_one("#f-deployment-cmake-flags", TextArea).text = "\n".join(flags)
+            else:
+                self.query_one("#f-deployment-cmake-flags", TextArea).text = ""
+            self._update_build_command()
+
+    def on_text_area_changed(self, event: TextArea.Changed) -> None:
+        if event.text_area.id == "f-deployment-cmake-flags":
+            self._update_build_command()
 
     def _set_error(self, message: str) -> None:
         self.query_one("#deployment-error", Static).update(message)
@@ -855,9 +905,11 @@ class AddDeploymentModal(ModalScreen[tuple[str, str] | None]):
         if event.button.id in ("deployment-close", "btn-deployment-cancel"):
             self.dismiss(None)
         elif event.button.id == "btn-deployment-add":
-            self._select()
+            self._select(should_build=False)
+        elif event.button.id == "btn-deployment-add-build":
+            self._select(should_build=True)
 
-    def _select(self) -> None:
+    def _select(self, should_build: bool = False) -> None:
         gpu_id = self.query_one("#f-deployment-gpu", Select).value
         backend = self.query_one("#f-deployment-backend", Select).value
         if gpu_id is Select.BLANK or backend is Select.BLANK:
@@ -867,10 +919,15 @@ class AddDeploymentModal(ModalScreen[tuple[str, str] | None]):
         if gpu is None:
             self._set_error(f"unknown GPU {gpu_id!r}")
             return
-        if backend in gpu.get("backends", []):
-            self._set_error(f"{gpu_id!r} already has backend {backend!r}")
+        flags = [
+            line.strip()
+            for line in self.query_one("#f-deployment-cmake-flags", TextArea).text.splitlines()
+            if line.strip()
+        ]
+        if not flags:
+            self._set_error("cmake_flags cannot be empty — at least one flag is required")
             return
-        self.dismiss((str(gpu_id), str(backend)))
+        self.dismiss((str(gpu_id), str(backend), flags, should_build))
 
     def action_dismiss_modal(self) -> None:
         self.dismiss(None)
@@ -909,7 +966,7 @@ class BackendDetailModal(ModalScreen[None]):
     }
     #detail-dialog {
         width: 90%;
-        height: 80%;
+        height: 85%;
         border: thick $background 80%;
         background: $surface;
         padding: $space-normal $space-section;
@@ -930,7 +987,7 @@ class BackendDetailModal(ModalScreen[None]):
         margin-bottom: $space-normal;
     }
     #f-detail-cmake-flags {
-        height: 5;
+        height: 12;
     }
     #detail-command-group {
         height: auto;
@@ -1195,13 +1252,12 @@ class BuildsScreen(CockpitScreenBase):
                     yield Button("Update to latest", id="btn-update-to-latest", classes="thin-button")
                     yield Button("Change version…", id="btn-change-version", classes="thin-button")
 
-            if not self.backends:
-                yield Static(
-                    "host profile declares no GPU backends (hosts/*.yaml gpus[].backends) — "
-                    "nothing to build.",
-                    id="no-backends",
-                    classes="panel",
-                )
+            yield Static(
+                "host profile declares no GPU backends (hosts/*.yaml gpus[].backends) — "
+                "nothing to build.",
+                id="no-backends",
+                classes="panel",
+            )
 
             # No fixed_columns (DESIGN.md §4.2): datatable--fixed REPLACES the row style rather
             # than compositing with it, so a pinned column cut a flat band down column 0 through
@@ -1228,6 +1284,9 @@ class BuildsScreen(CockpitScreenBase):
                 yield Button("Build log", id="btn-build-log", classes="thin-button")
 
     def on_mount(self) -> None:
+        no_backends = self.query("#no-backends")
+        if no_backends:
+            no_backends.first().display = not bool(self.backends)
         backends_table = self.query_one("#backends-table", SingleClickDataTable)
         backends_table.cursor_type = "row"
         backends_table.zebra_stripes = True
@@ -1417,6 +1476,10 @@ class BuildsScreen(CockpitScreenBase):
             )
             self._swap_unit_name = swap_facts["unit_name"]
 
+        no_backends = self.query("#no-backends")
+        if no_backends:
+            no_backends.first().display = not bool(self.backends)
+
         table = self.query_one("#backends-table", SingleClickDataTable)
         table.clear()
         for backend in self.backends:
@@ -1512,16 +1575,18 @@ class BuildsScreen(CockpitScreenBase):
                 callback=lambda _: self._refresh_backends_table(),
             )
             return
-        if action_id != "build":
-            return
+        if action_id == "build":
+            self._start_backend_build(row_key)
+
+    def _start_backend_build(self, backend: str) -> None:
         if self._building_backends:
             self.notify("a build is already in progress", severity="warning")
             return
         ref = self.manifest.get("llama_cpp", {}).get("ref", "")
-        force = self._is_rebuild(row_key, ref)
+        force = self._is_rebuild(backend, ref)
         self._log_buffer = []
-        self._open_log_modal(f"Build log — {row_key}")
-        self._run_build([row_key], force=force)
+        self._open_log_modal(f"Build log — {backend}")
+        self._run_build([backend], force=force)
 
     # ------------------------------------------------------------------ button dispatch
 
@@ -1802,68 +1867,92 @@ class BuildsScreen(CockpitScreenBase):
         else:
             self.manifest = schema.load_manifest(self._manifest_path())
 
-    # ------------------------------------------------------------------ add deployment (writes hosts/<hostname>.yaml, never builds)
+    # ------------------------------------------------------------------ add deployment (writes hosts/<hostname>.yaml and optionally builds)
 
     @work
     async def _confirm_and_add_deployment(self) -> None:
-        """Binds an existing backend to an existing GPU by writing hosts/<hostname>.yaml
-        gpus[].backends (plans/06 Phase 4, A4). Never adds or renames a GPU (§0h-2) — if the
-        host profile has none, this points at Settings -> GPU Topology instead of growing a
-        second GPU-editing form here."""
+        """Opens AddDeploymentModal to bind a backend to a GPU, customize cmake_flags,
+        and optionally trigger compilation immediately."""
         if not self.host_profile.get("gpus"):
             self.notify("no GPUs configured — add one in Settings -> GPU Topology first", severity="warning")
             return
         selection = await self.app.push_screen_wait(AddDeploymentModal(self.host_profile, self.manifest))
         if selection is None:
             return
-        gpu_id, backend = selection
+        gpu_id, backend, edited_flags, should_build = selection
 
         candidate = copy.deepcopy(self.host_profile)
         target_gpu = next((g for g in candidate["gpus"] if g["id"] == gpu_id), None)
         if target_gpu is None:
             self.notify(f"unknown GPU {gpu_id!r}", severity="error")
             return
-        if backend in target_gpu.get("backends", []):
-            # AddDeploymentModal already rejected this against the same host_profile reference;
-            # re-checking against the fresh deep copy only matters if the profile changed
-            # between opening the modal and confirming here (another screen's write landing in
-            # between) — cheap enough to keep as a genuine second check, not a copy of the first.
-            self.notify(f"{gpu_id!r} already has backend {backend!r}", severity="warning")
-            return
-        target_gpu["backends"] = list(target_gpu.get("backends", [])) + [backend]
 
-        try:
-            schema.validate_host_profile_dict(candidate, known_backends=self.manifest["backends"].keys())
-        except schema.ValidationError as e:
-            self.notify(f"validation failed: {e}", severity="error")
-            return
+        is_already_bound = backend in target_gpu.get("backends", [])
+        if not is_already_bound:
+            target_gpu["backends"] = list(target_gpu.get("backends", [])) + [backend]
+            try:
+                schema.validate_host_profile_dict(candidate, known_backends=self.manifest["backends"].keys())
+            except schema.ValidationError as e:
+                self.notify(f"validation failed: {e}", severity="error")
+                return
 
-        message = f"Bind backend {backend!r} to GPU {gpu_id!r} in hosts/{self.app_ref.host_name}.yaml?"
-        confirmed = await self.app.push_screen_wait(ConfirmModal(message, confirm_label="Add", danger=True))
-        if not confirmed:
-            return
+        recipe_flags = self.manifest.get("backends", {}).get(backend, {}).get("cmake_flags", [])
+        flags_changed = (edited_flags != recipe_flags)
 
-        # Keyed on app_ref.host_name (the file cockpit/app.py actually loaded, --host or the
-        # machine's own hostname), not candidate["hostname"] (the field inside it) — settings.py
-        # ._host_profile_path() uses the latter, which is a pre-existing latent bug there: dormant
-        # only because the two happen to match on every host profile in this repo today. Do not
-        # copy that idiom here; a write keyed on the field can land in a different file than the
-        # one that was read the moment they diverge (e.g. `bin/cockpit --host staging`).
-        content = yaml.safe_dump(candidate, sort_keys=False)
-        target_path = self.repo_root / "hosts" / f"{self.app_ref.host_name}.yaml"
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        target_path.write_text(content, encoding="utf-8")
+        if not should_build:
+            action_desc = (
+                f"Bind backend {backend!r} to GPU {gpu_id!r} in hosts/{self.app_ref.host_name}.yaml?"
+                if not is_already_bound
+                else f"Save cmake_flags for backend {backend!r} in manifest.yaml?"
+            )
+            confirmed = await self.app.push_screen_wait(
+                ConfirmModal(action_desc, confirm_label="Save" if is_already_bound else "Add", danger=True)
+            )
+            if not confirmed:
+                return
+        else:
+            action_desc = (
+                f"Bind backend {backend!r} to GPU {gpu_id!r} and build llama.cpp?"
+                if not is_already_bound
+                else f"Build llama.cpp ({backend}) on GPU {gpu_id!r}?"
+            )
+            confirmed = await self.app.push_screen_wait(
+                ConfirmModal(action_desc, confirm_label="Build", danger=True)
+            )
+            if not confirmed:
+                return
 
-        # Reload through the app, not by keeping `candidate`: reload_host_profile() re-parses
-        # the file just written, and reading self.app_ref.host_profile back (rather than
-        # assigning `candidate` directly) means BuildsScreen ends up holding the same object
-        # every other screen's constructor would get on the next restart — one object, not two
-        # equal-but-distinct ones (the same shape dashboard.py:147 uses for self.models).
-        self.app_ref.reload_host_profile()
-        self.host_profile = getattr(self.app_ref, "host_profile", self.host_profile)
+        manifest_path = getattr(self.app_ref, "manifest_path", self.repo_root / "manifest.yaml")
+        if flags_changed and manifest_path.exists():
+            try:
+                _write_manifest_cmake_flags(manifest_path, backend, edited_flags, clear_example=True)
+                if self.app_ref is not None:
+                    self.app_ref.reload_manifest()
+                    self.manifest = getattr(self.app_ref, "manifest", self.manifest)
+                else:
+                    self.manifest = schema.load_manifest(manifest_path)
+            except Exception as e:
+                self.notify(f"failed to write manifest: {e}", severity="error")
+                return
+
+        if not is_already_bound:
+            content = yaml.safe_dump(candidate, sort_keys=False)
+            target_path = self.repo_root / "hosts" / f"{self.app_ref.host_name}.yaml"
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            target_path.write_text(content, encoding="utf-8")
+            self.app_ref.reload_host_profile()
+            self.host_profile = getattr(self.app_ref, "host_profile", self.host_profile)
+
         self.backends = self._compute_backends()
         self._refresh_backends_table()
-        self.notify(f"backend {backend!r} bound to {gpu_id!r} — hosts/{self.app_ref.host_name}.yaml written")
+
+        if not is_already_bound:
+            self.notify(f"backend {backend!r} bound to {gpu_id!r} — hosts/{self.app_ref.host_name}.yaml written")
+        elif flags_changed:
+            self.notify(f"flags updated for backend {backend!r} — manifest.yaml written")
+
+        if should_build:
+            self._start_backend_build(backend)
 
     # ------------------------------------------------------------------ build (blocking, off main thread)
 

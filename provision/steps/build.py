@@ -333,6 +333,26 @@ def _build_backend(
     nproc = str(os.cpu_count() or 4)
     source_script = recipe.get("source_script")
 
+    # Sanitize CUDACXX: CMake's CMakeDetermineCUDACompiler fails with:
+    # "Could not find compiler set in environment variable CUDACXX: <path>"
+    # if CUDACXX points to a compiler binary that does not exist on disk.
+    for target in (build_env, os.environ):
+        val = target.get("CUDACXX")
+        if val and not (Path(val.strip()).is_file() or shutil.which(val.strip())):
+            log.warning("build[%s]: ignoring invalid CUDACXX=%r (binary not found)", backend, val)
+            target.pop("CUDACXX", None)
+
+    if backend == "cuda" and not build_env.get("CUDACXX") and not os.environ.get("CUDACXX"):
+        default_nvcc = Path("/usr/local/cuda/bin/nvcc")
+        if default_nvcc.is_file():
+            build_env["CUDACXX"] = str(default_nvcc)
+            cuda_bin = str(default_nvcc.parent)
+            cur_path = os.environ.get("PATH", "")
+            if cuda_bin not in cur_path.split(os.pathsep):
+                build_env["PATH"] = f"{cuda_bin}{os.pathsep}{cur_path}"
+        elif shutil.which("nvcc"):
+            build_env["CUDACXX"] = shutil.which("nvcc")  # type: ignore[assignment]
+
     # cmake --install over hand-copying build-<backend>/bin/: llama.cpp's CMakeLists.txt
     # ships standard install() targets for llama-cli/llama-server/libllama, so this gives a
     # complete, correct prefix layout regardless of which targets a given backend produces.
@@ -351,7 +371,7 @@ def _build_backend(
         )
         runner.shell(script)
     else:
-        env = {**os.environ, **build_env} if build_env else None
+        env = {**os.environ, **build_env}
         runner.run(resolve_cmake_argv(backend, recipe, checkout_dir, prefix), env=env)
         runner.run(["cmake", "--build", str(builddir), "--config", "Release", "-j", nproc], env=env)
         runner.run(["cmake", "--install", str(builddir)], env=env)
