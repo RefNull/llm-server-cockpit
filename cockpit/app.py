@@ -183,8 +183,12 @@ class CockpitApp(App):
         self.theme = "cockpit-amber"
         self.host_name = host or socket.gethostname()
         self.repo_root = REPO_ROOT
-        self.host_profile = schema.try_load_host_profile(REPO_ROOT / "hosts" / f"{self.host_name}.yaml")
+        # Manifest first: try_load_host_profile validates gpus[].backends against
+        # manifest["backends"] (provision/schema.py), so it needs the manifest already loaded.
+        # This does not change the first-run case — try_load_host_profile returns None before
+        # ever consulting the manifest when hosts/<host>.yaml does not exist yet.
         self.manifest = schema.load_manifest(REPO_ROOT / "manifest.yaml")
+        self.host_profile = schema.try_load_host_profile(REPO_ROOT / "hosts" / f"{self.host_name}.yaml", self.manifest)
         if self.host_profile is not None:
             try:
                 self.models = schema.load_models(REPO_ROOT / "models.yaml", self.host_profile, self.manifest)

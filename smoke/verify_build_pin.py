@@ -45,6 +45,7 @@ bootstrap.add_venv_site_packages(_REPO_ROOT)
 
 from cockpit.screens.builds import _write_manifest_cmake_flags, _write_manifest_ref  # noqa: E402
 from cockpit.widgets import TableAction  # noqa: E402
+from provision import schema  # noqa: E402
 from provision.common import Runner  # noqa: E402
 from provision.steps import build as build_step  # noqa: E402
 
@@ -259,9 +260,15 @@ def verify_cmake_flags_roundtrip_order_independent() -> None:
 
 def verify_cmake_flags_roundtrip_real_manifest() -> None:
     """The real manifest.yaml: header, every sibling backend, and cuda's own apt_packages
-    comment must survive a cmake_flags rewrite targeting cuda."""
+    comment must survive a cmake_flags rewrite targeting cuda. Also covers the 2026-09-18
+    follow-up's `example: true` mark: a plain rewrite (clear_example=False, the default)
+    must leave it in place — the mark means "still stock", and this call doesn't claim to
+    know whether the new flags are still stock or not, so it must not touch the key."""
     original = (_REPO_ROOT / "manifest.yaml").read_text()
     header = original.split("llama_cpp:")[0]
+    assert "example: true" in original.split("vulkan:")[0].split("cuda:")[1], (
+        "fixture assumption broken: manifest.yaml's cuda recipe no longer has example: true"
+    )
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td) / "manifest.yaml"
         tmp.write_text(original)
@@ -274,11 +281,99 @@ def verify_cmake_flags_roundtrip_real_manifest() -> None:
         assert '"-DGGML_VULKAN=ON"' in after, "vulkan's cmake_flags were disturbed"
         assert '"-DGGML_SYCL=ON"' in after, "sycl's cmake_flags were disturbed"
         assert '"-DLLAMA_BUILD_TESTS=OFF"' in after, "new flag was not written"
+        cuda_block_after = after.split("cuda:")[1].split("rocm:")[0]
+        assert "example: true" in cuda_block_after, (
+            "example: true was dropped by a plain rewrite (clear_example=False) — it must "
+            "only be removed when explicitly requested"
+        )
         # ref: line (a completely different rewrite path) must be untouched by this call.
         assert "481c65f091f74c5e7089dd0a3a1cc6b50cced31e  # b10903" in after, (
             "llama_cpp.ref was disturbed by a cmake_flags-only rewrite"
         )
-    print("verify_build_pin: real manifest.yaml survives a cmake_flags rewrite — OK")
+    print("verify_build_pin: real manifest.yaml survives a cmake_flags rewrite, example: true intact — OK")
+
+
+def verify_example_mark_cleared_on_request() -> None:
+    """The same rewrite, with clear_example=True: `example: true` must be removed from
+    cuda's block, and only cuda's — every sibling backend's own `example: true` (rocm,
+    vulkan, sycl all ship one) must survive untouched, proving the removal is bounded to
+    the target backend's block the same way the cmake_flags rewrite itself is."""
+    original = (_REPO_ROOT / "manifest.yaml").read_text()
+    header = original.split("llama_cpp:")[0]
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td) / "manifest.yaml"
+        tmp.write_text(original)
+        new_flags = ["-DGGML_CUDA=ON", "-DGGML_NATIVE=OFF", "-DLLAMA_BUILD_TESTS=OFF"]
+        _write_manifest_cmake_flags(tmp, "cuda", new_flags, clear_example=True)
+        after = tmp.read_text()
+        assert after.startswith(header), "header comment block was not preserved"
+        # Scoped to the backends: block so the header comment's own mention of the literal
+        # text `example: true` (explaining the key) isn't miscounted as a recipe's key.
+        backends_after = after.split("backends:")[1]
+        cuda_block_after = backends_after.split("cuda:")[1].split("rocm:")[0]
+        assert "example: true" not in cuda_block_after, (
+            "example: true was not cleared from cuda's block despite clear_example=True"
+        )
+        assert backends_after.count("example: true") == 3, (
+            "clearing cuda's example: true must not touch rocm/vulkan/sycl's own — "
+            f"expected 3 remaining, found {backends_after.count('example: true')}"
+        )
+    print("verify_build_pin: clear_example=True removes only the target backend's example: true — OK")
+
+
+def _minimal_valid_host_profile(backends: list[str]) -> dict:
+    """The smallest host profile that satisfies every _require() in
+    validate_host_profile_dict — everything but gpus[0].backends is filler that only needs
+    to be structurally valid, since backend-name validation is what's under test here."""
+    return {
+        "hostname": "test-host",
+        "network": {
+            "vpn": {"interface": "wg0"},
+            "wol": {"interface": "eth0", "mac": "00:11:22:33:44:55"},
+            "gateway": {"port": 8090},
+        },
+        "gpus": [{"id": "gpu0", "vendor": "nvidia", "backends": backends}],
+        "paths": {"models_dir": "/models", "state_dir": "/state", "prefix_root": "/prefix"},
+        "retain_builds": 3,
+        "hf": {"token_env": "HF_TOKEN"},
+    }
+
+
+def verify_backend_names_derive_from_manifest() -> None:
+    """2026-09-18 operator QA: a backend recipe added only to manifest.yaml (not one of the
+    historical cuda/rocm/vulkan/sycl four) must be immediately bindable — validate_host_
+    profile_dict must accept it when given that manifest's backends, and still reject a name
+    in no manifest at all. Also proves the documented no-manifest contract: known_backends=
+    None skips the check entirely (deferred to validate_models_dict/build.run, per the
+    docstring on validate_host_profile_dict), it does not fall back to a hardcoded list —
+    that fallback was the reported bug, and a literal default here would silently reintroduce
+    it under a different name."""
+    manifest_with_custom_backend = {"backends": {"cuda": {}, "vulkan-igpu": {"cmake_flags": []}}}
+    profile_custom = _minimal_valid_host_profile(["vulkan-igpu"])
+    # Accepted: vulkan-igpu is a real key in this manifest's backends.
+    schema.validate_host_profile_dict(
+        profile_custom, known_backends=manifest_with_custom_backend["backends"].keys()
+    )
+
+    profile_bogus = _minimal_valid_host_profile(["not-a-real-backend"])
+    try:
+        schema.validate_host_profile_dict(
+            profile_bogus, known_backends=manifest_with_custom_backend["backends"].keys()
+        )
+        raised = False
+    except schema.ValidationError:
+        raised = True
+    assert raised, "a backend absent from every manifest must still be rejected"
+
+    # No manifest at all: the check is skipped, not defaulted to a hardcoded set — this is
+    # the documented contract, not an accident, so the same bogus name passes here.
+    schema.validate_host_profile_dict(profile_bogus, known_backends=None)
+
+    print(
+        "verify_build_pin: backend names derive from manifest.yaml — a manifest-only backend "
+        "is accepted, an unknown one is rejected, and known_backends=None defers (doesn't "
+        "fall back) — OK"
+    )
 
 
 def verify_cmake_flags_write_aborts_on_bad_backend() -> None:
@@ -377,6 +472,8 @@ def main() -> None:
     verify_force_flag()
     verify_cmake_flags_roundtrip_order_independent()
     verify_cmake_flags_roundtrip_real_manifest()
+    verify_example_mark_cleared_on_request()
+    verify_backend_names_derive_from_manifest()
     verify_cmake_flags_write_aborts_on_bad_backend()
     verify_resolve_cmake_argv_matches_build()
     verify_table_action_confirm_callable()

@@ -167,6 +167,12 @@ class SettingsScreen(CockpitScreenBase):
 
     # -- layout ---------------------------------------------------------------
 
+    def _backend_hint(self) -> str:
+        """Backends (comma-separated: …) hint text — derived from manifest.yaml's backends:
+        keys, the single source of truth _validate_gpu_form also checks against, rather than a
+        second hardcoded copy of the same list."""
+        return ", ".join(sorted(self.manifest.get("backends", {}).keys()))
+
     def compose(self) -> ComposeResult:
         if self.host_profile is None:
             yield from self._compose_wizard()
@@ -217,7 +223,7 @@ class SettingsScreen(CockpitScreenBase):
                     yield Input(id="gpu-add-id", placeholder="e.g. gpu0")
                     yield Label("Vendor")
                     yield Select(_GPU_VENDOR_OPTIONS, id="gpu-add-vendor", allow_blank=False, value="nvidia")
-                    yield Label("Backends (comma-separated: cuda, rocm, vulkan, sycl)")
+                    yield Label(f"Backends (comma-separated: {self._backend_hint()})")
                     yield Input(id="gpu-add-backends", placeholder="cuda")
                     yield Static("", id="gpu-add-error", classes="error-text")
                     with Horizontal(classes="action-row-primary"):
@@ -309,7 +315,7 @@ class SettingsScreen(CockpitScreenBase):
                         yield Input(id="gpu-add-id", placeholder="e.g. gpu2")
                         yield Label("Vendor")
                         yield Select(_GPU_VENDOR_OPTIONS, id="gpu-add-vendor", allow_blank=False, value="nvidia")
-                        yield Label("Backends (comma-separated: cuda, rocm, vulkan, sycl)")
+                        yield Label(f"Backends (comma-separated: {self._backend_hint()})")
                         yield Input(id="gpu-add-backends", placeholder="cuda")
                         yield Static("", id="gpu-add-error", classes="error-text")
                         with Horizontal(classes="action-row-primary"):
@@ -516,9 +522,10 @@ class SettingsScreen(CockpitScreenBase):
         backends = [b.strip() for b in backends_raw.split(",") if b.strip()]
         if not backends:
             return None, "At least one backend is required (e.g. cuda)"
+        known = sorted(self.manifest.get("backends", {}).keys())
         for b in backends:
-            if b not in ("cuda", "rocm", "vulkan", "sycl"):
-                return None, f"Unknown backend '{b}' (must be cuda, rocm, vulkan, or sycl)"
+            if b not in known:
+                return None, f"Unknown backend '{b}' (must be one of: {', '.join(known)})"
         return {"id": gpu_id, "vendor": str(vendor), "backends": backends}, None
 
     def _save_gpu_form(self) -> None:
@@ -550,7 +557,7 @@ class SettingsScreen(CockpitScreenBase):
         candidate = copy.deepcopy(self.host_profile)
         candidate["gpus"] = list(candidate.get("gpus", [])) + [new_gpu]
         try:
-            schema.validate_host_profile_dict(candidate)
+            schema.validate_host_profile_dict(candidate, known_backends=self.manifest["backends"].keys())
         except schema.ValidationError as e:
             self.query_one("#gpu-add-error", Static).update(f"validation failed: {e}")
             return
@@ -641,7 +648,7 @@ class SettingsScreen(CockpitScreenBase):
             self.query_one("#step-hardware-error", Static).update(err)
             return
         try:
-            schema.validate_host_profile_dict(candidate)
+            schema.validate_host_profile_dict(candidate, known_backends=self.manifest["backends"].keys())
         except schema.ValidationError as e:
             self.query_one("#step-hardware-error", Static).update(f"Validation error: {e}")
             return
@@ -715,7 +722,7 @@ class SettingsScreen(CockpitScreenBase):
             self.query_one("#step-review-error", Static).update(err)
             return
         try:
-            schema.validate_host_profile_dict(candidate)
+            schema.validate_host_profile_dict(candidate, known_backends=self.manifest["backends"].keys())
         except schema.ValidationError as e:
             self.query_one("#step-review-error", Static).update(f"validation failed: {e}")
             return
@@ -730,7 +737,7 @@ class SettingsScreen(CockpitScreenBase):
             self.query_one("#step-review-error", Static).update(err)
             return
         try:
-            schema.validate_host_profile_dict(candidate)
+            schema.validate_host_profile_dict(candidate, known_backends=self.manifest["backends"].keys())
         except schema.ValidationError as e:
             self.query_one("#step-review-error", Static).update(f"validation failed: {e}")
             return
@@ -955,7 +962,7 @@ class SettingsScreen(CockpitScreenBase):
             self._set_profile_error(err)
             return
         try:
-            schema.validate_host_profile_dict(candidate)
+            schema.validate_host_profile_dict(candidate, known_backends=self.manifest["backends"].keys())
         except schema.ValidationError as e:
             self._set_profile_error(f"validation failed: {e}")
             return
@@ -983,7 +990,7 @@ class SettingsScreen(CockpitScreenBase):
             self._set_profile_error(err)
             return
         try:
-            schema.validate_host_profile_dict(candidate)
+            schema.validate_host_profile_dict(candidate, known_backends=self.manifest["backends"].keys())
         except schema.ValidationError as e:
             self._set_profile_error(f"validation failed: {e}")
             return
@@ -1080,7 +1087,7 @@ class SettingsScreen(CockpitScreenBase):
         candidate = copy.deepcopy(self.host_profile)
         candidate.setdefault("network", {})["wol"] = {"interface": iface, "mac": mac}
         try:
-            schema.validate_host_profile_dict(candidate)
+            schema.validate_host_profile_dict(candidate, known_backends=self.manifest["backends"].keys())
         except schema.ValidationError as e:
             self.query_one("#wol-error", Static).update(f"validation failed: {e}")
             return
@@ -1271,7 +1278,7 @@ class SettingsScreen(CockpitScreenBase):
         # /usr/local/bin — and failed outright for an unprivileged cockpit. WOL has its own
         # Save button, which only writes the profile.
         try:
-            schema.validate_host_profile_dict(candidate)
+            schema.validate_host_profile_dict(candidate, known_backends=self.manifest["backends"].keys())
         except schema.ValidationError as e:
             self._set_service_error(f"validation failed: {e}")
             return

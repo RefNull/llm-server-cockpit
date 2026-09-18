@@ -24,34 +24,65 @@ textual:
 # *which* of these its GPUs use (hosts/<hostname>.yaml gpus[].backends).
 # Recipes for backends no host currently uses (rocm, sycl) stay here so
 # adding a new host with different hardware is a host-profile edit, not a
-# code change.
+# code change. `gpus[].backends` and this screen's "Add GPU" form both
+# validate against these keys directly (provision/schema.py,
+# cockpit/screens/settings.py) — add a recipe here and it is immediately
+# bindable, no code change required.
+#
+# `example: true` on a recipe below marks it as still-stock: shipped with
+# the repo, not yet tailored to any real machine (rendered as an "EX." tag
+# on the Installs tab and in that backend's detail view). It is not a
+# promise about what the flags do — only about whether an operator has
+# edited them. Saving an edit to a recipe's cmake_flags through the
+# Installs tab's detail view clears this key on that recipe automatically
+# (cockpit/screens/builds.py `_write_manifest_cmake_flags`); there is no
+# other way to add it back short of restoring the shipped defaults by hand.
 backends:
   cuda:
+    # GGML_NATIVE=OFF here, ON for vulkan below — deliberately asymmetric, not an
+    # inconsistency to harmonise. ON bakes -march=native into the binary: a free
+    # optimization on a fixed bare-metal host, and a wrong one if the binary is ever copied
+    # to different hardware. vulkan takes ON at the operator's request; cuda keeps OFF
+    # because that is the safer default for a recipe nobody has reviewed yet. (Kept above
+    # cmake_flags:, not between its items — `_write_manifest_cmake_flags`, the rewrite this
+    # editable list goes through, expects the list to be an unbroken run of `- "..."` lines.)
     cmake_flags:
       - "-DGGML_CUDA=ON"
+      - "-DGGML_VULKAN=OFF"
       - "-DGGML_NATIVE=OFF"
+      - "-DLLAMA_BUILD_TESTS=OFF"
     apt_packages: []  # CUDA toolkit presence is checked, not installed, by `provision drivers`
+    example: true
 
   rocm:
     cmake_flags:
       - "-DGGML_HIP=ON"
+      - "-DLLAMA_BUILD_TESTS=OFF"
     build_env:
       HIPCXX: "$(hipconfig -l)/clang"
       HIP_PATH: "$(hipconfig -R)"
     apt_packages: []  # ROCm stack presence is checked, not installed, by `provision drivers`
+    example: true
 
   vulkan:
+    # GGML_NATIVE=ON here, OFF for cuda above — see cuda's comment; deliberate, not the
+    # same default.
     cmake_flags:
       - "-DGGML_VULKAN=ON"
+      - "-DGGML_NATIVE=ON"
+      - "-DLLAMA_BUILD_TESTS=OFF"
     apt_packages:
       - libvulkan-dev
       - glslc
       - spirv-headers
+    example: true
 
   sycl:
     cmake_flags:
       - "-DGGML_SYCL=ON"
       - "-DCMAKE_C_COMPILER=icx"
       - "-DCMAKE_CXX_COMPILER=icpx"
+      - "-DLLAMA_BUILD_TESTS=OFF"
     source_script: /opt/intel/oneapi/setvars.sh  # sourced before cmake configure+build
     apt_packages: []
+    example: true

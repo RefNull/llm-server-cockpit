@@ -78,10 +78,14 @@ It orchestrates multi-backend `llama.cpp` compilation (CUDA, ROCm, Vulkan, SYCL)
 
 | Backend | Manifest Key | CMake Compilation Flags | Host Dependencies & Utilities | Target Hardware |
 | :--- | :--- | :--- | :--- | :--- |
-| **CUDA** | `cuda` | `-DGGML_CUDA=ON`, `-DGGML_NATIVE=OFF` | NVIDIA Driver, CUDA Toolkit (`nvidia-smi`) | NVIDIA GeForce, RTX, Tesla, Hopper |
-| **ROCm** | `rocm` | `-DGGML_HIP=ON` | AMD ROCm stack, `rocm-libs`, `amdgpu` (`hipconfig`) | AMD Radeon, Radeon Pro, Instinct |
-| **Vulkan** | `vulkan` | `-DGGML_VULKAN=ON` | `libvulkan-dev`, `glslc`, `spirv-headers` (`vulkaninfo`) | Intel Arc / iGPU, cross-vendor GPUs |
-| **SYCL** | `sycl` | `-DGGML_SYCL=ON`, `-DCMAKE_C_COMPILER=icx` | Intel oneAPI Base Toolkit (`setvars.sh`, `icx`/`icpx`) | Intel Data Center GPU Flex/Max, Arc |
+| **CUDA** | `cuda` | `-DGGML_CUDA=ON`, `-DGGML_VULKAN=OFF`, `-DGGML_NATIVE=OFF`, `-DLLAMA_BUILD_TESTS=OFF` | NVIDIA Driver, CUDA Toolkit (`nvidia-smi`) | NVIDIA GeForce, RTX, Tesla, Hopper |
+| **ROCm** | `rocm` | `-DGGML_HIP=ON`, `-DLLAMA_BUILD_TESTS=OFF` | AMD ROCm stack, `rocm-libs`, `amdgpu` (`hipconfig`) | AMD Radeon, Radeon Pro, Instinct |
+| **Vulkan** | `vulkan` | `-DGGML_VULKAN=ON`, `-DGGML_NATIVE=ON`, `-DLLAMA_BUILD_TESTS=OFF` | `libvulkan-dev`, `glslc`, `spirv-headers` (`vulkaninfo`) | Intel Arc / iGPU, cross-vendor GPUs |
+| **SYCL** | `sycl` | `-DGGML_SYCL=ON`, `-DCMAKE_C_COMPILER=icx`, `-DLLAMA_BUILD_TESTS=OFF` | Intel oneAPI Base Toolkit (`setvars.sh`, `icx`/`icpx`) | Intel Data Center GPU Flex/Max, Arc |
+
+`-DCMAKE_BUILD_TYPE=Release` is injected by the build step and is not repeated in any recipe. `-DGGML_NATIVE` is deliberately asymmetric — `ON` bakes `-march=native` into the binary, which is free performance on a fixed bare-metal host and wrong if that binary is ever copied to different hardware.
+
+**These recipes ship marked `example: true`.** The Installs tab renders such a backend as `EX. llama.cpp (<backend>)` — "still stock, nobody has tailored this" — and editing a recipe's `cmake_flags` from that tab's detail view clears the mark. Adding a recipe here makes that backend immediately bindable in `hosts/<hostname>.yaml` `gpus[].backends` and in Settings → GPU Topology; both validate against these keys rather than a hardcoded list.
 
 ## Installation
 

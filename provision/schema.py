@@ -7,6 +7,7 @@ not at first use on the live host.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from pathlib import Path
 
 import yaml
@@ -52,8 +53,24 @@ def _load_yaml(path: Path) -> dict:
         raise ValidationError(f"{path}: invalid YAML: {e}") from e
 
 
-def validate_host_profile_dict(data: dict, source: str = "host profile") -> None:
-    """Validate in-memory host profile dictionary."""
+def validate_host_profile_dict(
+    data: dict, source: str = "host profile", known_backends: Iterable[str] | None = None
+) -> None:
+    """Validate in-memory host profile dictionary.
+
+    `known_backends` is the manifest's `backends.keys()` — backend recipes are repo-level
+    (`manifest.yaml`, see AGENTS.md), so a host profile's `gpus[].backends` entries are only
+    as valid as the recipes that exist. When the caller has no manifest to check against
+    (`known_backends=None`), the unknown-backend check is skipped here rather than falling
+    back to a hardcoded name list: a literal default would itself be an uncredited copy of
+    `manifest["backends"].keys()` that silently drifts the moment a recipe is added or
+    renamed — exactly the defect this parameter exists to remove. Deferring is not losing the
+    check: `validate_models_dict` still rejects a model bound to a backend absent from the
+    manifest, and `provision.steps.build.run` hard-exits at build time with "backend 'x' is
+    used by a GPU in the host profile but has no recipe in manifest.yaml" — both of which run
+    with a manifest in hand by construction. A host profile can therefore pass this function
+    naming a backend with no recipe at all; it will not get past either of those.
+    """
     _require(data, ["hostname", "network", "gpus", "paths", "retain_builds", "hf"], source)
 
     net = data["network"]
@@ -75,9 +92,11 @@ def validate_host_profile_dict(data: dict, source: str = "host profile") -> None
             raise ValidationError(f"{source}.gpus[{i}].vendor: invalid vendor {g['vendor']!r}")
         if not isinstance(g["backends"], list) or len(g["backends"]) == 0:
             raise ValidationError(f"{source}.gpus[{i}].backends: must be a non-empty list")
-        for b in g["backends"]:
-            if b not in ("cuda", "rocm", "vulkan", "sycl"):
-                raise ValidationError(f"{source}.gpus[{i}].backends: unknown backend {b!r}")
+        if known_backends is not None:
+            kb = frozenset(known_backends)
+            for b in g["backends"]:
+                if b not in kb:
+                    raise ValidationError(f"{source}.gpus[{i}].backends: unknown backend {b!r}")
 
     paths = data["paths"]
     _require(paths, ["models_dir", "state_dir", "prefix_root"], f"{source}.paths")
@@ -184,19 +203,21 @@ def validate_scripts_dict(data: dict, source: str = "scripts.yaml") -> dict:
     return data
 
 
-def load_host_profile(path: Path) -> dict:
+def load_host_profile(path: Path, manifest: dict | None = None) -> dict:
     if not path.exists():
         raise ValidationError(f"no host profile at {path} — create hosts/<hostname>.yaml for this machine")
     data = _load_yaml(path)
-    validate_host_profile_dict(data, source=str(path))
+    known_backends = manifest["backends"].keys() if manifest is not None else None
+    validate_host_profile_dict(data, source=str(path), known_backends=known_backends)
     return data
 
 
-def try_load_host_profile(path: Path) -> dict | None:
+def try_load_host_profile(path: Path, manifest: dict | None = None) -> dict | None:
     if not path.exists():
         return None
     data = _load_yaml(path)
-    validate_host_profile_dict(data, source=str(path))
+    known_backends = manifest["backends"].keys() if manifest is not None else None
+    validate_host_profile_dict(data, source=str(path), known_backends=known_backends)
     return data
 
 

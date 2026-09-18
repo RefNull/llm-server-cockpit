@@ -74,7 +74,9 @@ def _yaml_quote(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def _write_manifest_cmake_flags(path: Path, backend: str, new_flags: list[str]) -> None:
+def _write_manifest_cmake_flags(
+    path: Path, backend: str, new_flags: list[str], *, clear_example: bool = False
+) -> None:
     """Rewrite manifest.yaml's `backends.<backend>.cmake_flags` list in place — the list-block
     equivalent of `_write_manifest_ref`'s scalar-line rewrite, for the same reason: never
     `yaml.safe_dump`, which would destroy the header comment block and every inline comment
@@ -90,6 +92,14 @@ def _write_manifest_cmake_flags(path: Path, backend: str, new_flags: list[str]) 
     manifest.yaml uses a 2-space indent per nesting level throughout (`backends:` at column 0,
     `<backend>:` at column 2, its keys at column 4, list items at column 6) — that file-wide
     style, not a per-call guess, is what fixes the indent widths below.
+
+    `clear_example=True` additionally strips that backend's own `example: true` sibling key
+    (if present) from the same bounded block — the mark means "still stock", and an accepted
+    cmake_flags edit through this function is exactly the thing that makes that false. A
+    recipe with no `example` key is untouched either way; `clear_example=False` (the default)
+    never looks for the key at all, so a caller rewriting flags for a reason unrelated to the
+    example mark (there is none today, but the parameter exists so that stays true) leaves it
+    alone by construction, not by omission.
     """
     text = path.read_text()
 
@@ -115,17 +125,32 @@ def _write_manifest_cmake_flags(path: Path, backend: str, new_flags: list[str]) 
 
     new_items = "".join(f"{indent}    - {_yaml_quote(f)}\n" for f in new_flags)
     new_block = block[: flags_match.start(1)] + new_items + block[flags_match.end(1):]
+
+    if clear_example:
+        # Same indent convention as cmake_flags above: the backend's own key sits at `indent`,
+        # its child keys (cmake_flags, apt_packages, example, ...) at `indent + "  "`. Bounded
+        # to this backend's own block (already sliced above), so a sibling backend's
+        # `example: true` can never match here.
+        example_re = re.compile(rf"^{indent}  example:[ \t]*true[ \t]*\n", re.MULTILINE)
+        new_block = example_re.sub("", new_block, count=1)
+
     new_text = text[:block_start] + new_block + text[block_end:]
 
     # Never trust the regex alone: parse the result back (yaml.safe_load — read-only, not the
     # forbidden safe_dump) and confirm it says what was meant before committing anything to
     # disk. Abort without writing on any mismatch.
     parsed = yaml.safe_load(new_text)
-    actual = ((parsed or {}).get("backends", {}) or {}).get(backend, {}).get("cmake_flags")
+    written_recipe = ((parsed or {}).get("backends", {}) or {}).get(backend, {}) or {}
+    actual = written_recipe.get("cmake_flags")
     if actual != new_flags:
         raise RuntimeError(
             f"manifest.yaml: cmake_flags rewrite for {backend!r} would produce {actual!r}, "
             f"expected {new_flags!r} — aborting without writing"
+        )
+    if clear_example and written_recipe.get("example"):
+        raise RuntimeError(
+            f"manifest.yaml: example: true for {backend!r} was not cleared as requested — "
+            "aborting without writing"
         )
     path.write_text(new_text)
 
@@ -739,10 +764,14 @@ class BackendDetailModal(ModalScreen[None]):
         self.repo_root = repo_root
         self.app_ref = app_ref
 
+    def _title(self) -> str:
+        prefix = "EX. " if self._recipe().get("example") else ""
+        return f"{prefix}llama.cpp ({self.backend})"
+
     def compose(self) -> ComposeResult:
         with Vertical(id="detail-dialog"):
             with Horizontal(id="detail-header"):
-                yield Static(f"llama.cpp ({self.backend})", id="detail-title")
+                yield Static(self._title(), id="detail-title")
                 yield Button("×", id="detail-close", classes="close-button", variant="error")
             with VerticalScroll(id="detail-body"):
                 yield Static(id="detail-what")
@@ -764,17 +793,23 @@ class BackendDetailModal(ModalScreen[None]):
 
     def _populate_detail(self) -> None:
         recipe = self._recipe()
+        self.query_one("#detail-title", Static).update(self._title())
         gpus = [
             f"{g.get('id', '?')} ({g.get('vendor', '?')})"
             for g in self.host_profile.get("gpus", [])
             if self.backend in g.get("backends", [])
         ]
         host_name = escape_markup(getattr(self.app_ref, "host_name", "?"))
+        example_line = (
+            "\nThis is a stock example recipe, shipped as-is with the repo — editing "
+            "cmake_flags below and saving clears this mark." if recipe.get("example") else ""
+        )
         self.query_one("#detail-what", Static).update(
             "[b]What[/]\n"
             f"Backend: {escape_markup(self.backend)}\n"
             f"Declared by: {escape_markup(', '.join(gpus)) or '(no GPU declares it)'} "
             f"— hosts/{host_name}.yaml"
+            f"{example_line}"
         )
 
         prefix_root = Path(self.host_profile["paths"]["prefix_root"])
@@ -839,14 +874,17 @@ class BackendDetailModal(ModalScreen[None]):
         if not new_flags:
             self._set_error("cmake_flags cannot be emptied — at least one flag is required")
             return
-        old_flags = self._recipe().get("cmake_flags", [])
+        recipe = self._recipe()
+        old_flags = recipe.get("cmake_flags", [])
         if new_flags == old_flags:
             self._set_error("no change")
             return
+        was_example = bool(recipe.get("example"))
         message = (
             f"Update backends.{self.backend}.cmake_flags in manifest.yaml?\n"
             f"- old: {' '.join(old_flags)}\n"
             f"+ new: {' '.join(new_flags)}"
+            + ("\nThis clears the EX. (stock example) mark on this recipe." if was_example else "")
         )
         confirmed = await self.app.push_screen_wait(
             ConfirmModal(message, confirm_label="Save flags", danger=True)
@@ -854,7 +892,9 @@ class BackendDetailModal(ModalScreen[None]):
         if not confirmed:
             return
         try:
-            _write_manifest_cmake_flags(self.repo_root / "manifest.yaml", self.backend, new_flags)
+            _write_manifest_cmake_flags(
+                self.repo_root / "manifest.yaml", self.backend, new_flags, clear_example=was_example
+            )
         except Exception as e:
             self.app.notify(f"could not write manifest.yaml: {e}", severity="error")
             return
@@ -878,6 +918,9 @@ class BuildsScreen(CockpitScreenBase):
         display: none;
     }
     BuildsScreen .version-line {
+        margin-bottom: $space-normal;
+    }
+    BuildsScreen #backend-source-note {
         margin-bottom: $space-normal;
     }
     """
@@ -942,6 +985,17 @@ class BuildsScreen(CockpitScreenBase):
                 )
                 backends_table.cursor_type = "row"
                 yield backends_table
+                # Answers "where does a row come from, and how do I add one" — the operator's
+                # 2026-09-18 QA report: the bind lives in Settings -> GPU Topology's "Add GPU"
+                # form (gpus[].backends), and nothing on this tab said so. Not a second
+                # GPU-editing form — that form stays the only one; this is a pointer to it.
+                yield Static(
+                    f"[$text-muted]Rows above are the backends declared by this host's GPUs "
+                    f"(hosts/{escape_markup(getattr(self.app_ref, 'host_name', '?'))}.yaml -> "
+                    "gpus[].backends). To add a backend: bind an existing manifest.yaml recipe "
+                    "to a GPU in Settings -> GPU Topology.[/]",
+                    id="backend-source-note",
+                )
 
             if not self.backends:
                 yield Static(
@@ -976,9 +1030,13 @@ class BuildsScreen(CockpitScreenBase):
         backends_table = self.query_one("#backends-table", SingleClickDataTable)
         backends_table.cursor_type = "row"
         backends_table.zebra_stripes = True
-        backends_table.add_column("Component", width=22)
+        # Component is 24, not 22: an "EX. " prefix on a stock recipe's row (2026-09-18
+        # follow-up item 3) makes "llama.cpp (vulkan)" (18 chars) into "EX. llama.cpp
+        # (vulkan)" (22 chars) — the longest name among the shipped backends — which needs
+        # content budget 22, i.e. width 24 (width includes 2 cells of padding, DESIGN.md §4.4).
+        backends_table.add_column("Component", width=24)
         backends_table.add_column("Installed", width=14)
-        # 22 + 14 + 35 + 11 + 8 = 90 content, render 90 + 2*5 = 100 (DESIGN.md §4, updated for
+        # 24 + 14 + 35 + 11 + 8 = 92 content, render 92 + 2*5 = 102 (DESIGN.md §4, updated for
         # this follow-up's 5-column shape — the pin is hoisted above the table as one global
         # line, so Version is no longer a per-row column; QA 2026-09-18 traced "Update to
         # latest changes every row" to exactly that column existing). Status keeps enough room
@@ -1085,8 +1143,12 @@ class BuildsScreen(CockpitScreenBase):
                 if backend in self._building_backends
                 else self._format_update_cell(self._llama_cpp_check, shorten=True)
             )
+            # "EX. " marks a still-stock recipe (manifest.yaml backends.<name>.example) — see
+            # BackendDetailModal's Info view for what it means and how it clears.
+            is_example = bool(self.manifest.get("backends", {}).get(backend, {}).get("example"))
+            component_label = f"{'EX. ' if is_example else ''}llama.cpp ({backend})"
             table.add_row(
-                Text(f"llama.cpp ({backend})"),
+                Text(component_label),
                 self._installed_cell(backend, cpp_ref),
                 status_cell,
                 *table.action_cells(backend),

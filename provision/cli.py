@@ -25,8 +25,10 @@ STEPS = {
 
 
 def _load(host: str):
-    host_profile = schema.load_host_profile(REPO_ROOT / "hosts" / f"{host}.yaml")
+    # Manifest first: load_host_profile validates gpus[].backends against manifest["backends"]
+    # (schema.py), so the manifest has to already be in hand for that check to run at all.
     manifest = schema.load_manifest(REPO_ROOT / "manifest.yaml")
+    host_profile = schema.load_host_profile(REPO_ROOT / "hosts" / f"{host}.yaml", manifest)
     models = schema.load_models(REPO_ROOT / "models.yaml", host_profile, manifest)
     return host_profile, manifest, models
 
