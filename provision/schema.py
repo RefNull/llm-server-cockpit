@@ -103,6 +103,13 @@ def validate_host_profile_dict(
 
     if not isinstance(data["retain_builds"], int) or data["retain_builds"] < 1:
         raise ValidationError(f"{source}.retain_builds: must be an integer >= 1")
+    # retain_builds is a disk-space budget for INSTALLED builds only (each is a multi-GB
+    # compiled prefix) — it is not a count of every build directory. A build that failed to
+    # compile or failed its smoke test has no binaries (a build-info.json + a log, kilobytes)
+    # and is pruned separately, on its own generous cap — see build.py's
+    # _MAX_FAILED_BUILDS_KEPT and _prune_old_builds. Do not "fix" this asymmetry: counting
+    # failures against this budget lets a run of failed builds evict a working one a rollback
+    # might need (provision/steps/build.py, coordinator correction 2026-09-18).
 
     _require(data["hf"], ["token_env"], f"{source}.hf")
 

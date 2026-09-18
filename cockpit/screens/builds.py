@@ -436,13 +436,13 @@ class RetainedBuildsModal(ModalScreen[None]):
         self._builds.clear()
         for backend in self.backends:
             for b in build_step.list_builds(self.host_profile, backend):
-                key = f"{backend}:{b.get('ref', '')}"
+                key = f"{backend}:{b.get('id', '')}"
                 self._builds[key] = {**b, "backend": backend}
                 current_cell = Text("current", style="bold green") if b.get("current") else Text("retained", style="dim")
                 sane_cell = Text("ok", style="green") if b.get("sane") else Text("NOT SANE", style="bold red")
                 table.add_row(
                     Text(backend),
-                    Text(_short(b.get("ref", ""))),
+                    Text(_short(b.get("version", ""))),
                     current_cell,
                     sane_cell,
                     *table.action_cells(key),
@@ -482,9 +482,9 @@ class RetainedBuildsModal(ModalScreen[None]):
         if build is None:
             return
         if event.action.id == "rollback":
-            self._run_rollback(build["backend"], build["ref"])
+            self._run_rollback(build["backend"], build["id"])
         elif event.action.id == "remove":
-            self._run_remove(build["backend"], build["ref"])
+            self._run_remove(build["backend"], build["id"])
 
     @work(thread=True)
     def _run_rollback(self, backend: str, ref: str) -> None:
@@ -626,7 +626,7 @@ class ChangeVersionModal(ModalScreen[str | None]):
                 if ref:
                     self._add_row(ref, "history", f"{backend}: {h.get('outcome', '')}", kind="sha")
             for b in build_step.list_builds(self.host_profile, backend):
-                ref = b.get("ref") or ""
+                ref = b.get("version") or ""
                 if not ref:
                     continue
                 state = "current" if b.get("current") else "retained"
@@ -818,7 +818,7 @@ class BackendDetailModal(ModalScreen[None]):
         current_target = current_link.resolve() if current_link.is_symlink() else None
         builds = build_step.list_builds(self.host_profile, self.backend)
         retained_lines = "\n".join(
-            f"  {_short(b['ref'])}{' (current)' if b['current'] else ''}{'' if b['sane'] else ' NOT SANE'}"
+            f"  {b['id']} ({_short(b['version'])}){' (current)' if b['current'] else ''}{'' if b['sane'] else ' NOT SANE'}"
             for b in builds
         ) or "  (nothing built yet)"
         self.query_one("#detail-where", Static).update(
@@ -829,7 +829,7 @@ class BackendDetailModal(ModalScreen[None]):
         )
 
         ref = self.manifest.get("llama_cpp", {}).get("ref", "")
-        prefix = build_step.backend_prefix(self.host_profile, self.backend, ref)
+        prefix = Path(self.host_profile["paths"]["prefix_root"]) / self.backend
         checkout_dir = build_step.checkout_dir_for(self.host_profile)
         argv = build_step.resolve_cmake_argv(self.backend, recipe, checkout_dir, prefix)
         cmd = " ".join(shlex.quote(a) for a in argv)
@@ -1088,7 +1088,7 @@ class BuildsScreen(CockpitScreenBase):
         item 5), rather than the old silent no-op _prefix_ready used to produce."""
         ref = self.manifest.get("llama_cpp", {}).get("ref", "")
         for b in build_step.list_builds(self.host_profile, row_key):
-            if b.get("ref") == ref and b.get("sane"):
+            if b.get("version") == ref and b.get("sane"):
                 return "Rebuild"
         return "Build"
 
@@ -1102,7 +1102,7 @@ class BuildsScreen(CockpitScreenBase):
         label = self._build_label(row_key)
         ref = self.manifest.get("llama_cpp", {}).get("ref", "")
         recipe = self.manifest.get("backends", {}).get(row_key, {})
-        prefix = build_step.backend_prefix(self.host_profile, row_key, ref)
+        prefix = Path(self.host_profile["paths"]["prefix_root"]) / row_key
         checkout_dir = build_step.checkout_dir_for(self.host_profile)
         argv = build_step.resolve_cmake_argv(row_key, recipe, checkout_dir, prefix)
         cmd = " ".join(shlex.quote(a) for a in argv)
@@ -1114,7 +1114,7 @@ class BuildsScreen(CockpitScreenBase):
     def _installed_ref(self, backend: str) -> str | None:
         for b in build_step.list_builds(self.host_profile, backend):
             if b.get("current"):
-                return b.get("ref")
+                return b.get("version")
         return None
 
     def _installed_cell(self, backend: str, selected_ref: str) -> Text:
@@ -1296,7 +1296,7 @@ class BuildsScreen(CockpitScreenBase):
         already_built = sorted(
             backend for backend in self.backends
             for b in build_step.list_builds(self.host_profile, backend)
-            if b.get("ref") == new_ref and b.get("sane")
+            if b.get("version") == new_ref and b.get("sane")
         )
         message = f"Update llama.cpp version {_short(old_ref)} → {_short(new_ref)}? Writes manifest.yaml; does not build."
         if already_built:

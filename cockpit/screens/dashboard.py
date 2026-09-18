@@ -284,7 +284,7 @@ class DashboardScreen(CockpitScreenBase):
                 continue
             current = next((b for b in builds if b.get("current")), None)
             if current:
-                ref = (current.get("ref") or "")[:10]
+                ref = (current.get("version") or "")[:10]
                 lines.append(service_row(f"llama.cpp ({backend})", True, f"built · {ref}"))
             else:
                 lines.append(service_row(f"llama.cpp ({backend})", False, "not built"))

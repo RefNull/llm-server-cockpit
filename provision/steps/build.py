@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -19,6 +20,18 @@ from provision.common import Runner, resolve_env_value
 from provision.smoke import ensure_smoke_model, load_smoke_fixture, run_smoke_test
 
 log = logging.getLogger("provision")
+
+# A failed build has no binaries — a build-info.json plus a build.log, kilobytes — so it
+# never competes with retain_builds' disk-space budget for installed (multi-GB) prefixes.
+# It gets its own generous, fixed cap instead: high enough that a real flag-tuning session
+# (the reason this whole phase exists) never loses the log it is actively iterating on, low
+# enough that the directory can't grow without bound. (Coordinator correction, 2026-09-18:
+# an earlier version of _prune_old_builds counted every directory, including failures,
+# against retain_builds — a run of failed builds could evict a working, non-current build a
+# rollback might need.)
+_MAX_FAILED_BUILDS_KEPT = 20
+
+_BUILD_DIR_RE = re.compile(r"^build(\d+)$")
 
 
 def _needed_backends(host_profile: dict[str, Any]) -> list[str]:
@@ -145,9 +158,114 @@ def checkout_dir_for(host_profile: dict[str, Any]) -> Path:
     return Path(host_profile["paths"]["state_dir"]) / "src" / "llama.cpp"
 
 
-def backend_prefix(host_profile: dict[str, Any], backend: str, ref: str) -> Path:
-    """The versioned install prefix for one backend at one ref."""
-    return Path(host_profile["paths"]["prefix_root"]) / backend / ref
+def resolve_build_dir(host_profile: dict[str, Any], backend: str, build_id: str) -> Path:
+    """The install prefix for one already-known build, addressed by its directory name
+    (e.g. "build3", or a legacy `<sha>` directory predating this scheme). Purely mechanical —
+    callers that need to *allocate a new* build use allocate_build_dir() instead."""
+    return Path(host_profile["paths"]["prefix_root"]) / backend / build_id
+
+
+def allocate_build_dir(host_profile: dict[str, Any], backend: str) -> Path:
+    """A fresh, never-before-used directory for a new build of this backend: prefix_root/
+    <backend>/build<N>, N = one past the highest existing build<N> (never a filled gap, so
+    it can never collide with a directory pruning left behind). Read-only — it only inspects
+    what is already on disk; nothing is created until the caller actually writes into it
+    (Runner.write_file's own mkdir(parents=True) does that), so this is dry-run-safe by
+    having nothing to gate.
+
+    Directories not matching build<N> — a legacy `<sha>` build, or `current` itself, which is
+    a symlink and therefore already excluded — are ignored for the purpose of choosing N;
+    they are still visible to list_builds().
+    """
+    backend_dir = Path(host_profile["paths"]["prefix_root"]) / backend
+    max_n = 0
+    if backend_dir.is_dir():
+        for d in backend_dir.iterdir():
+            if not d.is_dir() or d.is_symlink():
+                continue
+            m = _BUILD_DIR_RE.match(d.name)
+            if m:
+                max_n = max(max_n, int(m.group(1)))
+    return backend_dir / f"build{max_n + 1}"
+
+
+def _read_build_metadata(build_dir: Path) -> dict[str, Any] | None:
+    """The per-build record written by _write_build_record(), or None for a directory that
+    predates it (legacy `<sha>` builds) or whose record is unreadable."""
+    path = build_dir / "build-info.json"
+    if not path.is_file():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def read_build_metadata(host_profile: dict[str, Any], backend: str, build_id: str) -> dict[str, Any] | None:
+    """Public accessor for the full per-build record (ref, cmake_flags, argv, timestamp,
+    outcome, detail) — for a cockpit detail view that wants more than list_builds()'s row
+    shape. Returns None for a legacy build with no build-info.json."""
+    return _read_build_metadata(resolve_build_dir(host_profile, backend, build_id))
+
+
+def build_log_path(host_profile: dict[str, Any], backend: str, build_id: str) -> Path:
+    """Where _write_build_record() puts this build's persisted compile log. The file may not
+    exist — e.g. a legacy build, or a build that was skipped because it was already sane."""
+    return resolve_build_dir(host_profile, backend, build_id) / "build.log"
+
+
+def _write_build_record(
+    build_dir: Path,
+    runner: Runner,
+    *,
+    backend: str,
+    ref: str,
+    recipe: dict[str, Any],
+    checkout_dir: Path,
+    outcome: str,
+    detail: str,
+    log_lines: list[str],
+) -> None:
+    """Writes build-info.json (always — this is what makes an outcome, including a failure,
+    readable) and build.log (only when log_lines is non-empty, i.e. only when a build actually
+    ran this call — the idempotent "already built, skipping" path must never blank out an
+    existing build's real compile transcript). Both go through Runner so sudo and --dry-run
+    stay honest; a dry_run=True Runner writes neither."""
+    record = {
+        "ref": ref,
+        "cmake_flags": resolve_cmake_flags(recipe),
+        "argv": resolve_cmake_argv(backend, recipe, checkout_dir, build_dir),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "outcome": outcome,  # "smoke_pass" | "smoke_failed" | "build_failed"
+        "detail": detail[:2000],
+    }
+    runner.write_file(build_dir / "build-info.json", json.dumps(record, indent=2) + "\n")
+    if log_lines:
+        runner.write_file(build_dir / "build.log", "\n".join(log_lines) + "\n")
+
+
+def _find_matching_build(host_profile: dict[str, Any], backend: str, ref: str) -> Path | None:
+    """The newest sane, already-built directory for this backend that was built at `ref` —
+    or None. Preserves the old "same ref ⇒ same directory ⇒ skippable" idempotence
+    (verify_build_pin.py's verify_force_flag) without directory identity doing the work:
+    a build with a record matches by its recorded ref; a legacy `<sha>` directory with no
+    record matches the old way, by its own name."""
+    backend_dir = Path(host_profile["paths"]["prefix_root"]) / backend
+    if not backend_dir.is_dir():
+        return None
+    dirs = sorted(
+        (d for d in backend_dir.iterdir() if d.is_dir() and not d.is_symlink()),
+        key=lambda d: d.stat().st_mtime,
+        reverse=True,
+    )
+    for d in dirs:
+        if not _prefix_ready(d):
+            continue
+        meta = _read_build_metadata(d)
+        built_ref = meta["ref"] if meta is not None else d.name
+        if built_ref == ref:
+            return d
+    return None
 
 
 def resolve_cmake_flags(recipe: dict[str, Any]) -> list[str]:
@@ -213,6 +331,11 @@ def _build_backend(
 
 
 def _prune_old_builds(prefix_root: Path, backend: str, retain: int, runner: Runner) -> None:
+    """retain (host_profile['retain_builds']) is a disk-space budget for INSTALLED builds
+    only — see schema.py's comment on retain_builds for why. Sane builds (installed,
+    multi-GB) and failed builds (a log + a JSON record, kilobytes) are pruned against two
+    separate quotas so a run of failed builds can never evict a working, non-current build.
+    `current` is never pruned by either path."""
     backend_dir = prefix_root / backend
     current_link = backend_dir / "current"
     current_target = current_link.resolve() if current_link.is_symlink() else None
@@ -222,45 +345,37 @@ def _prune_old_builds(prefix_root: Path, backend: str, retain: int, runner: Runn
         key=lambda d: d.stat().st_mtime,
         reverse=True,
     )
+    sane_dirs = [d for d in dirs if d != current_target and _prefix_ready(d)]
+    failed_dirs = [d for d in dirs if d != current_target and not _prefix_ready(d)]
 
     keep: set[Path] = set()
     if current_target is not None:
         keep.add(current_target)
-    for d in dirs:
+    for d in sane_dirs:
         if len(keep) >= retain:
             break
         keep.add(d)
-
-    for d in dirs:
+    for d in sane_dirs:
         if d not in keep:
             log.info("build[%s]: pruning old build %s (retain_builds=%d)", backend, d, retain)
             runner.run(["rm", "-rf", str(d)])
+
+    for d in failed_dirs[_MAX_FAILED_BUILDS_KEPT:]:
+        log.info("build[%s]: pruning old failed build %s (cap=%d)", backend, d, _MAX_FAILED_BUILDS_KEPT)
+        runner.run(["rm", "-rf", str(d)])
 
 
 def _history_path(host_profile: dict[str, Any]) -> Path:
     return Path(host_profile["paths"]["state_dir"]) / "build-history.jsonl"
 
 
-def _record_history(host_profile: dict[str, Any], runner: Runner, *, backend: str, ref: str, outcome: str, detail: str = "") -> None:
-    """Append-only evidence log for the cockpit's Installs tab — real smoke-test history, not
-    just "the binary currently exists". Never written under --dry-run (nothing real happened)."""
-    if runner.dry_run:
-        return
-    entry = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "backend": backend,
-        "ref": ref,
-        "outcome": outcome,  # "smoke_pass" | "smoke_failed" | "build_failed"
-        "detail": detail[:2000],
-    }
-    path = _history_path(host_profile)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a") as f:
-        f.write(json.dumps(entry) + "\n")
-
-
 def read_build_history(host_profile: dict[str, Any], backend: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
-    """Most-recent-first tail of the build history log, optionally filtered to one backend."""
+    """Most-recent-first tail of a pre-Phase-1 build-history.jsonl, optionally filtered to one
+    backend. Nothing writes this file any more — Phase 1 folded per-run history into each
+    build's own build-info.json (_write_build_record) — so this only ever returns whatever a
+    host accumulated before that change. Kept (rather than deleted) so a host with real
+    pre-migration history in this file, and the two existing cockpit readers of it, don't
+    hard-break; it is expected to be retired once the cockpit's Build History UI is."""
     path = _history_path(host_profile)
     if not path.exists():
         return []
@@ -278,7 +393,21 @@ def read_build_history(host_profile: dict[str, Any], backend: str | None = None,
 
 
 def list_builds(host_profile: dict[str, Any], backend: str) -> list[dict[str, Any]]:
-    """Retained build dirs for a backend, most recent first — for the cockpit's Installs tab."""
+    """Every build directory for a backend, most recent first — for the cockpit's Builds list.
+
+    Returns identity and version as separate fields, since a build's directory name (`id`,
+    e.g. "build3") is no longer a version the way it was pre-Phase-1: `version` is read from
+    the build's own record (build-info.json's `ref`) when one exists. A directory with no
+    record — a `<sha>`-named build from before this scheme — is still listed, with its
+    directory name reported as its version and `legacy: True`, rather than crashing or being
+    hidden.
+
+    Shape: [{"id": str, "version": str, "legacy": bool, "current": bool, "sane": bool,
+             "outcome": str | None, "timestamp": str | None}, ...]
+    `outcome`/`timestamp` come straight from the record (None for a legacy build) — the
+    cockpit's Builds list needs them per row; the full record (cmake_flags, argv, detail) is
+    available separately via read_build_metadata() for a detail view.
+    """
     backend_dir = Path(host_profile["paths"]["prefix_root"]) / backend
     if not backend_dir.is_dir():
         return []
@@ -289,17 +418,43 @@ def list_builds(host_profile: dict[str, Any], backend: str) -> list[dict[str, An
         key=lambda d: d.stat().st_mtime,
         reverse=True,
     )
-    return [{"ref": d.name, "current": d == current_target, "sane": _prefix_ready(d)} for d in dirs]
+    result = []
+    for d in dirs:
+        meta = _read_build_metadata(d)
+        legacy = meta is None
+        result.append({
+            "id": d.name,
+            "version": meta["ref"] if meta is not None else d.name,
+            "legacy": legacy,
+            "current": d == current_target,
+            "sane": _prefix_ready(d),
+            "outcome": None if meta is None else meta.get("outcome"),
+            "timestamp": None if meta is None else meta.get("timestamp"),
+        })
+    return result
 
 
 def rollback(host_profile: dict[str, Any], backend: str, target_ref: str, runner: Runner) -> None:
     """Point `current` at an already-built, retained prefix — no rebuild. Skips re-smoke-testing:
     this build already passed its smoke test to get built in the first place, and the binary
-    hasn't changed since; if that's not good enough, rebuild that ref instead of rolling back."""
-    target = Path(host_profile["paths"]["prefix_root"]) / backend / target_ref
+    hasn't changed since; if that's not good enough, rebuild that ref instead of rolling back.
+
+    target_ref must be a bare directory name, one level directly under prefix_root/<backend>/
+    — never an absolute path or one containing a path separator, and never "." or "..". This
+    is checked on the raw string before any Path join: Path(base) / "/etc/passwd" silently
+    discards `base` and evaluates to "/etc/passwd", so the join itself cannot be trusted to
+    enforce this.
+    """
+    if os.path.isabs(target_ref) or "/" in target_ref or "\\" in target_ref or target_ref in (".", ".."):
+        sys.exit(f"build: invalid build id {target_ref!r} — must be a bare directory name")
+    prefix_root = Path(host_profile["paths"]["prefix_root"]).resolve()
+    backend_dir = prefix_root / backend
+    target = (backend_dir / target_ref).resolve()
+    if target.parent != backend_dir:
+        sys.exit(f"build: {target_ref!r} does not resolve to a build directly under {backend_dir}")
     if not _prefix_ready(target):
         sys.exit(f"build: cannot roll back {backend!r} to {target_ref!r} — {target} is missing or not a sane build")
-    runner.atomic_symlink(Path(host_profile["paths"]["prefix_root"]) / backend / "current", target)
+    runner.atomic_symlink(backend_dir / "current", target)
 
 
 def run(
@@ -353,19 +508,40 @@ def run(
                 f"manifest.yaml backends (defined: {sorted(manifest['backends'])})"
             )
 
-        prefix = backend_prefix(host_profile, backend, ref)
-        try:
-            if _prefix_ready(prefix) and not force:
-                log.info("build[%s]: prefix %s already built and sane, skipping build", backend, prefix)
-            else:
+        matched = None if force else _find_matching_build(host_profile, backend, ref)
+        log_lines: list[str] = []
+        if matched is not None:
+            prefix = matched
+            log.info("build[%s]: %s already built and sane at %s, skipping build", backend, ref, prefix)
+        else:
+            # A fresh directory per build (never the same one twice, even at the same ref)
+            # is the whole point of this phase — see resolve_build_dir/allocate_build_dir's
+            # docstrings. Capture this build's output here, around the call, rather than
+            # inside _build_backend: that keeps _build_backend's signature — and its two
+            # direct callers in smoke/verify_build_pin.py — unchanged.
+            prefix = allocate_build_dir(host_profile, backend)
+            original_on_output = runner.on_output
+
+            def _capture(line: str, _orig=original_on_output) -> None:
+                log_lines.append(line)
+                if _orig is not None:
+                    _orig(line)
+
+            runner.on_output = _capture
+            try:
                 _build_backend(backend, recipe, checkout_dir, prefix, runner)
-        except (subprocess.CalledProcessError, OSError) as e:
-            # A build failure for one backend must not abort the others (constraint: one
-            # backend's failure shouldn't block the rest) — record it and move on.
-            failed.append(backend)
-            log.error("build[%s]: BUILD FAILED — %s — leaving 'current' symlink untouched", backend, e)
-            _record_history(host_profile, runner, backend=backend, ref=ref, outcome="build_failed", detail=str(e))
-            continue
+            except (subprocess.CalledProcessError, OSError) as e:
+                # A build failure for one backend must not abort the others (constraint: one
+                # backend's failure shouldn't block the rest) — record it and move on.
+                failed.append(backend)
+                log.error("build[%s]: BUILD FAILED — %s — leaving 'current' symlink untouched", backend, e)
+                _write_build_record(
+                    prefix, runner, backend=backend, ref=ref, recipe=recipe, checkout_dir=checkout_dir,
+                    outcome="build_failed", detail=str(e), log_lines=log_lines,
+                )
+                continue
+            finally:
+                runner.on_output = original_on_output
 
         cli_binary = prefix / "bin" / "llama-cli"
         if not cli_binary.exists():
@@ -374,6 +550,11 @@ def run(
                 continue
             failed.append(backend)
             log.error("build[%s]: expected binary %s not present after build — cannot smoke test", backend, cli_binary)
+            _write_build_record(
+                prefix, runner, backend=backend, ref=ref, recipe=recipe, checkout_dir=checkout_dir,
+                outcome="build_failed", detail=f"expected binary {cli_binary} not present after build",
+                log_lines=log_lines,
+            )
             continue
 
         model_path = ensure_smoke_model(host_profile, fixture, runner)
@@ -390,11 +571,17 @@ def run(
         if not ok:
             failed.append(backend)
             log.error("build[%s]: SMOKE TEST FAILED — %s — leaving 'current' symlink untouched", backend, detail)
-            _record_history(host_profile, runner, backend=backend, ref=ref, outcome="smoke_failed", detail=detail)
+            _write_build_record(
+                prefix, runner, backend=backend, ref=ref, recipe=recipe, checkout_dir=checkout_dir,
+                outcome="smoke_failed", detail=detail, log_lines=log_lines,
+            )
             continue
 
         log.info("build[%s]: smoke test passed", backend)
-        _record_history(host_profile, runner, backend=backend, ref=ref, outcome="smoke_pass", detail=detail)
+        _write_build_record(
+            prefix, runner, backend=backend, ref=ref, recipe=recipe, checkout_dir=checkout_dir,
+            outcome="smoke_pass", detail=detail, log_lines=log_lines,
+        )
         # atomic_symlink / runner.run are dry-run-gated internally, same as every other step.
         runner.atomic_symlink(prefix_root / backend / "current", prefix)
         _prune_old_builds(prefix_root, backend, retain, runner)

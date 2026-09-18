@@ -32,8 +32,11 @@ Run: .venv/bin/python smoke/verify_build_pin.py
 """
 from __future__ import annotations
 
+import json
+import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -185,6 +188,234 @@ def verify_force_flag() -> None:
             f"whole point): {calls_true}"
         )
     print("verify_build_pin: force=True rebuilds, force=False still skips — OK")
+
+
+# --------------------------------------------------------------------- Phase 1: per-build dirs
+
+
+def _make_failed_dir(path: Path) -> None:
+    """A build attempt that produced a record but no binaries — build_failed/smoke_failed."""
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "build-info.json").write_text('{"ref": "deadbeef", "outcome": "build_failed"}')
+
+
+def verify_sequential_dirs_two_force_builds_first_unmodified() -> None:
+    """A7's whole point: force=True twice at the SAME ref must produce two directories, and
+    the first must not be touched by the second. Proven directly, not inferred — including
+    that build1's own files (its build-info.json, its build.log, its fake binaries) are
+    byte-identical before and after the second build runs."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp_root = Path(td)
+        host_profile, manifest, models, ref = _fixture(tmp_root)
+
+        model_path = tmp_root / "smoke-model.gguf"
+        model_path.write_bytes(b"")
+
+        def fake_build_backend(backend, recipe, checkout_dir, px, runner):
+            _write_fake_prefix(px)
+
+        orig_build_backend = build_step._build_backend
+        orig_ensure_model = build_step.ensure_smoke_model
+        orig_run_smoke = build_step.run_smoke_test
+        build_step._build_backend = fake_build_backend
+        build_step.ensure_smoke_model = lambda *a, **k: model_path
+        build_step.run_smoke_test = lambda *a, **k: (True, "ok")
+        try:
+            # CapturingRunner: no real git clone/rm, same as _run_with_force above — but
+            # write_file/mkdir/atomic_symlink are NOT overridden by it, so build-info.json,
+            # build.log and the fake binaries this test inspects are real files on disk.
+            runner = CapturingRunner()
+            build_step.run(host_profile, manifest, models, runner, _REPO_ROOT, backends=["cuda"], force=True)
+
+            backend_dir = Path(host_profile["paths"]["prefix_root"]) / "cuda"
+            dirs_after_first = sorted(p.name for p in backend_dir.iterdir() if p.is_dir() and not p.is_symlink())
+            assert dirs_after_first == ["build1"], f"expected exactly one build dir after the first build, got {dirs_after_first}"
+            build1 = backend_dir / "build1"
+            snapshot = {
+                p: p.read_bytes() for p in build1.rglob("*") if p.is_file()
+            }
+            assert snapshot, "build1 has no files to compare — fixture is broken"
+            mtime_before = build1.stat().st_mtime
+
+            build_step.run(host_profile, manifest, models, runner, _REPO_ROOT, backends=["cuda"], force=True)
+
+            dirs_after_second = sorted(p.name for p in backend_dir.iterdir() if p.is_dir() and not p.is_symlink())
+            assert dirs_after_second == ["build1", "build2"], (
+                f"a second force=True build at the same ref must allocate a NEW directory, "
+                f"not reuse or remove the first: got {dirs_after_second}"
+            )
+            assert build1.stat().st_mtime == mtime_before, "build1's directory mtime changed — it was touched"
+            after_snapshot = {p: p.read_bytes() for p in build1.rglob("*") if p.is_file()}
+            assert after_snapshot == snapshot, "build1's file contents changed after the second build"
+        finally:
+            build_step._build_backend = orig_build_backend
+            build_step.ensure_smoke_model = orig_ensure_model
+            build_step.run_smoke_test = orig_run_smoke
+    print("verify_build_pin: two force=True builds at the same ref -> two directories, first untouched — OK")
+
+
+def verify_list_builds_shape_and_legacy() -> None:
+    """list_builds() returns identity (id) and version as separate fields, backed by each
+    build's own build-info.json; a pre-Phase-1 `<sha>`-named directory with no record is
+    still listed, with its directory name reported as its version and legacy=True."""
+    with tempfile.TemporaryDirectory() as td:
+        # .resolve(): on macOS, tempfile's own tmp root has a /var -> /private/var symlink,
+        # which would make an unresolved dir compare unequal to current_link.resolve() even
+        # though they name the same file. Not a Phase 1 concern — resolving once up front
+        # keeps every path built from tmp_root canonical, matching list_builds' own
+        # current_link.resolve() comparison.
+        tmp_root = Path(td).resolve()
+        host_profile, manifest, models, ref = _fixture(tmp_root)
+        backend_dir = Path(host_profile["paths"]["prefix_root"]) / "cuda"
+
+        modern = backend_dir / "build1"
+        _write_fake_prefix(modern)
+        (modern / "build-info.json").write_text(json.dumps({
+            "ref": ref, "cmake_flags": [], "argv": [], "timestamp": "2026-09-18T00:00:00+00:00",
+            "outcome": "smoke_pass", "detail": "ok",
+        }))
+        (backend_dir / "current").symlink_to(modern)
+
+        legacy = backend_dir / ("c" * 40)
+        _write_fake_prefix(legacy)
+
+        rows = build_step.list_builds(host_profile, "cuda")
+        by_id = {r["id"]: r for r in rows}
+        print(f"verify_build_pin: list_builds() row for a modern build: {by_id['build1']}")
+
+        assert by_id["build1"]["version"] == ref, "modern build's version must come from its record, not its dir name"
+        assert by_id["build1"]["id"] == "build1", "modern build's id must be its directory name"
+        assert by_id["build1"]["legacy"] is False
+        assert by_id["build1"]["current"] is True
+        assert by_id["build1"]["sane"] is True
+        assert by_id["build1"]["outcome"] == "smoke_pass"
+
+        legacy_row = by_id["c" * 40]
+        assert legacy_row["legacy"] is True, "a build with no build-info.json must be marked legacy"
+        assert legacy_row["version"] == "c" * 40, "a legacy build's version must fall back to its directory name"
+        assert legacy_row["current"] is False
+        assert legacy_row["sane"] is True
+        assert legacy_row["outcome"] is None
+    print("verify_build_pin: list_builds() separates id/version, marks a recordless legacy dir — OK")
+
+
+def verify_prune_disk_budget_is_sane_builds_only() -> None:
+    """First-ever test for _prune_old_builds. retain_builds is a disk-space budget for
+    installed (sane) builds only: `current` is never pruned even when it is the oldest
+    directory, exactly `retain_builds` sane builds survive, and — the case that motivated
+    the coordinator's correction — several failed builds in a row must NOT evict a sane,
+    non-current build to make room for themselves."""
+    with tempfile.TemporaryDirectory() as td:
+        prefix_root = Path(td).resolve()  # see verify_list_builds_shape_and_legacy's comment
+        backend_dir = prefix_root / "cuda"
+        backend_dir.mkdir(parents=True)
+
+        current_dir = backend_dir / "build1"  # current, oldest of all — must survive regardless
+        _write_fake_prefix(current_dir)
+        (backend_dir / "current").symlink_to(current_dir)
+
+        prune_dir = backend_dir / "build2"  # sane, non-current, older of the two -> pruned
+        _write_fake_prefix(prune_dir)
+
+        keep_dir = backend_dir / "build3"  # sane, non-current, newer of the two -> kept
+        _write_fake_prefix(keep_dir)
+
+        failed_dirs = [backend_dir / f"build{i}" for i in range(4, 9)]  # 5 failed builds
+        for d in failed_dirs:
+            _make_failed_dir(d)
+
+        now = time.time()
+        for age, d in enumerate([current_dir, prune_dir, keep_dir, *failed_dirs]):
+            os.utime(d, (now + age, now + age))  # each later in the list is newer
+
+        runner = CapturingRunner()
+        build_step._prune_old_builds(prefix_root, "cuda", retain=2, runner=runner)
+        pruned = {Path(c[-1]) for c in runner.run_calls}
+
+        assert current_dir not in pruned, "current was pruned even though it is oldest and must never be"
+        assert keep_dir not in pruned, "a sane, non-current build within retain_builds was pruned"
+        assert prune_dir in pruned, "the sane build exceeding retain_builds=2 should have been pruned"
+        assert not (set(failed_dirs) & pruned), (
+            "5 failed builds under the 20-build failed-build cap were pruned when they shouldn't be"
+        )
+        assert pruned == {prune_dir}, (
+            f"expected exactly the one excess sane build pruned, got {[str(p) for p in pruned]} — "
+            "a failed build must never count against retain_builds"
+        )
+    print("verify_build_pin: pruning keeps current + retain_builds sane builds; failed builds never evict them — OK")
+
+
+def verify_rollback_rejects_traversal() -> None:
+    """rollback() must reject a target_ref that escapes prefix_root/<backend>/ — checked on
+    the raw string before any Path join, since Path(base) / "/etc/passwd" silently discards
+    `base`."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp_root = Path(td)
+        host_profile, manifest, models, ref = _fixture(tmp_root)
+        backend_dir = Path(host_profile["paths"]["prefix_root"]) / "cuda"
+        sane = backend_dir / "build1"
+        _write_fake_prefix(sane)
+
+        for bad in ("../../etc", "/etc/passwd", "sub/dir", "..", "."):
+            try:
+                build_step.rollback(host_profile, "cuda", bad, CapturingRunner())
+                raised = False
+            except SystemExit:
+                raised = True
+            assert raised, f"rollback() accepted an invalid target_ref: {bad!r}"
+
+        # A legitimate id is still accepted, to prove the guard isn't over-broad.
+        build_step.rollback(host_profile, "cuda", "build1", CapturingRunner())
+    print("verify_build_pin: rollback() rejects path traversal, absolute paths, and separators — OK")
+
+
+def verify_metadata_roundtrip_and_dry_run_writes_nothing() -> None:
+    """The per-build record round-trips (ref, cmake_flags, argv, outcome, detail all
+    readable back exactly as written), and a dry_run=True Runner writes neither
+    build-info.json nor build.log."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp_root = Path(td)
+        host_profile, manifest, models, ref = _fixture(tmp_root)
+        backend_dir = Path(host_profile["paths"]["prefix_root"]) / "cuda"
+        build_dir = backend_dir / "build1"
+        recipe = manifest["backends"]["cuda"]
+        checkout_dir = build_step.checkout_dir_for(host_profile)
+
+        dry_runner = Runner(dry_run=True)
+        build_step._write_build_record(
+            build_dir, dry_runner, backend="cuda", ref=ref, recipe=recipe, checkout_dir=checkout_dir,
+            outcome="smoke_pass", detail="ok", log_lines=["configuring...", "building..."],
+        )
+        assert not build_dir.exists(), "a dry_run=True Runner must write nothing at all"
+
+        real_runner = Runner()
+        build_step._write_build_record(
+            build_dir, real_runner, backend="cuda", ref=ref, recipe=recipe, checkout_dir=checkout_dir,
+            outcome="smoke_pass", detail="ok", log_lines=["configuring...", "building..."],
+        )
+        meta = build_step.read_build_metadata(host_profile, "cuda", "build1")
+        assert meta is not None, "build-info.json was not written"
+        assert meta["ref"] == ref
+        assert meta["cmake_flags"] == build_step.resolve_cmake_flags(recipe)
+        assert meta["argv"] == build_step.resolve_cmake_argv("cuda", recipe, checkout_dir, build_dir)
+        assert meta["outcome"] == "smoke_pass"
+        assert meta["detail"] == "ok"
+        log_path = build_step.build_log_path(host_profile, "cuda", "build1")
+        assert log_path.read_text() == "configuring...\nbuilding...\n"
+
+        # The idempotent "already built, skipping" path must never blank out an existing
+        # build's log: calling _write_build_record with no new log_lines must leave build.log
+        # untouched while still refreshing build-info.json's outcome/timestamp.
+        build_step._write_build_record(
+            build_dir, real_runner, backend="cuda", ref=ref, recipe=recipe, checkout_dir=checkout_dir,
+            outcome="smoke_pass", detail="ok (re-verified)", log_lines=[],
+        )
+        assert log_path.read_text() == "configuring...\nbuilding...\n", (
+            "build.log was rewritten (or blanked) by a call with no new log_lines"
+        )
+        meta_after = build_step.read_build_metadata(host_profile, "cuda", "build1")
+        assert meta_after["detail"] == "ok (re-verified)", "build-info.json was not refreshed"
+    print("verify_build_pin: build-info.json round-trips; build.log only written when log_lines is non-empty; dry_run writes nothing — OK")
 
 
 # --------------------------------------------------------------------- cmake_flags block rewrite
@@ -409,7 +640,7 @@ def verify_resolve_cmake_argv_matches_build() -> None:
 
     for backend in ("cuda", "vulkan"):
         recipe = manifest_dict["backends"][backend]
-        prefix = build_step.backend_prefix(host_profile, backend, "deadbeef")
+        prefix = build_step.resolve_build_dir(host_profile, backend, "deadbeef")
         assert prefix == Path("/opt/llm-server/builds") / backend / "deadbeef"
         argv = build_step.resolve_cmake_argv(backend, recipe, checkout_dir, prefix)
         expected = [
@@ -470,6 +701,11 @@ def verify_table_action_confirm_callable() -> None:
 def main() -> None:
     verify_manifest_roundtrip()
     verify_force_flag()
+    verify_sequential_dirs_two_force_builds_first_unmodified()
+    verify_list_builds_shape_and_legacy()
+    verify_prune_disk_budget_is_sane_builds_only()
+    verify_rollback_rejects_traversal()
+    verify_metadata_roundtrip_and_dry_run_writes_nothing()
     verify_cmake_flags_roundtrip_order_independent()
     verify_cmake_flags_roundtrip_real_manifest()
     verify_example_mark_cleared_on_request()
