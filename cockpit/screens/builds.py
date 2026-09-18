@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import shlex
+import shutil
 from pathlib import Path
 
 import yaml
@@ -1679,38 +1680,68 @@ class BuildsScreen(CockpitScreenBase):
             message, confirm_label="Update llama-swap", mutates_system=True, requires_root=True
         ):
             return
-        self._run_swap_update(new_version)
+        self._run_swap_update(new_version, check)
+
+    def _manifest_path(self) -> Path:
+        target = self.repo_root / "manifest.yaml"
+        if not target.exists():
+            template = self.repo_root / "manifest.example.yaml"
+            if template.exists():
+                shutil.copyfile(template, target)
+        return target
 
     @work(thread=True)
-    def _run_swap_update(self, new_version: str) -> None:
+    def _run_swap_update(self, new_version: str, check: dict) -> None:
+        target_manifest = copy.deepcopy(self.manifest)
+        target_manifest.setdefault("llama_swap", {})["version"] = new_version
         try:
-            _write_manifest_llama_swap_version(self.repo_root / "manifest.yaml", new_version)
-        except Exception as e:
-            self.app.call_from_thread(self.app.notify, f"could not write manifest.yaml: {e}", severity="error")
-            return
-        self.app.call_from_thread(self.app_ref.reload_manifest)
-        self.manifest = getattr(self.app_ref, "manifest", self.manifest)
-        try:
-            swap_step.install_pinned_binary(self.host_profile, self.manifest, self.privileged_runner)
-            service_state = swap_step.reconcile_service(self.privileged_runner)
+            swap_step.install_pinned_binary(self.host_profile, target_manifest, self.privileged_runner)
         except SystemExit as e:
             self.app.call_from_thread(self.app.notify, f"llama-swap update failed: {e}", severity="error")
             return
         except Exception as e:
             self.app.call_from_thread(self.app.notify, f"llama-swap update failed: {e}", severity="error")
             return
-        # The binary update is the update. What happened to the service is a separate fact and
-        # is reported as one — a host with no llama-swap.service is not a failed update, it is
-        # a host that does not supervise llama-swap with systemd.
+
+        manifest_file = self._manifest_path()
+        try:
+            _write_manifest_llama_swap_version(manifest_file, new_version)
+        except Exception as e:
+            self.app.call_from_thread(
+                self.app.notify,
+                f"llama-swap installed but could not write manifest.yaml: {e}",
+                severity="error",
+            )
+            return
+
+        try:
+            service_state = swap_step.reconcile_service(self.privileged_runner)
+        except Exception as e:
+            log.warning("swap_step.reconcile_service failed: %s", e)
+            service_state = "unknown"
+
+        self.app.call_from_thread(self._on_swap_updated, new_version, service_state, check)
+
+    def _on_swap_updated(self, new_version: str, service_state: str, check: dict) -> None:
+        if self.app_ref is not None:
+            self.app_ref.reload_manifest()
+            self.manifest = getattr(self.app_ref, "manifest", self.manifest)
+        else:
+            self.manifest = schema.load_manifest(self._manifest_path())
+        updated_check = {
+            **check,
+            "pinned": new_version,
+            "update_available": False,
+        }
+        update_check._write_view_cache("llama_swap", updated_check)
+        self._apply_swap_check_result(updated_check)
         tail = {
             "restarted": " — service restarted",
             "started": " — service enabled and started",
             "no-unit": " — no llama-swap.service on this host, so nothing was restarted",
             "unknown": " — could not reach systemd to restart the service",
         }.get(service_state, "")
-        self.app.call_from_thread(self.app.notify, f"llama-swap updated to {new_version}{tail}")
-        self.app.call_from_thread(self._refresh_backends_table)
-        self.app.call_from_thread(self._update_action_buttons_state)
+        self.app.notify(f"llama-swap updated to {new_version}{tail}")
 
     @work
     async def _confirm_and_change_version(self) -> None:
@@ -1738,13 +1769,16 @@ class BuildsScreen(CockpitScreenBase):
         self._refresh_backends_table()
 
     def _write_pin(self, new_ref: str, *, new_comment: str | None = None) -> None:
-        _write_manifest_ref(self.repo_root / "manifest.yaml", new_ref, new_comment)
+        _write_manifest_ref(self._manifest_path(), new_ref, new_comment)
         # Reload through the app, not a private load here: cockpit/app.py hands the same
         # manifest dict to every screen's constructor, so rebinding only self.manifest would
         # leave every other tab holding the pre-write dict until the app restarts. reload_manifest
         # is the third sibling to reload_models()/reload_scripts() (cockpit/app.py).
-        self.app_ref.reload_manifest()
-        self.manifest = getattr(self.app_ref, "manifest", self.manifest)
+        if self.app_ref is not None:
+            self.app_ref.reload_manifest()
+            self.manifest = getattr(self.app_ref, "manifest", self.manifest)
+        else:
+            self.manifest = schema.load_manifest(self._manifest_path())
 
     # ------------------------------------------------------------------ add deployment (writes hosts/<hostname>.yaml, never builds)
 
@@ -1897,15 +1931,15 @@ class BuildsScreen(CockpitScreenBase):
         self.app.call_from_thread(self._apply_swap_check_result, result)
 
     def _apply_cpp_check_result(self, result: dict) -> None:
+        self._llama_cpp_check = result
         if not self.is_mounted:
             return
-        self._llama_cpp_check = result
         self._refresh_backends_table()
         self._update_action_buttons_state()
 
     def _apply_swap_check_result(self, result: dict) -> None:
+        self._llama_swap_check = result
         if not self.is_mounted:
             return
-        self._llama_swap_check = result
         self._refresh_backends_table()
         self._update_action_buttons_state()

@@ -51,7 +51,8 @@ from cockpit.screens.builds import _short, _write_manifest_cmake_flags, _write_m
 from cockpit.widgets import TableAction  # noqa: E402
 from provision import schema  # noqa: E402
 from provision.common import Runner  # noqa: E402
-from provision.steps import build as build_step  # noqa: E402
+from provision.steps import build as build_step, swap as swap_step  # noqa: E402
+from textual._context import active_app  # noqa: E402
 
 
 class CapturingRunner(Runner):
@@ -980,9 +981,143 @@ def verify_first_run_creates_manifest_verbatim() -> None:
     print("verify_build_pin: first run creates manifest verbatim, second run preserves edits — OK")
 
 
+def verify_swap_install_captures_output_and_errors() -> None:
+    """swap._install_llama_swap returns early when already installed, uses capture=True
+    during curl/tar/install when updating, and raises descriptive RuntimeError on failure."""
+    import subprocess
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        hp = {"paths": {"state_dir": str(root / "state")}}
+        manifest = {"llama_swap": {"version": "v256", "repo": "https://github.com/mostlygeek/llama-swap"}}
+
+        # 1. Early return if already installed
+        orig_version_fn = swap_step._current_installed_version
+        swap_step._current_installed_version = lambda bp: "llama-swap version v256 (amd64)"
+        runner = CapturingRunner()
+        try:
+            res = swap_step._install_llama_swap(hp, manifest, runner)
+            assert res == swap_step._BINARY_PATH
+            assert runner.run_calls == [], "already installed binary ran install commands anyway"
+
+            # 2. Captures output and raises descriptive RuntimeError on command failure
+            swap_step._current_installed_version = lambda bp: "llama-swap version v255 (amd64)"
+
+            class _FailingRunner(Runner):
+                def __init__(self) -> None:
+                    super().__init__()
+                    self.captured_calls: list[tuple[list[str], bool]] = []
+
+                def run(self, cmd, capture=False, **kwargs):
+                    self.captured_calls.append((list(cmd), capture))
+                    if "curl" in cmd:
+                        raise subprocess.CalledProcessError(22, cmd, output="curl: (22) The requested URL returned error: 404")
+                    return None
+
+            failing_runner = _FailingRunner()
+            try:
+                swap_step._install_llama_swap(hp, manifest, failing_runner)
+                assert False, "_install_llama_swap should have raised on curl failure"
+            except RuntimeError as e:
+                assert "curl: (22) The requested URL returned error: 404" in str(e)
+                assert "failed (exit 22)" in str(e)
+
+            # 3. Verify capture=True was passed to runner.run
+            assert len(failing_runner.captured_calls) == 1
+            cmd, capture = failing_runner.captured_calls[0]
+            assert "curl" in cmd and capture is True, f"curl was not run with capture=True: {failing_runner.captured_calls}"
+        finally:
+            swap_step._current_installed_version = orig_version_fn
+
+    print("verify_build_pin: swap install skips when current, captures output and raises on error — OK")
+
+
+def verify_swap_update_transaction_and_state() -> None:
+    """BuildsScreen._run_swap_update passes target_manifest to install_pinned_binary, writes
+    manifest.yaml only on success, updates update_check view cache, and updates UI state."""
+    from cockpit.screens.builds import BuildsScreen
+
+    class _FakeApp:
+        def __init__(self) -> None:
+            self.notifications: list[str] = []
+
+        def call_from_thread(self, fn, *args, **kwargs):
+            return fn(*args, **kwargs)
+
+        def notify(self, msg, **kwargs):
+            self.notifications.append(msg)
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        manifest_path = root / "manifest.yaml"
+        shutil.copyfile(_REPO_ROOT / "manifest.example.yaml", manifest_path)
+
+        fake_app = _FakeApp()
+        token = active_app.set(fake_app)
+        try:
+            screen = BuildsScreen(
+                {"paths": {"state_dir": str(root / "state")}, "gpus": []},
+                {"llama_swap": {"version": "v255"}},
+                {"models": []},
+                CapturingRunner(),
+                root,
+                app_ref=None,
+            )
+
+            # 1. Failure case: install fails -> manifest.yaml untouched
+            orig_install = swap_step.install_pinned_binary
+            orig_reconcile = swap_step.reconcile_service
+
+            def _fail_install(hp, m, r):
+                raise RuntimeError("network down")
+
+            swap_step.install_pinned_binary = _fail_install
+            check = {"ok": True, "pinned": "v255", "latest": "v256", "update_available": True}
+            BuildsScreen._run_swap_update.__wrapped__(screen, "v256", check)
+
+            disk_content = manifest_path.read_text()
+            assert "version: v255" in disk_content, "failed install mutated manifest.yaml on disk!"
+            assert screen.manifest.get("llama_swap", {}).get("version") == "v255"
+            assert any("llama-swap update failed" in n for n in fake_app.notifications)
+
+            # 2. Success case: install succeeds -> manifest.yaml updated, cache updated, check cleared
+            received_manifests: list[dict] = []
+
+            def _succ_install(hp, m, r):
+                received_manifests.append(m)
+
+            swap_step.install_pinned_binary = _succ_install
+            swap_step.reconcile_service = lambda r: "restarted"
+
+            fake_app.notifications.clear()
+            BuildsScreen._run_swap_update.__wrapped__(screen, "v256", check)
+
+            assert len(received_manifests) == 1
+            target_manifest = received_manifests[0]
+            assert target_manifest.get("llama_swap", {}).get("version") == "v256", (
+                f"install_pinned_binary was called with {target_manifest.get('llama_swap', {}).get('version')} "
+                "instead of new_version v256"
+            )
+
+            assert "version: v256" in manifest_path.read_text(), "manifest.yaml on disk was not updated to v256"
+            assert screen.manifest.get("llama_swap", {}).get("version") == "v256", "screen.manifest was not updated"
+            assert screen._llama_swap_check is not None
+            assert screen._llama_swap_check["update_available"] is False
+            assert screen._llama_swap_check["pinned"] == "v256"
+            assert any("llama-swap updated to v256 — service restarted" in n for n in fake_app.notifications)
+        finally:
+            swap_step.install_pinned_binary = orig_install
+            swap_step.reconcile_service = orig_reconcile
+            active_app.reset(token)
+
+    print("verify_build_pin: swap update transaction installs target version, updates manifest/state/cache, atomic on failure — OK")
+
+
 def main() -> None:
     verify_missing_manifest_fails_with_remedy()
     verify_first_run_creates_manifest_verbatim()
+    verify_swap_install_captures_output_and_errors()
+    verify_swap_update_transaction_and_state()
     verify_manifest_roundtrip()
     verify_write_manifest_ref_rejects_non_sha()
     verify_force_flag()

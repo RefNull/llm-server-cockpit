@@ -21,7 +21,7 @@ from provision.common import Runner, unit_command, unit_value
 
 log = logging.getLogger("provision")
 
-_ARCH_MAP = {"x86_64": "amd64", "aarch64": "arm64"}
+_ARCH_MAP = {"x86_64": "amd64", "aarch64": "arm64", "arm64": "arm64"}
 _BINARY_PATH = Path("/usr/local/bin/llama-swap")
 _UNIT_PATH = Path("/etc/systemd/system/llama-swap.service")
 _UNIT_NAME = "llama-swap.service"
@@ -50,7 +50,7 @@ def _install_llama_swap(host_profile: dict[str, Any], manifest: dict[str, Any], 
     machine = subprocess.run(["uname", "-m"], stdout=subprocess.PIPE, text=True).stdout.strip()
     arch_suffix = _ARCH_MAP.get(machine)
     if arch_suffix is None:
-        sys.exit(f"swap: unsupported host architecture {machine!r} (supported: {sorted(_ARCH_MAP)})")
+        raise RuntimeError(f"swap: unsupported host architecture {machine!r} (supported: {sorted(_ARCH_MAP)})")
 
     asset = _release_asset_name(version, arch_suffix)
     repo = manifest["llama_swap"]["repo"].rstrip("/")
@@ -59,14 +59,22 @@ def _install_llama_swap(host_profile: dict[str, Any], manifest: dict[str, Any], 
     workdir = Path(host_profile["paths"]["state_dir"]) / "llama-swap-install"
     runner.mkdir(workdir)
     tarball = workdir / asset
-    runner.run(["curl", "-fsSL", "-o", str(tarball), url])
-    runner.run(["tar", "-xzf", str(tarball), "-C", str(workdir)])
-    runner.run(["install", "-m", "0755", str(workdir / "llama-swap"), str(_BINARY_PATH)])
+    try:
+        runner.run(["curl", "-fsSL", "-o", str(tarball), url], capture=True)
+        runner.run(["tar", "-xzf", str(tarball), "-C", str(workdir)], capture=True)
+        runner.run(["install", "-m", "0755", str(workdir / "llama-swap"), str(_BINARY_PATH)], capture=True)
+    except subprocess.CalledProcessError as e:
+        detail = (e.output or "").strip()
+        cmd_str = " ".join(e.cmd) if isinstance(e.cmd, list) else str(e.cmd)
+        raise RuntimeError(
+            f"swap: install command {cmd_str} failed (exit {e.returncode})"
+            + (f": {detail}" if detail else "")
+        ) from e
 
     if not runner.dry_run:
         new_version = _current_installed_version(_BINARY_PATH)
         if new_version is None or version not in new_version:
-            sys.exit(
+            raise RuntimeError(
                 f"swap: installed llama-swap at {_BINARY_PATH} but `-version` does not report pinned "
                 f"{version!r} (got {new_version!r})"
             )
