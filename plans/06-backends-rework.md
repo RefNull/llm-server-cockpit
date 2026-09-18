@@ -258,8 +258,12 @@ so it passes either way.
    still belongs in the refresh path (§0j-7).
 5. **Table columns.** Component becomes just the backend — the section says llama.cpp:
 
-   `Backend` 14, `Active build` 20, `Status` 32, `[ Build ]` 9, `[ Edit ]` 8, `[ Builds ]` 10
-   → 93 content, render 93 + 2×6 = **105 ≤ 115**.
+   `Backend` 14, `Active build` 20, `Status` 32, `[ Build ]` 9, `[ Edit ]` 8
+   → 83 content, render 83 + 2×5 = **93 ≤ 115**.
+
+   **Corrected 2026-09-18**: this list originally included `[ Builds ]` 10, which contradicted
+   Phase 3 — that action's modal does not exist until then, and Phase 2 item 6 says not to
+   pre-empt the merge. Phase 3 adds the column (render becomes 105).
 
    `EX. cuda` is 8 cells; `build3 · 481c65f09` is 19; `update available (d1d3c33ab1)` is 29.
 6. **Status drops the word "latest" (A5a)** — `update available (<id>)` is sufficient and

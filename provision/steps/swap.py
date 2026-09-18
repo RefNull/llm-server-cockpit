@@ -306,13 +306,42 @@ def _is_enabled(unit: str) -> bool:
 
 
 def status(host_profile: dict[str, Any]) -> dict[str, Any]:
-    """Read-only llama-swap facts for display (the cockpit's Dashboard/Models tabs) — reuses
-    run()'s own _is_active/_is_enabled/_current_installed_version rather than a parallel check."""
+    """Read-only llama-swap facts for display (the cockpit's Dashboard/Backends tabs) — reuses
+    run()'s own _is_active/_is_enabled/_current_installed_version rather than a parallel check.
+
+    `binary_path`/`unit_name` are the module's own `_BINARY_PATH`/`_UNIT_NAME` constants,
+    surfaced here rather than as separate exported names — this is already the one function
+    both cockpit call sites use for llama-swap facts, so it stays the single public surface
+    instead of growing a second and third module-level name."""
     return {
         "installed_version": _current_installed_version(_BINARY_PATH),
         "unit_active": _is_active(_UNIT_NAME),
         "unit_enabled": _is_enabled(_UNIT_NAME),
+        "binary_path": str(_BINARY_PATH),
+        "unit_name": _UNIT_NAME,
     }
+
+
+def install_pinned_binary(host_profile: dict[str, Any], manifest: dict[str, Any], runner: Runner) -> Path:
+    """Install/refresh the llama-swap binary at manifest.yaml's pinned version only — no
+    config.yaml regeneration, no unit install, no restart. Narrow counterpart to run(), for a
+    caller that must not turn "update llama-swap" into a full redeploy of the gateway (the
+    cockpit's Backends tab "Update to latest" button, which bumps the pin and installs the new
+    binary but must not rewrite config.yaml or the systemd unit as a side effect)."""
+    return _install_llama_swap(host_profile, manifest, runner)
+
+
+def restart_or_start(runner: Runner) -> None:
+    """Restart llama-swap if it's already running, otherwise start+enable it — without
+    touching config.yaml or the unit file. Narrow counterpart to run()'s own tail (lines
+    414-420), reused here rather than duplicated so a caller that only changed the binary (via
+    install_pinned_binary()) can bring the running service in line with it: without this,
+    `_current_installed_version` would report the new pin while the running process still
+    executes the old inode."""
+    if _is_active(_UNIT_NAME):
+        runner.run(["systemctl", "restart", _UNIT_NAME])
+    else:
+        runner.run(["systemctl", "enable", "--now", _UNIT_NAME])
 
 
 def _sync_timer_pair(

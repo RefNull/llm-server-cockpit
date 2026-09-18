@@ -25,6 +25,7 @@ from cockpit.widgets import (
     CockpitDataTable,
     CockpitScreenBase,
     ConfirmModal,
+    InfoModal,
     SingleClickDataTable,
     TableAction,
     TableActionInvoked,
@@ -34,6 +35,7 @@ from cockpit.widgets import (
 )
 from provision.common import Runner
 from provision.steps import build as build_step
+from provision.steps import swap as swap_step
 
 log = logging.getLogger("provision")
 
@@ -151,6 +153,68 @@ def _write_manifest_cmake_flags(
         raise RuntimeError(
             f"manifest.yaml: example: true for {backend!r} was not cleared as requested — "
             "aborting without writing"
+        )
+    path.write_text(new_text)
+
+
+_SWAP_VERSION_RE = re.compile(r"^v\d+(?:\.\d+){0,3}$")
+
+# `llama_swap:` is the block's own key line at column 0; its children (`version:`, `repo:`)
+# sit at column 2 — same convention `_write_manifest_cmake_flags` documents for `backends:`.
+_MANIFEST_SWAP_KEY_RE = re.compile(r"^llama_swap:[ \t]*\n", re.MULTILINE)
+_MANIFEST_SWAP_VERSION_LINE_RE = re.compile(r"^(  version:\s*)(\S+)(\s*#.*)?$", re.MULTILINE)
+
+
+def _write_manifest_llama_swap_version(path: Path, new_version: str, new_comment: str | None = None) -> None:
+    """Rewrite manifest.yaml's `llama_swap.version` line in place, byte-identical otherwise —
+    the same targeted-line-rewrite idiom as `_write_manifest_ref` (never `yaml.safe_dump`,
+    which would destroy the header comment block and every inline comment), but scoped to the
+    `llama_swap:` block first: `version:` is not a unique key in this file the way `ref:` is —
+    `huggingface_hub.version` and `textual.version` both use the same bare key name — so an
+    unscoped line match could rewrite the wrong one.
+
+    Unlike `_write_manifest_ref`, which accepts any string today (plans/06 §0b records that as
+    a live bug on the llama_cpp side), this validates the value BEFORE touching the file: a
+    llama-swap version is a release tag like `v255`, not an arbitrary string, and a bad value
+    reaching the pin is exactly what proceeding as-typed on the other pin already gets wrong.
+    """
+    if not _SWAP_VERSION_RE.fullmatch(new_version):
+        raise ValueError(
+            f"{new_version!r} does not look like a llama-swap release tag (expected e.g. 'v255') "
+            "— refusing to write manifest.yaml"
+        )
+
+    text = path.read_text()
+    key_match = _MANIFEST_SWAP_KEY_RE.search(text)
+    if key_match is None:
+        raise RuntimeError(f"manifest.yaml: no llama_swap: block found in {path}")
+    block_start = key_match.end()
+
+    # Bounded the same way _write_manifest_cmake_flags bounds a backend's block: the next line
+    # back at column 0 (the next top-level key, or EOF), never a fixed line count.
+    next_top_level_re = re.compile(r"^\S", re.MULTILINE)
+    next_match = next_top_level_re.search(text, block_start)
+    block_end = next_match.start() if next_match else len(text)
+    block = text[block_start:block_end]
+
+    version_match = _MANIFEST_SWAP_VERSION_LINE_RE.search(block)
+    if version_match is None:
+        raise RuntimeError(f"manifest.yaml: llama_swap has no version: line to rewrite in {path}")
+
+    comment = f"  # {new_comment}" if new_comment else (version_match.group(3) or "")
+    new_line = f"{version_match.group(1)}{new_version}{comment}"
+    new_block = block[: version_match.start()] + new_line + block[version_match.end():]
+    new_text = text[:block_start] + new_block + text[block_end:]
+
+    # Same never-trust-the-regex-alone guard as _write_manifest_ref/_write_manifest_cmake_flags:
+    # parse the result back (read-only yaml.safe_load) and confirm it says what was meant before
+    # writing anything to disk.
+    parsed = yaml.safe_load(new_text)
+    actual = ((parsed or {}).get("llama_swap") or {}).get("version")
+    if actual != new_version:
+        raise RuntimeError(
+            f"manifest.yaml: llama_swap.version rewrite would produce {actual!r}, expected "
+            f"{new_version!r} — aborting without writing"
         )
     path.write_text(new_text)
 
@@ -914,14 +978,8 @@ class BuildsScreen(CockpitScreenBase):
     BuildsScreen {
         height: 1fr;
     }
-    BuildsScreen #foreign-builds-note {
+    BuildsScreen #btn-foreign-builds {
         display: none;
-    }
-    BuildsScreen .version-line {
-        margin-bottom: $space-normal;
-    }
-    BuildsScreen #backend-source-note {
-        margin-bottom: $space-normal;
     }
     """
 
@@ -955,6 +1013,10 @@ class BuildsScreen(CockpitScreenBase):
         # and a build the operator has switched tabs away from (DESIGN.md §6.1).
         self._log_buffer: list[str] = []
         self._log_modal: BuildLogModal | None = None
+        # Cache of the last filesystem scan (populated in the refresh path, DESIGN.md §3.0) —
+        # the "Foreign builds" button reads this on click rather than rescanning, and it also
+        # drives whether the button is shown at all.
+        self._foreign_builds: list[dict] = []
 
     def _compute_backends(self) -> list[str]:
         seen: list[str] = []
@@ -968,34 +1030,40 @@ class BuildsScreen(CockpitScreenBase):
 
     def compose(self) -> ComposeResult:
         with VerticalScroll():
-            with Vertical(id="update-panel", classes="panel"):
-                # The pin is one global fact (manifest.yaml llama_cpp.ref) rendered once here,
-                # not per row — a per-row "Version" column is what made "Update to latest"
-                # read as "changes every row" (plans/05 follow-up, operator QA 2026-09-18):
-                # a global fact was rendered in a per-row column. _refresh_backends_table
-                # keeps this in sync with the table.
-                yield Static(id="version-line", classes="version-line")
-                # No fixed_columns (DESIGN.md §4.2): datatable--fixed REPLACES the row
-                # style rather than compositing with it, so a pinned column cut a flat band
-                # down column 0 through the zebra stripes — the "first column is always
-                # highlighted" defect. Every column has an explicit width that fits, so
-                # nothing scrolls horizontally for it to pin.
-                backends_table = SingleClickDataTable(
-                    id="backends-table", zebra_stripes=True, classes="data-table"
-                )
-                backends_table.cursor_type = "row"
-                yield backends_table
-                # Answers "where does a row come from, and how do I add one" — the operator's
-                # 2026-09-18 QA report: the bind lives in Settings -> GPU Topology's "Add GPU"
-                # form (gpus[].backends), and nothing on this tab said so. Not a second
-                # GPU-editing form — that form stays the only one; this is a pointer to it.
-                yield Static(
-                    f"[$text-muted]Rows above are the backends declared by this host's GPUs "
-                    f"(hosts/{escape_markup(getattr(self.app_ref, 'host_name', '?'))}.yaml -> "
-                    "gpus[].backends). To add a backend: bind an existing manifest.yaml recipe "
-                    "to a GPU in Settings -> GPU Topology.[/]",
-                    id="backend-source-note",
-                )
+            # Section one — Llama-swap (operator decision §0h-3: symmetric with section two,
+            # same shape — version, status, an update action — but never a table: this is one
+            # global service, not a per-backend collection, and its Build/Info cells on the old
+            # combined table were always blank because "llama-swap" was never in self.backends).
+            yield Static("Llama-swap", classes="section-title")
+            with Vertical(id="swap-panel", classes="panel"):
+                with Horizontal(classes="form-row"):
+                    yield Static("Installed version", classes="form-label")
+                    yield Static(id="swap-installed-version", classes="form-field")
+                with Horizontal(classes="form-row"):
+                    yield Static("Update status", classes="form-label")
+                    yield Static(id="swap-update-status", classes="form-field")
+                with Horizontal(classes="form-row"):
+                    yield Static("Binary path", classes="form-label")
+                    yield Static(id="swap-binary-path", classes="form-field")
+                with Horizontal(classes="form-row"):
+                    yield Static("Systemd unit", classes="form-label")
+                    yield Static(id="swap-unit-status", classes="form-field")
+            with Horizontal(classes="action-row-secondary"):
+                yield Button("Update to latest", id="btn-swap-update-to-latest", classes="thin-button", disabled=True)
+
+            # Section two — Llama.cpp, mirroring section one's shape.
+            yield Static("Llama.cpp", classes="section-title")
+            with Vertical(id="cpp-panel", classes="panel"):
+                with Horizontal(classes="form-row"):
+                    yield Static("Version", classes="form-label")
+                    yield Static(id="cpp-version", classes="form-field")
+                with Horizontal(classes="form-row"):
+                    yield Static("Update status", classes="form-label")
+                    yield Static(id="cpp-update-status", classes="form-field")
+            with Horizontal(classes="action-row-secondary"):
+                yield Button("Update to latest", id="btn-update-to-latest", classes="thin-button", disabled=True)
+                yield Button("Change version…", id="btn-change-version", classes="thin-button")
+                yield Button("Check for Updates", id="btn-check-updates", classes="thin-button")
 
             if not self.backends:
                 yield Static(
@@ -1005,49 +1073,49 @@ class BuildsScreen(CockpitScreenBase):
                     classes="panel",
                 )
 
-            # Populated by _refresh_backends_table (DESIGN.md §3.0: data reads belong in the
-            # refresh path, not compose/on_mount), which also toggles `display` — hidden on a
-            # clean host, and re-evaluated on every refresh rather than fixed at construction,
-            # so it neither lingers after a foreign tree is removed nor misses one built while
-            # the tab is open.
-            yield Static(id="foreign-builds-note", classes="panel")
-
-            # Two rows, split by what the operator is deciding, not by width — both rows fit
-            # one line at normal widths and both stack under Screen.-narrow (SHARED_CSS,
-            # DESIGN.md §9 "Action-row overflow at narrow widths"). Row 1 is the decision
-            # (which version); row 2 is the record (what has actually been built). Build itself
-            # is deliberately not here — it's per-backend, so it lives in the table.
-            with Horizontal(classes="action-row-secondary"):
-                yield Button("Update to latest", id="btn-update-to-latest", classes="thin-button", disabled=True)
-                yield Button("Change version…", id="btn-change-version", classes="thin-button")
-                yield Button("Check for Updates", id="btn-check-updates", classes="thin-button")
+            # No fixed_columns (DESIGN.md §4.2): datatable--fixed REPLACES the row style rather
+            # than compositing with it, so a pinned column cut a flat band down column 0 through
+            # the zebra stripes — the "first column is always highlighted" defect. Every column
+            # has an explicit width that fits, so nothing scrolls horizontally for it to pin.
+            backends_table = SingleClickDataTable(
+                id="backends-table", zebra_stripes=True, classes="data-table"
+            )
+            backends_table.cursor_type = "row"
+            yield backends_table
+            # Answers "where does a row come from, and how do I add one" — the operator's
+            # 2026-09-18 QA report: the bind lives in Settings -> GPU Topology's "Add GPU" form
+            # (gpus[].backends). Not a second GPU-editing form — that stays the only one.
             with Horizontal(classes="action-row-secondary"):
                 yield Button("Retained Builds", id="btn-retained-builds", classes="thin-button")
                 yield Button("Build History", id="btn-build-history", classes="thin-button")
                 yield Button("Build log", id="btn-build-log", classes="thin-button")
+                # Hidden by default (DEFAULT_CSS) until _refresh_backends_table finds something —
+                # a scan result behind a button (A2), not an always-visible block, and never
+                # rescanned on click (DESIGN.md §3.0: the scan itself stays in the refresh path).
+                yield Button("Foreign builds", id="btn-foreign-builds", classes="thin-button")
 
     def on_mount(self) -> None:
         backends_table = self.query_one("#backends-table", SingleClickDataTable)
         backends_table.cursor_type = "row"
         backends_table.zebra_stripes = True
-        # Component is 24, not 22: an "EX. " prefix on a stock recipe's row (2026-09-18
-        # follow-up item 3) makes "llama.cpp (vulkan)" (18 chars) into "EX. llama.cpp
-        # (vulkan)" (22 chars) — the longest name among the shipped backends — which needs
-        # content budget 22, i.e. width 24 (width includes 2 cells of padding, DESIGN.md §4.4).
-        backends_table.add_column("Component", width=24)
-        backends_table.add_column("Installed", width=14)
-        # 24 + 14 + 35 + 11 + 8 = 92 content, render 92 + 2*5 = 102 (DESIGN.md §4, updated for
-        # this follow-up's 5-column shape — the pin is hoisted above the table as one global
-        # line, so Version is no longer a per-row column; QA 2026-09-18 traced "Update to
-        # latest changes every row" to exactly that column existing). Status keeps enough room
-        # for both the useful case ("update available (latest d1d3c33)") and the failure case
-        # ("couldn't check (HTTP Error 403: rate limit exceeded)").
-        backends_table.add_column("Status", width=35)
+        # The section title already says "llama.cpp" — this column is just the backend name,
+        # with an "EX. " prefix on a still-stock recipe (manifest.yaml backends.<name>.example).
+        # "EX. vulkan" is the longest at 10 chars; width 14 leaves headroom.
+        backends_table.add_column("Backend", width=14)
+        # "build3 · 481c65f09" is 19 chars (identity and version, now separable — Phase 1);
+        # width 20 fits it and "not built".
+        backends_table.add_column("Active build", width=20)
+        # 14 + 20 + 32 + 9 + 8 = 83 content, render 83 + 2*5 = 93 (DESIGN.md §4.4). "update
+        # available (d1d3c33ab1)" is 29 chars and fits; the failure case ("couldn't check
+        # (HTTP Error 403: rate limit exceeded)") is unchanged text and can now clip earlier
+        # than at the old width=35 — an accepted trade for the column budget this phase asks
+        # for, not something silently widened back.
+        backends_table.add_column("Status", width=32)
         backends_table.add_action_column(
             TableAction(
                 "build",
-                self._build_label,
-                width=11,  # fits "[ Rebuild ]" (7+4); "[ Build ]" (9) fits the same column
+                "Build",  # always "Build" (A8) — the confirm dialog says whether it's a rebuild
+                width=9,  # len("Build") + 4
                 confirm=self._build_confirm_message,
                 requires_root=True,
                 available=lambda row_key: row_key in self.backends,
@@ -1056,8 +1124,8 @@ class BuildsScreen(CockpitScreenBase):
         backends_table.add_action_column(
             TableAction(
                 "info",
-                "Info",
-                width=8,  # len("Info") + 4
+                "Edit",  # relabelled from "Info" this phase; id/handler/modal are Phase 3's
+                width=8,  # len("Edit") + 4
                 available=lambda row_key: row_key in self.backends,
             )
         )
@@ -1082,15 +1150,21 @@ class BuildsScreen(CockpitScreenBase):
 
     # ------------------------------------------------------------------ rendering
 
-    def _build_label(self, row_key: str) -> str:
-        """Rebuild when the selected version is already built and sane for this backend —
-        pressing Build on the current version then literally is a rebuild (plans/05 Phase 2
-        item 5), rather than the old silent no-op _prefix_ready used to produce."""
-        ref = self.manifest.get("llama_cpp", {}).get("ref", "")
-        for b in build_step.list_builds(self.host_profile, row_key):
-            if b.get("version") == ref and b.get("sane"):
-                return "Rebuild"
-        return "Build"
+    def _current_build(self, backend: str) -> dict | None:
+        for b in build_step.list_builds(self.host_profile, backend):
+            if b.get("current"):
+                return b
+        return None
+
+    def _is_rebuild(self, backend: str, selected_ref: str) -> bool:
+        """The single definition of "already built", shared by the confirm dialog's wording and
+        the `Active build` cell's colour: is the *current* build already at this ref? (Not "is
+        any build at this ref sane" — that was the old per-row build-label callable's
+        definition, and it disagreeing with the old installed-cell's "is one current" is
+        exactly the inconsistency the operator reported: `Not built` beside `Rebuild`. One
+        definition, used by both.)"""
+        build = self._current_build(backend)
+        return bool(build) and build.get("version") == selected_ref
 
     def _build_confirm_message(self, row_key: str) -> str:
         """Composed per row (TableAction.confirm as a callable — cockpit/widgets.py, same
@@ -1098,9 +1172,10 @@ class BuildsScreen(CockpitScreenBase):
         resolved cmake flags and the target prefix before committing ten minutes, not just a
         generic "Build llama.cpp (cuda)?" (operator QA 2026-09-18). `resolve_cmake_argv` is
         the same function `_build_backend` uses to configure the real build, so this is
-        provably what will run, not a description of it."""
-        label = self._build_label(row_key)
+        provably what will run, not a description of it. The `[ Build ]` column is always
+        "Build" (A8); this confirm is the one place that still says "Rebuild" when it is one."""
         ref = self.manifest.get("llama_cpp", {}).get("ref", "")
+        label = "Rebuild" if self._is_rebuild(row_key, ref) else "Build"
         recipe = self.manifest.get("backends", {}).get(row_key, {})
         prefix = Path(self.host_profile["paths"]["prefix_root"]) / row_key
         checkout_dir = build_step.checkout_dir_for(self.host_profile)
@@ -1111,105 +1186,121 @@ class BuildsScreen(CockpitScreenBase):
             f"Installs to {prefix}. This can take several minutes."
         )
 
-    def _installed_ref(self, backend: str) -> str | None:
-        for b in build_step.list_builds(self.host_profile, backend):
-            if b.get("current"):
-                return b.get("version")
-        return None
-
-    def _installed_cell(self, backend: str, selected_ref: str) -> Text:
-        """§0b: `current` is a per-backend symlink target, independent of the (global) pin —
-        this is the cell that would have told QA the truth immediately."""
-        current_ref = self._installed_ref(backend)
-        if current_ref is None:
+    def _active_build_cell(self, backend: str, selected_ref: str) -> Text:
+        """§0b: `current` is a per-backend symlink target, independent of the (global) pin.
+        Shows identity *and* version together (Phase 1 made them separable) — `build3 ·
+        481c65f09`, not just one or the other."""
+        build = self._current_build(backend)
+        if build is None:
             return Text("not built", style="dim")
-        if current_ref == selected_ref:
-            return Text(_short(current_ref), style="green")
-        return Text(_short(current_ref), style="bold yellow")
+        label = f"{build['id']} · {_short(build.get('version', ''))}"
+        style = "green" if build.get("version") == selected_ref else "bold yellow"
+        return Text(label, style=style)
 
     def _refresh_backends_table(self) -> None:
-        version_line = self.query_one("#version-line", Static)
         cpp_ref = self.manifest.get("llama_cpp", {}).get("ref", "")
-        version_line.update(
-            f"Selected version: {_short(cpp_ref)} — one source tree, per-backend compile "
-            "flags (manifest.yaml → llama_cpp.ref). Not per row: every backend below builds "
-            "the same commit."
-        )
+        self.query_one("#cpp-version", Static).update(escape_markup(_short(cpp_ref)))
+        self.query_one("#cpp-update-status", Static).update(self._format_update_cell(self._llama_cpp_check))
+
+        self.query_one("#swap-update-status", Static).update(self._format_update_cell(self._llama_swap_check))
+        # dashboard.py's _compute_llm_text guards this same call the same way: systemd isn't
+        # available on every host this cockpit runs on (e.g. a dev machine), and swap.status()
+        # shells out to `systemctl` with no guard of its own.
+        try:
+            swap_facts = swap_step.status(self.host_profile)
+        except FileNotFoundError:
+            swap_facts = None
+        except Exception as e:
+            log.warning("swap.status() failed: %s", e)
+            swap_facts = None
+        if swap_facts is None:
+            self.query_one("#swap-installed-version", Static).update("unknown (systemd not available)")
+            self.query_one("#swap-binary-path", Static).update("unknown")
+            self.query_one("#swap-unit-status", Static).update("unknown")
+        else:
+            self.query_one("#swap-installed-version", Static).update(
+                escape_markup(swap_facts.get("installed_version") or "not installed")
+            )
+            self.query_one("#swap-binary-path", Static).update(escape_markup(swap_facts["binary_path"]))
+            unit_state = "active" if swap_facts["unit_active"] else "inactive"
+            unit_state += ", enabled" if swap_facts["unit_enabled"] else ", disabled"
+            self.query_one("#swap-unit-status", Static).update(
+                escape_markup(f"{swap_facts['unit_name']} — {unit_state}")
+            )
+
         table = self.query_one("#backends-table", SingleClickDataTable)
         table.clear()
         for backend in self.backends:
             status_cell = (
                 Text("building…", style="dim")
                 if backend in self._building_backends
-                else self._format_update_cell(self._llama_cpp_check, shorten=True)
+                else self._format_update_cell(self._llama_cpp_check)
             )
             # "EX. " marks a still-stock recipe (manifest.yaml backends.<name>.example) — see
-            # BackendDetailModal's Info view for what it means and how it clears.
+            # BackendDetailModal's Edit view for what it means and how it clears.
             is_example = bool(self.manifest.get("backends", {}).get(backend, {}).get("example"))
-            component_label = f"{'EX. ' if is_example else ''}llama.cpp ({backend})"
+            backend_label = f"{'EX. ' if is_example else ''}{backend}"
             table.add_row(
-                Text(component_label),
-                self._installed_cell(backend, cpp_ref),
+                Text(backend_label),
+                self._active_build_cell(backend, cpp_ref),
                 status_cell,
                 *table.action_cells(backend),
                 key=backend,
             )
-        swap_version = self.manifest.get("llama_swap", {}).get("version", "")
-        table.add_row(
-            # llama-swap has exactly one version (a release tag, not a per-backend build) and
-            # no Version column exists any more, so it's named in the component cell instead
-            # of dropped — the version-line above the table is llama.cpp-specific.
-            Text(f"llama-swap ({swap_version})" if swap_version else "llama-swap"),
-            Text("—", style="dim"),
-            self._format_update_cell(self._llama_swap_check, shorten=False),
-            # The llama-swap row is informational only — updated from the Deploy tab's deploy
-            # action, not from here — so its Build/Info cells are always blank ("llama-swap"
-            # is never in self.backends).
-            *table.action_cells("llama-swap"),
-            key="llama-swap",
-        )
-        self._refresh_foreign_builds_note()
 
-    def _refresh_foreign_builds_note(self) -> None:
+        self._refresh_foreign_builds_button()
+
+    def _refresh_foreign_builds_button(self) -> None:
         """Read-only filesystem scan (build_step.find_foreign_builds) — belongs here, not in
         __init__/compose/on_mount, per DESIGN.md §3.0: a hidden tab does no I/O, and this runs
-        only from on_first_view/on_refresh_requested via _refresh_backends_table. Toggling
-        `display` each call, rather than computing once, is what keeps the note honest if a
-        foreign tree appears or disappears while the tab stays open."""
-        note = self.query_one("#foreign-builds-note", Static)
-        foreign = build_step.find_foreign_builds(self.host_profile)
-        if not foreign:
-            note.update("")
-            note.display = False
+        only from on_first_view/on_refresh_requested via _refresh_backends_table. The result is
+        cached (self._foreign_builds) so the button's own press handler never rescans; toggling
+        `display`/label each call is what keeps the button honest if a foreign tree appears or
+        disappears while the tab stays open, and hides it entirely (A2) when there is nothing
+        to report."""
+        self._foreign_builds = build_step.find_foreign_builds(self.host_profile)
+        btn = self.query_one("#btn-foreign-builds", Button)
+        if not self._foreign_builds:
+            btn.display = False
             return
-        lines = ["Detected outside paths.prefix_root — not managed by this toolkit:"]
-        for f in foreign:
-            suffix = "" if f["sane"] else " (binary missing or not executable)"
-            lines.append(f"  [$text-muted]{escape_markup(f['path'])}{suffix}[/]")
-        note.update("\n".join(lines))
-        note.display = True
+        btn.label = f"Foreign builds ({len(self._foreign_builds)})"
+        btn.display = True
 
-    def _format_update_cell(self, result: dict | None, *, shorten: bool) -> Text:
+    def _foreign_builds_text(self) -> str:
+        lines = ["Detected outside paths.prefix_root — not managed by this toolkit:"]
+        for f in self._foreign_builds:
+            suffix = "" if f["sane"] else " (binary missing or not executable)"
+            lines.append(f"  {escape_markup(f['path'])}{suffix}")
+        return "\n".join(lines)
+
+    def _format_update_cell(self, result: dict | None) -> Text:
         if result is None:
             return Text("not checked yet", style="dim")
         if not result.get("ok"):
             return Text(f"couldn't check ({result.get('error')})", style="dim")
         if not result["update_available"]:
             return Text("up to date", style="green")
-        latest = _short(result["latest"]) if shorten else result["latest"]
-        return Text(f"update available (latest {latest})", style="bold yellow")
+        return Text(f"update available ({_short(result['latest'])})", style="bold yellow")
 
     def _update_action_buttons_state(self) -> None:
         if not self.is_mounted:
             return
-        can_update = bool(
+        can_update_cpp = bool(
             self._llama_cpp_check
             and self._llama_cpp_check.get("ok")
             and self._llama_cpp_check.get("update_available")
         )
         btn = self.query("#btn-update-to-latest")
         if btn:
-            btn.first(Button).disabled = not can_update
+            btn.first(Button).disabled = not can_update_cpp
+        can_update_swap = bool(
+            self._llama_swap_check
+            and self._llama_swap_check.get("ok")
+            and self._llama_swap_check.get("update_available")
+        )
+        swap_btn = self.query("#btn-swap-update-to-latest")
+        if swap_btn:
+            swap_btn.first(Button).disabled = not can_update_swap
 
     # ------------------------------------------------------------------ per-row action dispatch
 
@@ -1224,7 +1315,8 @@ class BuildsScreen(CockpitScreenBase):
         if self._building_backends:
             self.notify("a build is already in progress", severity="warning")
             return
-        force = self._build_label(row_key) == "Rebuild"
+        ref = self.manifest.get("llama_cpp", {}).get("ref", "")
+        force = self._is_rebuild(row_key, ref)
         self._log_buffer = []
         self._open_log_modal(f"Build log — {row_key}")
         self._run_build([row_key], force=force)
@@ -1245,6 +1337,10 @@ class BuildsScreen(CockpitScreenBase):
             self.app.push_screen(RetainedBuildsModal(self.host_profile, self.backends, self.runner))
         elif button_id == "btn-build-log":
             self._open_log_modal("Build log")
+        elif button_id == "btn-foreign-builds":
+            self.app.push_screen(InfoModal("Foreign builds", self._foreign_builds_text()))
+        elif button_id == "btn-swap-update-to-latest":
+            self._confirm_and_update_swap()
 
     def _open_log_modal(self, title: str) -> None:
         modal = BuildLogModal(title, self._log_buffer)
@@ -1284,6 +1380,59 @@ class BuildsScreen(CockpitScreenBase):
         self._refresh_backends_table()
         self._update_action_buttons_state()
         self.notify(f"llama.cpp pin updated to {_short(new_ref)}")
+
+    @work
+    async def _confirm_and_update_swap(self) -> None:
+        """Bumps manifest.yaml's llama_swap.version pin, installs the binary at that pin, and
+        restarts the unit — three effects, none of them optional: installing the binary without
+        restarting would leave `_current_installed_version` reporting the new version while the
+        running service still executes the old inode, and this deliberately stops short of
+        run() (no config.yaml regeneration, no unit reinstall) — "update llama-swap" is not
+        licence to redeploy the whole gateway. Unlike the declarative-only llama_cpp pin write,
+        this actually restarts a running service, so it goes through self.confirm(...) with
+        both mutates_system and requires_root, not a bare ConfirmModal."""
+        check = self._llama_swap_check
+        if not check or not check.get("ok") or not check.get("update_available"):
+            self.notify("no update to apply — run 'Check for Updates' first", severity="warning")
+            return
+        old_version = self.manifest.get("llama_swap", {}).get("version", "")
+        new_version = check["latest"]
+        try:
+            unit_name = swap_step.status(self.host_profile)["unit_name"]
+        except Exception:
+            unit_name = "the llama-swap systemd unit"
+        message = (
+            f"Update llama-swap {old_version} → {new_version}?\n"
+            "This writes manifest.yaml, installs the new binary, and restarts "
+            f"{unit_name} — dropping any models currently loaded in VRAM."
+        )
+        if not await self.confirm(
+            message, confirm_label="Update llama-swap", mutates_system=True, requires_root=True
+        ):
+            return
+        self._run_swap_update(new_version)
+
+    @work(thread=True)
+    def _run_swap_update(self, new_version: str) -> None:
+        try:
+            _write_manifest_llama_swap_version(self.repo_root / "manifest.yaml", new_version)
+        except Exception as e:
+            self.app.call_from_thread(self.app.notify, f"could not write manifest.yaml: {e}", severity="error")
+            return
+        self.app.call_from_thread(self.app_ref.reload_manifest)
+        self.manifest = getattr(self.app_ref, "manifest", self.manifest)
+        try:
+            swap_step.install_pinned_binary(self.host_profile, self.manifest, self.privileged_runner)
+            swap_step.restart_or_start(self.privileged_runner)
+        except SystemExit as e:
+            self.app.call_from_thread(self.app.notify, f"llama-swap update failed: {e}", severity="error")
+            return
+        except Exception as e:
+            self.app.call_from_thread(self.app.notify, f"llama-swap update failed: {e}", severity="error")
+            return
+        self.app.call_from_thread(self.app.notify, f"llama-swap updated to {new_version}")
+        self.app.call_from_thread(self._refresh_backends_table)
+        self.app.call_from_thread(self._update_action_buttons_state)
 
     @work
     async def _confirm_and_change_version(self) -> None:
