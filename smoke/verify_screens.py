@@ -383,6 +383,8 @@ async def _assert_edit_model_modal(app: CockpitApp, pilot, context: str) -> None
     the geometry facts that regressed: the dialog fits the screen, every field is inside the
     dialog, and neither field-group Vertical (left or right column) clips its own content.
     """
+    from textual.widgets import Select
+
     from cockpit.screens.deploy import EditModelModal
 
     modal = EditModelModal(
@@ -403,59 +405,68 @@ async def _assert_edit_model_modal(app: CockpitApp, pilot, context: str) -> None
     )
 
     field_ids = (
-        "#f-engine", "#f-quant-file", "#f-mmproj-file", "#f-gpu", "#f-backend",
-        "#f-args", "#f-cmd", "#f-ttl", "#f-group", "#f-env",
+        "#f-id", "#f-engine", "#f-quant-file", "#f-mmproj-file", "#f-gpu", "#f-backend",
+        "#f-python-interpreter", "#f-python-script",
+        "#f-args", "#f-cmd", "#f-ttl", "#f-group", "#f-check-endpoint", "#f-env",
         "#btn-args-examples", "#btn-env-examples", "#btn-save", "#btn-cancel",
     )
-    # Horizontal containment only, not vertical: #f-quant-file..#f-group sit inside
-    # #edit-model-scroll (a VerticalScroll), so a field further down the form legitimately has
-    # a logical y past the dialog's visible bottom before anything has scrolled — that is
-    # scrolling working as designed, not the c.2 defect. c.2 (width: 110 hanging the right
-    # column off an 80-cell screen) is a HORIZONTAL escape no scroll offset can fix, which is
-    # exactly what this half of the check catches.
-    for widget_id in field_ids:
-        widget = app.screen.query_one(widget_id)
-        if not widget.is_on_screen:
-            continue
-        assert widget.region.x >= dialog.region.x and widget.region.right <= dialog.region.right, (
-            f"[{context}] {widget_id} region {widget.region} escapes the dialog horizontally "
-            f"({dialog.region}) — unreachable by any amount of vertical scrolling"
-        )
 
-    # Vertical reachability: scroll each column to its end and confirm the last field in it is
-    # then fully inside the dialog. This is the actual c.3 regression check on the reading
-    # side — the old bug capped max_scroll_y at 3 regardless of content height, so scrolling
-    # "worked" but never actually surfaced the clipped fields.
+    # plans/09 Phase 2 item 8: geometry must hold for every engine value, not just the default
+    # llama-cpp one that mounts first — python/unmanaged toggle a disjoint set of fields on.
     left_scroll = app.screen.query_one("#edit-model-scroll")
     right_scroll = app.screen.query_one("#edit-model-right")
-    left_scroll.scroll_end(animate=False)
-    right_scroll.scroll_end(animate=False)
-    await pilot.pause(0.2)
-    for widget_id in ("#f-group", "#f-env"):
-        widget = app.screen.query_one(widget_id)
-        assert widget.is_on_screen, f"[{context}] {widget_id} never reachable by scrolling"
-        assert dialog.region.contains_region(widget.region), (
-            f"[{context}] {widget_id} region {widget.region} still escapes the dialog "
-            f"{dialog.region} after scrolling its column to the end"
-        )
-    left_scroll.scroll_home(animate=False)
-    right_scroll.scroll_home(animate=False)
-    await pilot.pause(0.1)
+    for engine_value in ("llama-cpp", "python", "unmanaged"):
+        app.screen.query_one("#f-engine", Select).value = engine_value
+        await pilot.pause(0.15)
 
-    # The c.3 regression test: a plain Vertical field-group inside a scroll container must
-    # size to its own content (height: auto), not clip it to the framework's height: 1fr
-    # default. Covers both columns — #edit-model-right was converted to a VerticalScroll for
-    # the same reason once args/cmd moved above env there.
-    for group_id in ("#f-llamacpp-fields", "#f-args-group", "#f-cmd-group"):
-        group = app.screen.query_one(group_id)
-        if not group.is_on_screen:
-            continue
-        assert group.region.height >= group.virtual_size.height, (
-            f"[{context}] {group_id}: region.height={group.region.height} < "
-            f"virtual_size.height={group.virtual_size.height} — clipped, the c.3 defect"
-        )
+        # Horizontal containment only, not vertical: #f-quant-file..#f-check-endpoint sit
+        # inside #edit-model-scroll (a VerticalScroll), so a field further down the form
+        # legitimately has a logical y past the dialog's visible bottom before anything has
+        # scrolled — that is scrolling working as designed, not the c.2 defect. c.2 (width: 110
+        # hanging the right column off an 80-cell screen) is a HORIZONTAL escape no scroll
+        # offset can fix, which is exactly what this half of the check catches.
+        for widget_id in field_ids:
+            widget = app.screen.query_one(widget_id)
+            if not widget.is_on_screen:
+                continue
+            assert widget.region.x >= dialog.region.x and widget.region.right <= dialog.region.right, (
+                f"[{context} engine={engine_value}] {widget_id} region {widget.region} escapes "
+                f"the dialog horizontally ({dialog.region}) — unreachable by any amount of "
+                "vertical scrolling"
+            )
 
-    _assert_buttons_in_bounds(app, f"{context} EditModelModal")
+        # Vertical reachability: scroll each column to its end and confirm the last field in it
+        # is then fully inside the dialog. This is the actual c.3 regression check on the
+        # reading side — the old bug capped max_scroll_y at 3 regardless of content height, so
+        # scrolling "worked" but never actually surfaced the clipped fields.
+        left_scroll.scroll_end(animate=False)
+        right_scroll.scroll_end(animate=False)
+        await pilot.pause(0.2)
+        for widget_id in ("#f-check-endpoint", "#f-env"):
+            widget = app.screen.query_one(widget_id)
+            assert widget.is_on_screen, f"[{context} engine={engine_value}] {widget_id} never reachable by scrolling"
+            assert dialog.region.contains_region(widget.region), (
+                f"[{context} engine={engine_value}] {widget_id} region {widget.region} still "
+                f"escapes the dialog {dialog.region} after scrolling its column to the end"
+            )
+        left_scroll.scroll_home(animate=False)
+        right_scroll.scroll_home(animate=False)
+        await pilot.pause(0.1)
+
+        # The c.3 regression test: a plain Vertical field-group inside a scroll container must
+        # size to its own content (height: auto), not clip it to the framework's height: 1fr
+        # default. Covers both columns — #edit-model-right was converted to a VerticalScroll for
+        # the same reason once args/cmd moved above env there.
+        for group_id in ("#f-llamacpp-fields", "#f-python-group", "#f-args-group", "#f-cmd-group"):
+            group = app.screen.query_one(group_id)
+            if not group.is_on_screen:
+                continue
+            assert group.region.height >= group.virtual_size.height, (
+                f"[{context} engine={engine_value}] {group_id}: region.height={group.region.height} < "
+                f"virtual_size.height={group.virtual_size.height} — clipped, the c.3 defect"
+            )
+
+        _assert_buttons_in_bounds(app, f"{context} engine={engine_value} EditModelModal")
 
 
 async def _assert_builds_list_modal(app: CockpitApp, pilot, context: str) -> None:

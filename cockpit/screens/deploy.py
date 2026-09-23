@@ -10,6 +10,7 @@ reload. A failed validation never touches the real file.
 from __future__ import annotations
 
 import re
+import shlex
 from pathlib import Path
 from typing import Any
 
@@ -35,20 +36,74 @@ from provision import schema
 from provision.common import Runner
 from provision.steps import swap
 
-_ENGINE_OPTIONS = [("llama-cpp", "llama-cpp"), ("unmanaged", "unmanaged")]
+_ENGINE_OPTIONS = [
+    ("llama-server (GGUF)", "llama-cpp"),
+    ("Python script", "python"),
+    ("Custom command", "unmanaged"),
+]
+
+# The prefill EditModelModal drops into a NEW python model's (empty) args box on engine
+# switch (Decision 2, plans/09 Phase 2 item 3) — not every script takes --port, so this is a
+# convenience default, not a hardcoded part of the python cmd. Also the sentinel the
+# coordinator's away-from-python clear checks against, so switching python -> llama-cpp -> back
+# doesn't strand it as a stale llama-server flag no one typed.
+_PYTHON_ARGS_PREFILL = "--port ${PORT}"
+
+
+def _args_lines_to_tokens(text: str) -> list[str]:
+    """Parse an args TextArea's text into a flat token list (Decision 4, plans/09 Phase 2 item
+    6): shlex.split per non-blank line, not one line = one token — `--ctx-size 262144` on one
+    line must survive as two argv tokens or it reaches llama-server as a single unknown
+    argument (plan §0b). Raises ValueError (from shlex.split, an unbalanced quote) with the
+    1-based line number prepended so the caller can name the offending line in a form error.
+    """
+    tokens: list[str] = []
+    for lineno, raw_line in enumerate(text.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            tokens.extend(shlex.split(line))
+        except ValueError as e:
+            raise ValueError(f"line {lineno}: {e}") from e
+    return tokens
+
+
+def _args_tokens_to_lines(tokens: list[str]) -> str:
+    """Inverse of _args_lines_to_tokens, for display on load (Decision 4): re-pair `--flag
+    value` onto one line via shlex.join for readability. A token following a `-`-prefixed
+    token is paired with it only if that following token does NOT itself start with `-` — so
+    two flags in a row (e.g. --flash-attn, --jinja) each keep their own line rather than one
+    swallowing the other as a fake "value". Round-trip is lossless:
+    _args_lines_to_tokens(_args_tokens_to_lines(tokens)) == tokens (smoke/verify_swap_import.py).
+    """
+    lines: list[str] = []
+    i = 0
+    n = len(tokens)
+    while i < n:
+        tok = tokens[i]
+        if tok.startswith("-") and i + 1 < n and not tokens[i + 1].startswith("-"):
+            lines.append(shlex.join([tok, tokens[i + 1]]))
+            i += 2
+        else:
+            lines.append(shlex.join([tok]))
+            i += 1
+    return "\n".join(lines)
 
 
 class ExamplesModal(ModalScreen[str | None]):
-    """Copy-in snippets for the arguments/env fields (QA item c.4 + d).
+    """Copy-in snippets for the arguments/env fields (QA item c.4 + d; table form, plans/09
+    Phase 3, item c).
 
-    Rows are (label, snippet, description) — the label is a short human name, never the
-    snippet itself: `--chat-template-kwargs '{"reasoning_effort":"medium",...}'` as a Button
-    label would blow past the dialog width, and DESIGN.md §9 forbids fixing that with
-    per-button CSS. Clicking a row's "Insert" button dismisses with the snippet; the caller
-    appends it as a new line rather than overwriting whatever is already typed.
+    One two-column table (Purpose | Snippet) per DESIGN.md §4.6 — cells are rich.text.Text,
+    not str: the JSON snippet below carries braces and quotes the app console's markup=True
+    would otherwise try to parse. Row select dismisses with that row's snippet; the caller
+    (EditModelModal._insert_example) appends it as a new line rather than overwriting whatever
+    is already typed.
 
-    Every snippet below is copied verbatim from models.example.yaml or from the upstream docs
-    cited in plans/05-qa-remediation-pass.md §0g — none invented.
+    Every snippet below is copied verbatim from the operator's own llama-swap config (its
+    genericized shape lives in smoke/fixtures/llama-swap-import.yaml) or from
+    models.example.yaml.
     """
 
     BINDINGS = [("escape", "cancel", "Cancel")]
@@ -76,32 +131,30 @@ class ExamplesModal(ModalScreen[str | None]):
     #examples-scroll {
         height: 1fr;
     }
-    .examples-row {
-        height: auto;
-        margin-bottom: $space-normal;
-    }
-    .examples-snippet {
-        color: $text-muted;
-        width: 1fr;
-    }
     """
 
-    # (label, snippet, description) — arguments from models.example.yaml:26-46,57-62.
-    ARG_EXAMPLES: list[tuple[str, str, str]] = [
-        ("Large context", "--ctx-size 262144", "context window size, in tokens"),
-        ("Quantize KV cache", "--cache-type-k q4_0", "quantize the K side of the KV cache (pair with --cache-type-v)"),
-        ("Flash attention", "--flash-attn", "enable flash attention"),
-        ("Chat template", "--jinja", "use the model's own chat template via jinja"),
-        ("Embedding model", "--embedding --pooling cls", "serve this model for embeddings, not chat"),
+    # (purpose, snippet) — llama-server CLI flags, from the operator's config (fixture) and
+    # models.example.yaml. --port/--model/--mmproj excluded: the form owns those.
+    ARG_EXAMPLES: list[tuple[str, str]] = [
+        ("Context window", "--ctx-size 262144"),
+        ("KV cache K type", "--cache-type-k q4_0"),
+        ("KV cache V type", "--cache-type-v q4_0"),
+        ("Flash attention", "--flash-attn"),
+        ("Jinja chat template", "--jinja"),
+        ("Chat template kwargs", '--chat-template-kwargs \'{"reasoning_effort":"medium","preserve_thinking":true}\''),
+        ("Reasoning budget", "--reasoning-budget 5000"),
+        ("Speculative decoding", "--spec-type draft-mtp"),
+        ("Max draft tokens", "--spec-draft-n-max 2"),
+        ("Auto-fit off", "--fit off"),
+        ("Context checkpoints", "--ctx-checkpoints 0"),
+        ("Embedding", "--embedding"),
+        ("Pooling (embedding)", "--pooling cls"),
+        ("Reranking", "--reranking"),
+        ("Pooling (reranker)", "--pooling rank"),
     ]
-    # env from models.example.yaml:47-48,63-64.
-    ENV_EXAMPLES: list[tuple[str, str, str]] = [
-        (
-            "Intel Vulkan ICD",
-            "VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/intel_icd.x86_64.json",
-            "Intel GPU via Vulkan — required on hosts where the Intel ICD is not the default",
-        ),
-        ("CUDA device pin", "CUDA_VISIBLE_DEVICES=0", "restrict this model to one CUDA device"),
+    ENV_EXAMPLES: list[tuple[str, str]] = [
+        ("Intel Vulkan ICD", "VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/intel_icd.x86_64.json"),
+        ("Pin CUDA device", "CUDA_VISIBLE_DEVICES=0"),
     ]
 
     def __init__(self, kind: str) -> None:
@@ -115,29 +168,32 @@ class ExamplesModal(ModalScreen[str | None]):
             yield Static(title, id="examples-title")
             if self.kind == "args":
                 yield Static(
-                    "Three naming spaces collide in this form: this field takes llama-server "
-                    "CLI flags (below, appended to the generated cmd:); llama-swap's own cmd: "
-                    "key (used for engine: unmanaged) is a whole shell command; llama.cpp preset "
-                    "files use hyphenated bare keys like ctx-size with no --. Preset keys are "
-                    "NOT accepted here.",
+                    "llama-server CLI flags (with --). Not llama.cpp preset keys, not a full command.",
                     id="examples-intro",
                 )
             with VerticalScroll(id="examples-scroll"):
-                for i, (label, snippet, desc) in enumerate(self._examples):
-                    with Horizontal(classes="examples-row"):
-                        yield Button(f"Insert: {label}", id=f"ex-insert-{i}", classes="thin-button")
-                        yield Static(f"{snippet}\n{desc}", classes="examples-snippet")
+                table = SingleClickDataTable(id="examples-table", zebra_stripes=True, classes="data-table")
+                table.cursor_type = "row"
+                yield table
             with Horizontal(classes="action-row-primary"):
                 yield Button("Close", id="btn-examples-close", classes="thin-button")
 
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        bid = event.button.id or ""
-        if bid == "btn-examples-close":
-            self.dismiss(None)
+    def on_mount(self) -> None:
+        table = self.query_one("#examples-table", SingleClickDataTable)
+        table.add_column("Purpose", width=22)
+        table.add_column("Snippet", width=79)
+        for i, (purpose, snippet) in enumerate(self._examples):
+            table.add_row(Text(purpose), Text(snippet), key=str(i))
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        if event.data_table.id != "examples-table" or event.row_key is None or event.row_key.value is None:
             return
-        if bid.startswith("ex-insert-"):
-            idx = int(bid.removeprefix("ex-insert-"))
-            self.dismiss(self._examples[idx][1])
+        idx = int(event.row_key.value)
+        self.dismiss(self._examples[idx][1])
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-examples-close":
+            self.dismiss(None)
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -206,19 +262,18 @@ class EditModelModal(ModalScreen[bool]):
         width: 1fr;
         padding-right: $space-section;
     }
-    /* Now holds args/cmd (whichever the engine needs) above env, not env alone — a model can
-       carry 15-20 KEY=VALUE lines and the single-column form gave it a box a few rows tall at
-       the bottom of a scroll, the one field most likely to be long was the one hardest to
-       edit. VerticalScroll, not a plain Vertical: stacking args/cmd above a min-height: 18 env
-       box is more content than a non-scrolling height: 1fr column can hold at the 80x24 floor
-       — the same clipping mechanism §0f found on the left, reproduced here if this stayed a
-       plain Vertical (plans/05-qa-remediation-pass.md Phase 5, coordinator correction). */
+    /* Holds args/cmd (whichever the engine needs) above env, not env alone. Real configs
+       invert what this used to assume here: the operator's biggest model carries 19 arg
+       tokens and 1 env line, not 15-20 env lines (plans/09 §0f) — args, not env, is the field
+       that needs the room, hence #f-args below getting the flexible row instead of #f-env.
+       VerticalScroll, not a plain Vertical: stacking a flexible-height args/cmd box above env
+       is still more content than a non-scrolling height: 1fr column can hold at the 80x24
+       floor — the same clipping mechanism §0f found on the left, reproduced here if this
+       stayed a plain Vertical (plans/05-qa-remediation-pass.md Phase 5, coordinator
+       correction). */
     #edit-model-right {
         width: 1fr;
         height: 1fr;
-    }
-    #f-env {
-        min-height: 18;
     }
     #edit-model-dialog {
         width: 90%;
@@ -236,20 +291,36 @@ class EditModelModal(ModalScreen[bool]):
         height: 1fr;
     }
     /* Both columns now carry Labels (args/cmd moved into the right column, above env) so this
-       is scoped to the shared columns container, not just the left scroll. */
+       is scoped to the shared columns container, not just the left scroll. width: 1fr makes a
+       Label wrap inside its column instead of clipping at 80 cols (§0f: the args label's
+       ~110-char text used to run off the right edge). */
     #edit-model-columns Label {
         margin-top: $space-normal;
         color: $text-muted;
     }
-    #f-args, #f-cmd, #f-env {
+    #edit-model-right Label {
+        width: 1fr;
+    }
+    /* args is the field real configs actually grow (§0f: 19 tokens on the operator's biggest
+       model) — flexible with headroom, not a fixed 5 rows. cmd and env stay fixed: cmd is one
+       engine's whole command, env the operator's configs carry 0-1 lines of. */
+    #f-args {
+        height: 1fr;
+        min-height: 12;
+    }
+    #f-cmd, #f-env {
         height: 5;
     }
-    /* Plain Vertical, not VerticalScroll: these hold a handful of Selects/a TextArea each and
-       must size to their own content inside a VerticalScroll parent, the same c.3 fix as
-       #f-llamacpp-fields (§0f) — a plain Vertical's framework default of height: 1fr resolves
-       against the viewport, not the content, and clips. */
-    #f-llamacpp-fields, #f-args-group, #f-cmd-group {
+    /* Plain Vertical, not VerticalScroll: these hold a handful of Selects/Inputs/a TextArea
+       each and must size to their own content inside a VerticalScroll parent, the same c.3 fix
+       as #f-llamacpp-fields (§0f) — a plain Vertical's framework default of height: 1fr
+       resolves against the viewport, not the content, and clips. */
+    #f-llamacpp-fields, #f-python-group, #f-args-group, #f-cmd-group {
         height: auto;
+    }
+    .form-hint {
+        color: $text-muted;
+        margin-top: $space-normal;
     }
     #form-error {
         color: $error;
@@ -278,6 +349,13 @@ class EditModelModal(ModalScreen[bool]):
         self.editing_id = editing_id
         self.repo_root = repo_root
         self.app_ref = app_ref
+        # #f-id autofill (Decision 5): touched once the operator types in it themselves, so a
+        # later file pick no longer overwrites a chosen id. Always touched when editing — the
+        # id is disabled there and never autofilled. _autofilling_id guards the reentrant
+        # Input.Changed our own programmatic writes fire (on_input_changed must not mistake
+        # that for the operator typing).
+        self._id_touched = editing_id is not None
+        self._autofilling_id = False
         self._model = (
             next((m for m in self.models.get("models", []) if m["id"] == editing_id), None)
             if editing_id
@@ -313,14 +391,30 @@ class EditModelModal(ModalScreen[bool]):
         title = f"Edit Model: {self.editing_id}" if self.editing_id else "Add Model"
         m = self._model
         engine_val = m.get("engine", "llama-cpp") if m else "llama-cpp"
+        # Args box holds llama_server_args for llama-cpp, args for python — same slot, same
+        # parser (Decision 4). A brand-new model always starts blank, even though it opens on
+        # engine llama-cpp by default: the --port ${PORT} python prefill only fires when the
+        # operator actually switches the Select to python (on_select_changed), not here.
+        if m:
+            stored_args = m.get("llama_server_args") if engine_val == "llama-cpp" else m.get("args", [])
+            initial_args_text = _args_tokens_to_lines(stored_args or [])
+        else:
+            initial_args_text = ""
 
         with Vertical(id="edit-model-dialog"):
             yield Static(title, id="edit-model-title")
             with Horizontal(id="edit-model-columns", classes="columns-responsive"):
               with VerticalScroll(id="edit-model-scroll"):
-                # No id field: it is derived from the chosen filename (see _derived_id), which
-                # is what llama-swap routes on. The route name is still surfaced — in the save
-                # confirmation ("Save changes to model <id> in models.yaml?", below), not here.
+                # id: typed for python/unmanaged, autofilled from the chosen file for llama-cpp
+                # until the operator types over it (_maybe_autofill_id / Decision 5). Disabled
+                # when editing — renames are out of scope, the stored id wins.
+                yield Label("id")
+                yield Input(
+                    id="f-id",
+                    placeholder="letters, numbers, '_', '.', '-'",
+                    value=self.editing_id or "",
+                    disabled=self.editing_id is not None,
+                )
                 yield Label("engine")
                 yield Select(_ENGINE_OPTIONS, id="f-engine", allow_blank=False, value=engine_val)
 
@@ -343,6 +437,25 @@ class EditModelModal(ModalScreen[bool]):
                     yield Label("bind.backend")
                     yield Select([], id="f-backend", allow_blank=True)
 
+                with Vertical(id="f-python-group"):
+                    yield Label("python interpreter path")
+                    yield Input(
+                        id="f-python-interpreter",
+                        placeholder="/opt/services/asr/.venv/bin/python",
+                        value=(m.get("python", "") if m else ""),
+                    )
+                    yield Label("script path")
+                    yield Input(
+                        id="f-python-script",
+                        placeholder="/opt/services/asr/asr_server.py",
+                        value=(m.get("script", "") if m else ""),
+                    )
+                    yield Static(
+                        "Runs on demand under llama-swap on ${PORT}. For an always-on systemd "
+                        "service use the Scripts tab.",
+                        classes="form-hint",
+                    )
+
                 yield Label("ttl (seconds; 0 = never unload, blank = llama-swap default)")
                 # Blank for a new binding, not "0": 0 means never unload, so defaulting the
                 # box to it would make every model created here resident. Only an explicit ttl
@@ -354,6 +467,13 @@ class EditModelModal(ModalScreen[bool]):
                 yield Label("group (optional)")
                 yield Input(id="f-group", placeholder="", value=m.get("group", "") if m else "")
 
+                yield Label("check endpoint (optional; path only, e.g. /health)")
+                yield Input(
+                    id="f-check-endpoint",
+                    placeholder="/health",
+                    value=(m.get("check_endpoint", "") if m else ""),
+                )
+
                 yield Static("", id="form-error", classes="error-text")
 
               with VerticalScroll(id="edit-model-right"):
@@ -362,14 +482,11 @@ class EditModelModal(ModalScreen[bool]):
                   # multi-line and both deserve the width (QA item c.4).
                   with Vertical(id="f-args-group"):
                       yield Label(
-                          "llama-server arguments — one flag or value per line. Appended to "
-                          "the generated llama-swap cmd: after --model and --port."
+                          "llama-server flags — one flag (and its value) per line",
+                          id="f-args-label",
                       )
                       yield Button("Examples", id="btn-args-examples", classes="thin-button")
-                      yield TextArea(
-                          "\n".join(m.get("llama_server_args", [])) if m else "",
-                          id="f-args",
-                      )
+                      yield TextArea(initial_args_text, id="f-args")
                   with Vertical(id="f-cmd-group"):
                       yield Label(
                           "cmd — the complete command llama-swap runs. ${PORT} and "
@@ -449,15 +566,53 @@ class EditModelModal(ModalScreen[bool]):
 
     def _toggle_engine_fields(self, engine: str) -> None:
         is_llama = engine == "llama-cpp"
+        is_python = engine == "python"
+        is_unmanaged = engine == "unmanaged"
         self.query_one("#f-llamacpp-fields").display = is_llama
-        self.query_one("#f-args-group").display = is_llama
-        self.query_one("#f-cmd-group").display = not is_llama
+        self.query_one("#f-python-group").display = is_python
+        self.query_one("#f-args-group").display = is_llama or is_python
+        self.query_one("#f-cmd-group").display = is_unmanaged
+        # Examples snippets are llama-server CLI flags — meaningless for a python script's own
+        # args, and no python-args variant exists (plans/09 Phase 3 item 4: prefer hiding).
+        self.query_one("#btn-args-examples").display = is_llama
+        args_label = self.query_one("#f-args-label", Label)
+        if is_python:
+            args_label.update("script arguments — one per line")
+        else:
+            args_label.update("llama-server flags — one flag (and its value) per line")
+
+    def _maybe_autofill_id(self) -> None:
+        """#f-id from the chosen file, only for a NEW llama-cpp model that hasn't been typed
+        into yet (Decision 5) — python/unmanaged have no file select to derive from."""
+        if self.editing_id or self._id_touched:
+            return
+        derived = self._derived_id()
+        if derived:
+            self._autofilling_id = True
+            self.query_one("#f-id", Input).value = derived
+            self._autofilling_id = False
 
     def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id == "f-engine":
-            self._toggle_engine_fields(str(event.value))
+            engine = str(event.value)
+            args = self.query_one("#f-args", TextArea)
+            # Switching a NEW model away from python: drop the --port ${PORT} prefill this
+            # modal itself inserted, but only if the box still holds exactly that — an operator
+            # who typed real args, or edited the prefill, keeps whatever is there (coordinator
+            # course-correction, mid-package).
+            if engine != "python" and self._model is None and args.text == _PYTHON_ARGS_PREFILL:
+                args.text = ""
+            self._toggle_engine_fields(engine)
+            if engine == "python" and self._model is None and not args.text.strip():
+                args.text = _PYTHON_ARGS_PREFILL
         elif event.select.id == "f-gpu":
             self._refresh_backend_options(str(event.value))
+        elif event.select.id == "f-quant-file":
+            self._maybe_autofill_id()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "f-id" and not self._autofilling_id:
+            self._id_touched = True
 
     def _set_form_error(self, text: str) -> None:
         self.query_one("#form-error", Static).update(text)
@@ -469,6 +624,13 @@ class EditModelModal(ModalScreen[bool]):
         engine = self.query_one("#f-engine", Select).value
         if engine is Select.BLANK:
             return None, "engine is required"
+        engine = str(engine)
+
+        model_id = self.query_one("#f-id", Input).value.strip()
+        if not model_id:
+            return None, "id is required"
+        if not re.match(r"^[a-zA-Z0-9_.\-]+$", model_id):
+            return None, "id may only contain letters, numbers, '_', '.', '-'"
 
         # Blank means unspecified, NOT 0. Upstream llama-swap: "a ttl of 0 will mean never
         # unload", default "-1 (use global default)" — so coercing an empty box to 0 silently
@@ -484,12 +646,10 @@ class EditModelModal(ModalScreen[bool]):
                 return None, "ttl must be >= 0, or blank for llama-swap's default"
 
         group = self.query_one("#f-group", Input).value.strip()
+        check_endpoint = self.query_one("#f-check-endpoint", Input).value.strip()
         env_lines = [line.strip() for line in self.query_one("#f-env", TextArea).text.splitlines() if line.strip()]
 
-        model_id = self.editing_id or self._derived_id()
-        if not model_id:
-            return None, "could not derive an id — pick a model file"
-        model: dict[str, Any] = {"id": model_id, "engine": str(engine)}
+        model: dict[str, Any] = {"id": model_id, "engine": engine}
 
         if engine == "llama-cpp":
             quant_sel = self.query_one("#f-quant-file", Select).value
@@ -508,10 +668,26 @@ class EditModelModal(ModalScreen[bool]):
             if mmproj_sel is not Select.BLANK and str(mmproj_sel) != quant_file:
                 model["mmproj_file"] = str(mmproj_sel)
             model["bind"] = {"gpu": str(gpu), "backend": str(backend)}
-            args_lines = [line for line in self.query_one("#f-args", TextArea).text.splitlines() if line.strip() != ""]
-            if args_lines:
-                model["llama_server_args"] = args_lines
-        else:
+            try:
+                args_tokens = _args_lines_to_tokens(self.query_one("#f-args", TextArea).text)
+            except ValueError as e:
+                return None, f"could not parse arguments — {e}"
+            if args_tokens:
+                model["llama_server_args"] = args_tokens
+        elif engine == "python":
+            python_path = self.query_one("#f-python-interpreter", Input).value.strip()
+            script_path = self.query_one("#f-python-script", Input).value.strip()
+            if not python_path or not script_path:
+                return None, "python interpreter path and script path are required for python models"
+            model["python"] = python_path
+            model["script"] = script_path
+            try:
+                args_tokens = _args_lines_to_tokens(self.query_one("#f-args", TextArea).text)
+            except ValueError as e:
+                return None, f"could not parse arguments — {e}"
+            if args_tokens:
+                model["args"] = args_tokens
+        else:  # unmanaged
             cmd = self.query_one("#f-cmd", TextArea).text
             if not cmd.strip():
                 return None, "cmd is required for unmanaged models"
@@ -523,6 +699,8 @@ class EditModelModal(ModalScreen[bool]):
             model["ttl"] = ttl
         if group:
             model["group"] = group
+        if check_endpoint:
+            model["check_endpoint"] = check_endpoint
         return model, None
 
     async def _insert_example(self, kind: str, target_id: str) -> None:

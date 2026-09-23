@@ -106,6 +106,27 @@ def check_classification_and_status() -> list[dict]:
     return results
 
 
+def check_args_roundtrip(results: list[dict]) -> None:
+    """plans/09-swap-import-and-python-engine.md Phase 2 item 6 (Decision 4): the form's
+    tokens<->lines helpers must round-trip losslessly. Uses chat-main's llama_server_args,
+    which carries the fixture's quoted --chat-template-kwargs JSON blob (braces, colons,
+    embedded double quotes) — the token most likely to break a naive per-line join/split.
+    """
+    from cockpit.screens.deploy import _args_lines_to_tokens, _args_tokens_to_lines
+
+    by_id = {r["model"]["id"]: r for r in results}
+    tokens = by_id["chat-main"]["model"]["llama_server_args"]
+    assert any("chat-template-kwargs" in t for t in tokens), (
+        f"chat-main: fixture no longer carries a chat-template-kwargs token to round-trip: {tokens!r}"
+    )
+    lines = _args_tokens_to_lines(tokens)
+    round_tripped = _args_lines_to_tokens(lines)
+    assert round_tripped == tokens, (
+        f"args round-trip lossy over {len(tokens)} tokens:\n  in:  {tokens!r}\n  lines: {lines!r}\n  out: {round_tripped!r}"
+    )
+    print(f"  args round-trip lossless over {len(tokens)} tokens, including the quoted chat-template-kwargs JSON")
+
+
 def check_validate_and_regenerate(results: list[dict]) -> None:
     manifest = schema.load_manifest(_REPO_ROOT / "manifest.example.yaml")
     host_profile = schema.load_host_profile(_REPO_ROOT / "hosts" / "example.yaml", manifest)
@@ -134,6 +155,7 @@ def check_validate_and_regenerate(results: list[dict]) -> None:
 
 def main() -> None:
     results = check_classification_and_status()
+    check_args_roundtrip(results)
     check_validate_and_regenerate(results)
     print("Swap import verification PASSED.")
 
