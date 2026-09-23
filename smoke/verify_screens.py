@@ -268,7 +268,7 @@ async def _assert_wol_form_wiring(app: CockpitApp, pilot, context: str) -> None:
             select = app.query_one("#f-wol-interface", Select)
             mac_field = app.query_one("#f-wol-mac", Input)
 
-            options = [value for _, value in select._options if value is not Select.BLANK]
+            options = [value for _, value in select._options if value is not Select.NULL]
             for name in ("enp6s0", "eno1"):
                 assert name in options, f"[{context}] {name} missing from the interface Select: {options}"
 
@@ -286,6 +286,20 @@ async def _assert_wol_form_wiring(app: CockpitApp, pilot, context: str) -> None:
             await pilot.pause(0.2)
             assert mac_field.value == "de:ad:be:ef:00:01", (
                 f"[{context}] repopulating clobbered the operator's MAC override: {mac_field.value!r}"
+            )
+
+            # A profile with no configured interface must populate to a blank Select, and a blank
+            # Select must read back as "". Both used Select.BLANK (Widget.BLANK == False), which is
+            # not Select's no-selection value: assigning it raised InvalidSelectValueError, and
+            # `value is Select.BLANK` never matched, so the save path got the string "Select.NULL".
+            screen.host_profile["network"]["wol"] = {"interface": "", "mac": ""}
+            screen._populate_wol_form()
+            await pilot.pause(0.1)
+            assert select.value is Select.NULL, (
+                f"[{context}] empty configured interface did not populate blank: {select.value!r}"
+            )
+            assert screen._selected_wol_interface() == "", (
+                f"[{context}] blank interface Select read back as {screen._selected_wol_interface()!r}"
             )
         finally:
             wol._SYSFS_NET = real_sysfs
@@ -643,8 +657,80 @@ async def _assert_add_deployment_modal(app: CockpitApp, pilot, context: str) -> 
         )
 
     _assert_buttons_in_bounds(app, f"{context} AddDeploymentModal")
+
+    # Blank-Select handling. An untouched Select holds Select.NULL (truthy, str() ==
+    # "Select.NULL"); the modal used to test `is Select.BLANK`, which never matches.
+    from textual.widgets import Select, Static, TextArea
+
+    gpu_select = modal.query_one("#f-deployment-gpu", Select)
+    backend_select = modal.query_one("#f-deployment-backend", Select)
+    flags_area = modal.query_one("#f-deployment-cmake-flags", TextArea)
+    preview = modal.query_one("#deployment-build-command", Static)
+    error = modal.query_one("#deployment-error", Static)
+    dismissed: list = []
+    modal.dismiss = lambda result=None: dismissed.append(result)  # type: ignore[method-assign]
+
+    flags_area.text = "-DGGML_CUDA=ON"
+    await pilot.pause(0.1)
+    assert backend_select.value is Select.NULL
+    assert str(preview.render()) == "(select a backend)", (
+        f"[{context}] build preview with no backend chosen: {str(preview.render())!r}"
+    )
+
+    gpu_select.value = app.host_profile["gpus"][0]["id"]
+    await pilot.pause(0.1)
+    flags_area.text = "-DGGML_CUDA=ON"
+    await pilot.pause(0.1)
+    modal._select()
+    assert not dismissed, f"[{context}] Add with no backend dismissed with {dismissed!r}"
+    assert "choose a GPU and a backend" in str(error.render()), (
+        f"[{context}] Add with no backend: error {str(error.render())!r}"
+    )
+
+    gpu_select.clear()
+    backend_select.value = backend_select._options[-1][1]
+    await pilot.pause(0.1)
+    modal._set_error("")
+    modal._select()
+    assert not dismissed, f"[{context}] Add with no GPU dismissed with {dismissed!r}"
+    assert "choose a GPU and a backend" in str(error.render()), (
+        f"[{context}] Add with no GPU: error {str(error.render())!r}"
+    )
+
+    del modal.dismiss
     app.pop_screen()
     await pilot.pause(0.1)
+
+
+async def _assert_prebuilt_release_clear(app: CockpitApp, pilot, context: str) -> None:
+    """Clearing the release Select must not load a release named "Select.NULL". The handler
+    tested `is not Select.BLANK and tag`, both true for Select.NULL, so a cleared Select fed
+    _load_release_tag the NoSelection sentinel and rebuilt the fallback asset table with
+    "llama-Select.NULL-bin-..." download URLs."""
+    from cockpit.screens.builds import DownloadPrebuiltModal
+    from textual.widgets import Select
+
+    real_check = update_check.check_releases
+    update_check.check_releases = lambda repo: {
+        "ok": True,
+        "releases": [{"tag_name": "b1000", "published_at": "2026-01-01T00:00:00Z", "assets": []}],
+    }
+    try:
+        modal = DownloadPrebuiltModal(app.host_profile, app.manifest)
+        app.push_screen(modal)
+        await pilot.pause(0.3)
+        release_select = modal.query_one("#f-prebuilt-release", Select)
+        assert release_select.value == "b1000", f"[{context}] release not populated: {release_select.value!r}"
+        assert modal._current_tag == "b1000", f"[{context}] release not loaded: {modal._current_tag!r}"
+        release_select.clear()
+        await pilot.pause(0.1)
+        assert modal._current_tag == "b1000", (
+            f"[{context}] clearing the release Select loaded tag {modal._current_tag!r}"
+        )
+        app.pop_screen()
+        await pilot.pause(0.1)
+    finally:
+        update_check.check_releases = real_check
 
 
 def _print_backends_sections_height(app: CockpitApp, context: str) -> None:
@@ -863,6 +949,7 @@ async def verify_geometry_and_export_screenshots() -> None:
                     await _assert_backend_detail_modal(app, pilot, f"{name} @ {w}x{h}")
                     await _assert_builds_list_modal(app, pilot, f"{name} @ {w}x{h}")
                     await _assert_add_deployment_modal(app, pilot, f"{name} @ {w}x{h}")
+                    await _assert_prebuilt_release_clear(app, pilot, f"{name} @ {w}x{h}")
                     await _assert_update_buttons_absent_when_no_update(app, pilot, f"{name} @ {w}x{h}")
                     if expected_class == "-wide":
                         # Only once — this drives real tab navigation and doesn't need to run

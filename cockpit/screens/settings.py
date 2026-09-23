@@ -513,7 +513,7 @@ class SettingsScreen(CockpitScreenBase):
             return None, "GPU ID is required"
         if gpu_id in existing_ids:
             return None, f"GPU ID '{gpu_id}' already exists"
-        if vendor is Select.BLANK or not vendor:
+        if vendor is Select.NULL or not vendor:
             return None, "Vendor is required"
         backends = [b.strip() for b in backends_raw.split(",") if b.strip()]
         known = sorted(self.manifest.get("backends", {}).keys())
@@ -789,7 +789,10 @@ class SettingsScreen(CockpitScreenBase):
         # form would clobber a deliberately-overridden MAC with the NIC's real one.
         with self.prevent(Select.Changed):
             select.set_options([(n, n) for n in names])
-            select.value = configured if configured in names else Select.BLANK
+            if configured in names:
+                select.value = configured
+            else:
+                select.clear()
             self.query_one("#f-wol-mac", Input).value = wol_cfg.get("mac", "")
 
     def on_select_changed(self, event: Select.Changed) -> None:
@@ -1078,7 +1081,7 @@ class SettingsScreen(CockpitScreenBase):
 
     def _selected_wol_interface(self) -> str:
         value = self.query_one("#f-wol-interface", Select).value
-        return "" if value is Select.BLANK else str(value).strip()
+        return "" if value is Select.NULL else str(value).strip()
 
     @work
     async def _confirm_and_save_wol(self) -> None:

@@ -879,7 +879,7 @@ class AddDeploymentModal(ModalScreen[tuple[str, str, list[str], str] | None]):
 
     def _update_build_command(self) -> None:
         backend = self.query_one("#f-deployment-backend", Select).value
-        if backend is Select.BLANK or not backend:
+        if backend is Select.NULL or not backend:
             self.query_one("#deployment-build-command", Static).update("(select a backend)")
             return
         flags = [
@@ -900,7 +900,7 @@ class AddDeploymentModal(ModalScreen[tuple[str, str, list[str], str] | None]):
     def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id == "f-deployment-backend":
             backend = event.value
-            if backend is not Select.BLANK and backend:
+            if backend is not Select.NULL and backend:
                 recipe = self.manifest.get("backends", {}).get(str(backend), {})
                 flags = recipe.get("cmake_flags", [])
                 self.query_one("#f-deployment-cmake-flags", TextArea).text = "\n".join(flags)
@@ -924,7 +924,7 @@ class AddDeploymentModal(ModalScreen[tuple[str, str, list[str], str] | None]):
     def _select(self, action: str = "add") -> None:
         gpu_id = self.query_one("#f-deployment-gpu", Select).value
         backend = self.query_one("#f-deployment-backend", Select).value
-        if gpu_id is Select.BLANK or backend is Select.BLANK:
+        if gpu_id is Select.NULL or backend is Select.NULL:
             self._set_error("choose a GPU and a backend")
             return
         gpu = next((g for g in self.host_profile.get("gpus", []) if g["id"] == gpu_id), None)
@@ -975,16 +975,16 @@ class DownloadPrebuiltModal(ModalScreen[dict[str, Any] | None]):
     }
     #prebuilt-release-row .form-label {
         width: 10;
-        margin-top: 1;
+        margin-top: $space-normal;
     }
     #f-prebuilt-release {
         width: 32;
-        margin-right: 1;
+        margin-right: $space-normal;
     }
     #f-prebuilt-tag {
         width: 1fr;
         min-width: 20;
-        margin-right: 1;
+        margin-right: $space-normal;
     }
     #btn-prebuilt-load-tag {
         min-width: 10;
@@ -1086,7 +1086,7 @@ class DownloadPrebuiltModal(ModalScreen[dict[str, Any] | None]):
     def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id == "f-prebuilt-release":
             tag = event.value
-            if tag is not Select.BLANK and tag:
+            if tag is not Select.NULL and tag:
                 self._load_release_tag(str(tag))
 
     def _load_release_tag(self, tag: str) -> None:
