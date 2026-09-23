@@ -1176,6 +1176,17 @@ class DeployScreen(CockpitScreenBase):
             # serves, so without it this whole tab describes something that cannot run.
             yield Static("", id="swap-missing", classes="error-text")
 
+            # Both tables below are llama-swap routes — every model here is started, health
+            # checked, and (for Swappable) evicted BY llama-swap. There is no direct,
+            # non-llama-swap launch path in this repo yet (AGENTS.md: "llama-swap reverse
+            # proxy managed via systemd" is the one inference supervisor); the split is only
+            # "pinned in VRAM forever" vs "loaded/unloaded on demand", both under llama-swap.
+            yield Static(
+                "Both tables run under llama-swap — pinned vs. evictable, not "
+                "llama-swap-managed vs. direct. Direct (non-llama-swap) launch isn't built.",
+                classes="subtitle",
+            )
+
             yield Static("Resident (never unloaded from vRAM)", classes="section-title")
             yield SingleClickDataTable(id="models-resident", classes="data-table")
             with Horizontal(classes="action-row-secondary"):

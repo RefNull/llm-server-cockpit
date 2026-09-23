@@ -568,14 +568,14 @@ async def _assert_import_models_modal(app: CockpitApp, pilot, context: str) -> N
     await pilot.pause(0.2)
 
     table = modal.query_one("#import-table", CockpitDataTable)
-    assert table.row_count == 6, f"[{context}] expected 6 import rows from the fixture, got {table.row_count}"
+    assert table.row_count == 7, f"[{context}] expected 7 import rows from the fixture, got {table.row_count}"
 
-    expected_ids = {"chat-main", "chat-vision", "embed-bge", "rerank-qwen", "asr-python", "tts-python"}
+    expected_ids = {"chat-main", "chat-vision", "embed-bge", "rerank-qwen", "asr-python", "tts-python", "tts-docker"}
     assert set(modal._import_candidates) == expected_ids, (
         f"[{context}] unexpected candidate id set: {sorted(modal._import_candidates)}"
     )
     status = {mid: r["status"] for mid, r in modal._import_candidates.items()}
-    for model_id in ("chat-main", "chat-vision", "embed-bge", "rerank-qwen", "asr-python", "tts-python"):
+    for model_id in expected_ids:
         assert status[model_id] == "ok", (
             f"[{context}] {model_id}: expected status ok against hosts/example.yaml's real "
             f"backends, got {status[model_id]!r}"

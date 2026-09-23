@@ -51,8 +51,9 @@ def check_classification_and_status() -> list[dict]:
         "rerank-qwen": ("qwen3-reranker-4b-Q4_K_M.gguf", "cuda"),
     }
     expected_python = {"asr-python", "tts-python"}
+    expected_unmanaged = {"tts-docker"}
 
-    assert set(by_id) == set(expected_llama_cpp) | expected_python, (
+    assert set(by_id) == set(expected_llama_cpp) | expected_python | expected_unmanaged, (
         f"unexpected set of imported ids: {sorted(by_id)}"
     )
 
@@ -102,11 +103,29 @@ def check_classification_and_status() -> list[dict]:
     assert by_id["embed-bge"]["model"].get("group") == "always-on", "embed-bge: top-level groups.always-on.members not applied"
     assert by_id["rerank-qwen"]["model"].get("group") == "always-on", "rerank-qwen: top-level groups.always-on.members not applied"
 
+    # tts-docker: argv[0] is `PORT=${PORT}`, not llama-server or python -> unmanaged fallback.
+    # Regression coverage for a real bug (caught against the operator's own config): the
+    # fallback used to shlex.split+shlex.join the command, which quoted `PORT=${PORT}` into
+    # `'PORT=${PORT}'` — literal quote characters that were never in the source, and that
+    # llama-swap's own shlex-based exec (no shell; process_command.go:505 execs argv[0]
+    # directly) would treat as PART of the token, not stripped protection.
+    docker_entry = by_id["tts-docker"]
+    assert docker_entry["model"]["engine"] == "unmanaged", (
+        f"tts-docker: expected engine unmanaged, got {docker_entry['model']['engine']!r}"
+    )
+    expected_cmd = "PORT=${PORT} docker compose -f /srv/services/tts-docker/docker-compose.yml up --build"
+    assert docker_entry["model"]["cmd"] == expected_cmd, (
+        f"tts-docker: cmd was re-quoted on import: {docker_entry['model']['cmd']!r} != {expected_cmd!r}"
+    )
+    assert "'" not in docker_entry["model"]["cmd"], (
+        f"tts-docker: cmd carries a quote character not present in the source: {docker_entry['model']['cmd']!r}"
+    )
+
     assert getattr(results, "health_check_timeout", None) == 120, (
         f"expected health_check_timeout 120 from fixture, got {getattr(results, 'health_check_timeout', None)}"
     )
 
-    print(f"  {len(by_id)} entries classified correctly (4 llama-cpp, 2 python), notes present for relocated paths and dropped healthCheckTimeout, top-level healthCheckTimeout preserved")
+    print(f"  {len(by_id)} entries classified correctly (4 llama-cpp, 2 python, 1 unmanaged), notes present for relocated paths and dropped healthCheckTimeout, top-level healthCheckTimeout preserved, unmanaged cmd not re-quoted")
     return results
 
 

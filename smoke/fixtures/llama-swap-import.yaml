@@ -80,6 +80,18 @@ models:
     healthCheckTimeout: 180
     checkEndpoint: /health
 
+  # Not llama-server or python: argv[0] is a bare VAR=value prefix (`PORT=${PORT}`), so it
+  # falls to the unmanaged fallback. This is the entry that caught a real regression: the
+  # fallback used to run this through shlex.split + shlex.join, which added literal quote
+  # characters (`'PORT=${PORT}'`) that were never in the source — see
+  # check_unmanaged_cmd_not_requoted below.
+  tts-docker:
+    cmd: |
+      PORT=${PORT} docker compose
+      -f /srv/services/tts-docker/docker-compose.yml
+      up --build
+    ttl: 3600
+
   # old-chat-superseded:
   #   cmd: |
   #     /srv/llm/builds/cuda/current/bin/llama-server

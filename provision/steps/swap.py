@@ -235,11 +235,19 @@ def _collect_group_members(groups: Any, group_of: dict[str, str]) -> None:
             group_of[member_id] = group_name
 
 
-def _sanitize_cmd(raw_cmd: str, notes: list[str]) -> list[str]:
+def _sanitize_cmd(raw_cmd: str, notes: list[str]) -> tuple[list[str], str]:
     """Mirror llama-swap v255's SanitizeCommand (internal/config/commands.go:11-45) exactly:
     drop lines whose stripped text starts with '#', turn a trailing '\\' into a space, then
     shlex.split (POSIX) the result. `cmd` is never run through a shell (§0e) — this must match
-    that mechanism, not approximate it."""
+    that mechanism, not approximate it.
+
+    Returns `(tokens, cleaned_text)` — tokens for classifying/rewriting a recognised command
+    (llama-server, python), cleaned_text (comments stripped, lines joined, NOT re-quoted) for
+    an unrecognised one. An unrecognised command must be reproduced close to verbatim: running
+    it through shlex.split then shlex.join re-quotes every token that shlex considers special
+    (e.g. a bare `VAR=value` prefix, which contains `$`), which is needless since nothing here
+    rewrites it — and it once produced literal `'` characters in the reconstructed cmd that
+    were never in the operator's source (a real regression, caught against their own config)."""
     lines = raw_cmd.splitlines()
     kept: list[str] = []
     dropped: list[str] = []
@@ -255,7 +263,8 @@ def _sanitize_cmd(raw_cmd: str, notes: list[str]) -> list[str]:
         if mmproj_lines:
             note += f" ({'; '.join(mmproj_lines)})"
         notes.append(note)
-    return shlex.split("\n".join(kept))
+    cleaned_text = " ".join(line.strip() for line in kept if line.strip())
+    return shlex.split("\n".join(kept)), cleaned_text
 
 
 def _classify_llama_cpp(
@@ -378,7 +387,7 @@ def parse_config_for_import(yaml_text: str, host_profile: dict[str, Any]) -> Imp
         notes: list[str] = []
         status = "ok"
         try:
-            argv = _sanitize_cmd(entry["cmd"], notes)
+            argv, cleaned_text = _sanitize_cmd(entry["cmd"], notes)
         except ValueError as e:
             # One malformed entry (unbalanced quote) must not abort the whole import.
             argv = None
@@ -402,13 +411,13 @@ def parse_config_for_import(yaml_text: str, host_profile: dict[str, Any]) -> Imp
                 if len(argv) < 2:
                     status = "review"
                     notes.append("python interpreter with no script argument")
-                    model = {"engine": "unmanaged", "cmd": shlex.join(argv)}
+                    model = {"engine": "unmanaged", "cmd": cleaned_text}
                 else:
                     model = {"engine": "python", "python": argv[0], "script": argv[1]}
                     if argv[2:]:
                         model["args"] = argv[2:]
             else:
-                model = {"engine": "unmanaged", "cmd": shlex.join(argv)}
+                model = {"engine": "unmanaged", "cmd": cleaned_text}
 
         model = {"id": model_id, **model}
 
