@@ -423,10 +423,18 @@ def _generate_config(host_profile: dict[str, Any], models: dict[str, Any]) -> st
         if group:
             groups.setdefault(group, []).append(model["id"])
 
-    # Only the one precedent this repo has (an "always-on", never-evicted pool): swap: false
-    # with a member list. No general group-swap-policy support beyond that single shape.
+    # One group shape, and it means "resident" (cockpit DeployScreen._is_resident): upstream's
+    # "forever" group. All three flags are load-bearing — v255 defaults a group to
+    # swap: true, exclusive: true, persistent: false (internal/config/config.go:93-100), and
+    # this used to emit only swap: false. That left exclusive: true, so loading a group member
+    # evicted every ungrouped model, and persistent: false, so loading any ungrouped model
+    # (default group, exclusive: true) evicted the whole "always-on" pool
+    # (internal/router/group.go:84-96).
     if groups:
-        config["groups"] = {name: {"swap": False, "members": members} for name, members in groups.items()}
+        config["groups"] = {
+            name: {"swap": False, "exclusive": False, "persistent": True, "members": members}
+            for name, members in groups.items()
+        }
 
     return yaml.safe_dump(config, sort_keys=False)
 

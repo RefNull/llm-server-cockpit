@@ -485,8 +485,8 @@ async def _assert_edit_model_modal(app: CockpitApp, pilot, context: str) -> None
 
 async def _assert_import_models_modal(app: CockpitApp, pilot, context: str) -> None:
     """plans/09-swap-import-and-python-engine.md Phase 4: pushes ImportModelsModal and feeds it
-    the fixture via _load_candidates — the same code path _paste_config uses once it has text,
-    without a real ConfigPasteModal round-trip. Asserts the row count, the status the fixture
+    the fixture via its `candidates` argument — what DeployScreen._on_import_toggle passes on
+    once ConfigPasteModal has parsed a paste — without a real ConfigPasteModal round-trip. Asserts the row count, the status the fixture
     actually resolves to against hosts/example.yaml (this host has real vulkan+cuda backends,
     so every llama-cpp row comes back "ok" here — the operator's real "review" bug needs a
     host with an unconfigured backend, which is what the scratchpad pilot reproduces, not this
@@ -503,13 +503,9 @@ async def _assert_import_models_modal(app: CockpitApp, pilot, context: str) -> N
         models=app.models,
         repo_root=app.repo_root,
         app_ref=app,
+        candidates=swap.parse_config_for_import(fixture_text, app.host_profile),
     )
     app.push_screen(modal)
-    await pilot.pause(0.2)
-
-    proposed = swap.parse_config_for_import(fixture_text, app.host_profile)
-    modal._load_candidates(proposed)
-    modal._refresh_import_table()
     await pilot.pause(0.2)
 
     table = modal.query_one("#import-table", CockpitDataTable)
@@ -534,6 +530,17 @@ async def _assert_import_models_modal(app: CockpitApp, pilot, context: str) -> N
     assert app.screen.region.contains_region(dialog.region), (
         f"[{context}] ImportModelsModal dialog {dialog.region} is not fully inside the screen {app.screen.region}"
     )
+
+    # Toggling a tick must leave the cursor on the clicked row. It used to rebuild the table
+    # (clear() + add_row), which snapped the highlight back to row 0 on every click.
+    from textual.widgets import DataTable
+
+    table.move_cursor(row=3)
+    row_key, _ = table.coordinate_to_cell_key(table.cursor_coordinate)
+    modal.on_data_table_row_selected(DataTable.RowSelected(table, 3, row_key))
+    await pilot.pause(0.1)
+    assert table.cursor_row == 3, f"[{context}] tick toggle moved the cursor to row {table.cursor_row}, expected 3"
+    assert row_key.value not in modal._import_selected, f"[{context}] row 3 did not untick"
 
     app.pop_screen()
     await pilot.pause(0.1)

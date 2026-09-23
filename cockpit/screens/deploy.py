@@ -200,8 +200,17 @@ class ExamplesModal(ModalScreen[str | None]):
         self.dismiss(None)
 
 
-class ConfigPasteModal(ModalScreen[str | None]):
-    """Paste-a-llama-swap-config.yaml modal for importing models."""
+class ConfigPasteModal(ModalScreen[list | None]):
+    """First step of "Import from llama-swap": paste another instance's config.yaml.
+
+    Parses in place and stays open on failure, so a bad paste is fixed where it was made
+    instead of surfacing as an empty review table. Dismisses with parse_config_for_import's
+    results, or None on cancel.
+    """
+
+    def __init__(self, host_profile: dict) -> None:
+        super().__init__()
+        self.host_profile = host_profile
 
     BINDINGS = [("escape", "cancel", "Cancel")]
 
@@ -230,13 +239,27 @@ class ConfigPasteModal(ModalScreen[str | None]):
         with Vertical(id="paste-dialog"):
             yield Static("Paste a llama-swap config.yaml below", id="paste-title")
             yield TextArea(id="paste-text")
+            yield Static("", id="paste-error", classes="error-text")
             with Horizontal(classes="action-row-primary"):
                 yield Button("Parse", id="btn-parse", variant="primary", classes="thin-button")
                 yield Button("Cancel", id="btn-paste-cancel", classes="thin-button")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "btn-parse":
-            self.dismiss(self.query_one("#paste-text", TextArea).text)
+            error = self.query_one("#paste-error", Static)
+            text = self.query_one("#paste-text", TextArea).text
+            if not text.strip():
+                error.update("paste a config.yaml first")
+                return
+            try:
+                proposed = swap.parse_config_for_import(text, self.host_profile)
+            except ValueError as e:
+                error.update(f"parse failed: {e}")
+                return
+            if not proposed:
+                error.update("no models found in pasted config.yaml")
+                return
+            self.dismiss(proposed)
         elif event.button.id == "btn-paste-cancel":
             self.dismiss(None)
 
@@ -521,7 +544,7 @@ class EditModelModal(ModalScreen[dict | None]):
                         classes="form-hint",
                     )
 
-                yield Label("ttl (seconds; 0 = never unload, blank = llama-swap default)")
+                yield Label("ttl (idle seconds before unload; 0 = never, blank = llama-swap default)")
                 # Blank for a new binding, not "0": 0 means never unload, so defaulting the
                 # box to it would make every model created here resident. Only an explicit ttl
                 # already in models.yaml is prefilled.
@@ -529,8 +552,14 @@ class EditModelModal(ModalScreen[dict | None]):
                     id="f-ttl",
                     value=("0" if m is None and self.resident_seed else "" if m is None or "ttl" not in m else str(m["ttl"])),
                 )
-                yield Label("group (optional)")
-                yield Input(id="f-group", placeholder="", value=m.get("group", "") if m else "")
+                # Group membership is what makes a model resident (DeployScreen._is_resident):
+                # every group is emitted persistent, so "Add Resident Model" seeds always-on.
+                yield Label("group (any group = resident, never evicted; blank = swappable)")
+                yield Input(
+                    id="f-group",
+                    placeholder="",
+                    value=("always-on" if m is None and self.resident_seed else m.get("group", "") if m else ""),
+                )
 
                 yield Label("check endpoint (optional; path only, e.g. /health)")
                 yield Input(
@@ -885,6 +914,7 @@ class ImportModelsModal(ModalScreen[bool]):
         models: dict,
         repo_root: Path,
         app_ref: Any,
+        candidates: list[dict[str, Any]] | None = None,
     ) -> None:
         super().__init__()
         self.host_profile = host_profile
@@ -895,6 +925,7 @@ class ImportModelsModal(ModalScreen[bool]):
         # model id -> the parser's full {"model", "notes", "status"} result.
         self._import_candidates: dict[str, dict[str, Any]] = {}
         self._import_selected: set[str] = set()
+        self._load_candidates(candidates or [])
 
     def compose(self) -> ComposeResult:
         with Vertical(id="import-dialog"):
@@ -908,12 +939,11 @@ class ImportModelsModal(ModalScreen[bool]):
                 yield Static("", id="import-error", classes="error-text")
             with Horizontal(classes="action-row-primary"):
                 yield Button("Import selected", id="btn-import-selected", variant="primary", classes="thin-button")
-                yield Button("Paste config.yaml", id="btn-import-paste", classes="thin-button")
                 yield Button("Cancel", id="btn-import-close", classes="thin-button")
 
     def on_mount(self) -> None:
         table = self.query_one("#import-table", SingleClickDataTable)
-        table.add_column("", width=3)
+        table.add_column("", width=3, key="tick")
         table.add_column("ID", width=24)
         table.add_column("Engine", width=12)
         table.add_column("Status", width=8)
@@ -923,21 +953,13 @@ class ImportModelsModal(ModalScreen[bool]):
         # candidate the operator wants to tweak before import (e.g. add check_endpoint) doesn't
         # have to be "broken" first.
         table.add_action_column(TableAction("edit", "Edit"))
-
-        # Discover from state_dir config.yaml if present
-        state_dir = self.host_profile.get("paths", {}).get("state_dir")
-        if state_dir:
-            config_path = Path(state_dir) / "llama-swap" / "config.yaml"
-            if config_path.exists():
-                try:
-                    content = config_path.read_text(encoding="utf-8")
-                    self._load_candidates(swap.parse_config_for_import(content, self.host_profile))
-                except Exception:
-                    pass
+        # No discovery of this host's own state_dir config.yaml: that file is generated from
+        # models.yaml, so re-importing it can only ever propose what is already here. Candidates
+        # always come from ConfigPasteModal (DeployScreen._on_import_toggle).
         self._refresh_import_table()
 
     def _load_candidates(self, proposed: list[dict[str, Any]]) -> None:
-        """Shared by on_mount's discovery and _paste_config — also the entry point
+        """Called from __init__ with ConfigPasteModal's results — also the entry point
         smoke/verify_screens.py uses to feed the fixture without a real ConfigPasteModal."""
         self._import_candidates = {r["model"]["id"]: r for r in proposed}
         self._import_selected = {mid for mid, r in self._import_candidates.items() if r["status"] == "ok"}
@@ -972,7 +994,9 @@ class ImportModelsModal(ModalScreen[bool]):
             self._import_selected.discard(model_id)
         else:
             self._import_selected.add(model_id)
-        self._refresh_import_table()
+        # update_cell, not _refresh_import_table: a clear() + re-add resets the cursor to row 0,
+        # so the highlight never followed the row that was clicked.
+        event.data_table.update_cell(model_id, "tick", selection_marker(model_id in self._import_selected))
 
     @work
     async def _on_table_action_invoked(self, event: TableActionInvoked) -> None:
@@ -1021,26 +1045,8 @@ class ImportModelsModal(ModalScreen[bool]):
         bid = event.button.id
         if bid == "btn-import-close":
             self.dismiss(False)
-        elif bid == "btn-import-paste":
-            await self._paste_config()
         elif bid == "btn-import-selected":
             await self._confirm_and_import()
-
-    async def _paste_config(self) -> None:
-        text = await self.app.push_screen_wait(ConfigPasteModal())
-        if text is None or not text.strip():
-            return
-        try:
-            proposed = swap.parse_config_for_import(text, self.host_profile)
-        except ValueError as e:
-            self.query_one("#import-error", Static).update(f"parse failed: {e}")
-            return
-        if not proposed:
-            self.query_one("#import-error", Static).update("no models found in pasted config.yaml")
-            return
-        self.query_one("#import-error", Static).update("")
-        self._load_candidates(proposed)
-        self._refresh_import_table()
 
     async def _confirm_and_import(self) -> None:
         error_widget = self.query_one("#import-error", Static)
@@ -1143,7 +1149,7 @@ class DeployScreen(CockpitScreenBase):
             with Horizontal(classes="action-row-secondary"):
                 yield Button("Add Resident Model", id="btn-add-resident", classes="thin-button")
 
-            yield Static("Swappable (evicted when idle)", classes="section-title")
+            yield Static("Swappable (evicted when another model loads, or after ttl idle)", classes="section-title")
             yield SingleClickDataTable(id="models-swappable", classes="data-table")
             with Horizontal(classes="action-row-secondary"):
                 yield Button("Add Swappable Model", id="btn-add-swappable", classes="thin-button")
@@ -1200,16 +1206,18 @@ class DeployScreen(CockpitScreenBase):
     def _is_resident(model: dict) -> bool:
         """True when this model, once requested, stays in VRAM.
 
-        Two ways that happens, both from upstream llama-swap's own documentation:
-        `ttl: 0` is "a ttl of 0 will mean never unload", and group membership is resident here
-        because this repo only ever emits `swap: false` for a group
-        (provision/steps/swap.py::_generate_config), which upstream defines as "all members can
-        run together, no swapping".
+        Group membership only. swap.py::_generate_config emits every group as
+        `swap: false, exclusive: false, persistent: true` — upstream's "forever" group, which
+        no other load can evict. Ungrouped models land in llama-swap's default group
+        (swap: true, exclusive: true; v255 internal/config/config.go:295-305), so loading any
+        one of them evicts the previous one.
 
-        An omitted ttl is NOT resident: upstream's default is "-1 (use global default)", and
-        swap.py now leaves it out rather than writing 0.
+        `ttl: 0` is NOT residency, which is what this used to test: ttl only governs *idle*
+        unloading ("0 will mean never unload"). A ttl-0 model outside a group still gets
+        evicted by the next swap (v255 internal/router/group.go:84-96) — it belongs in the
+        Swappable table with "0 (no idle unload)" in its TTL column.
         """
-        return model.get("ttl") == 0 or bool(model.get("group"))
+        return bool(model.get("group"))
 
     def action_open_swap_repo(self) -> None:
         self.app.open_url(self.manifest.get("llama_swap", {}).get("repo", "https://github.com/mostlygeek/llama-swap"))
@@ -1261,7 +1269,7 @@ class DeployScreen(CockpitScreenBase):
                     (status_cell,)
                     if is_resident
                     else (
-                        Text("0 (pinned)" if m.get("ttl") == 0 else str(m.get("ttl", "default"))),
+                        Text("never" if m.get("ttl") == 0 else str(m.get("ttl", "default"))),
                         status_cell,
                     )
                 ),
@@ -1338,6 +1346,10 @@ class DeployScreen(CockpitScreenBase):
 
     @work
     async def _on_import_toggle(self) -> None:
+        # Paste first: the review table has nothing to show until there is a config to parse.
+        candidates = await self.app.push_screen_wait(ConfigPasteModal(self.host_profile))
+        if not candidates:
+            return
         imported = await self.app.push_screen_wait(
             ImportModelsModal(
                 host_profile=self.host_profile,
@@ -1345,6 +1357,7 @@ class DeployScreen(CockpitScreenBase):
                 models=self.models,
                 repo_root=self.repo_root,
                 app_ref=self.app_ref,
+                candidates=candidates,
             )
         )
         if imported:
