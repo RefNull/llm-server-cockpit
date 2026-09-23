@@ -212,19 +212,19 @@ def check_self_reimport(results: list[dict]) -> None:
 def check_residency_and_ttl_behavior() -> None:
     from cockpit.screens.deploy import DeployScreen
 
-    # Truth table for DeployScreen._is_resident:
-    # 1. Group membership + ttl 0 -> True (Resident: never evicted, never idle-unloaded)
-    assert DeployScreen._is_resident({"id": "m1", "group": "always-on", "ttl": 0}) is True
-    # 2. Group membership + unspecified ttl -> True (Resident: defaults to 0 in llama-swap)
-    assert DeployScreen._is_resident({"id": "m2", "group": "always-on"}) is True
+    # Truth table for DeployScreen._is_pinned:
+    # 1. Group membership + ttl 0 -> True (Pinned: never evicted, never idle-unloaded)
+    assert DeployScreen._is_pinned({"id": "m1", "group": "always-on", "ttl": 0}) is True
+    # 2. Group membership + unspecified ttl -> True (Pinned: defaults to 0 in llama-swap)
+    assert DeployScreen._is_pinned({"id": "m2", "group": "always-on"}) is True
     # 3. Group membership + positive ttl -> False (Swappable: idle-unloads after ttl seconds!)
-    assert DeployScreen._is_resident({"id": "m3", "group": "always-on", "ttl": 600}) is False
+    assert DeployScreen._is_pinned({"id": "m3", "group": "always-on", "ttl": 600}) is False
     # 4. No group + ttl 0 -> False (Swappable: gets evicted whenever another model is requested)
-    assert DeployScreen._is_resident({"id": "m4", "ttl": 0}) is False
+    assert DeployScreen._is_pinned({"id": "m4", "ttl": 0}) is False
     # 5. No group + positive ttl -> False (Swappable)
-    assert DeployScreen._is_resident({"id": "m5", "ttl": 600}) is False
+    assert DeployScreen._is_pinned({"id": "m5", "ttl": 600}) is False
     # 6. No group + unspecified ttl -> False (Swappable)
-    assert DeployScreen._is_resident({"id": "m6"}) is False
+    assert DeployScreen._is_pinned({"id": "m6"}) is False
 
     # Check that grouped model with ttl > 0 gets an informative note on import
     manifest = schema.load_manifest(_REPO_ROOT / "manifest.example.yaml")

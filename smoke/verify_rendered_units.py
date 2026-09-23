@@ -311,14 +311,14 @@ def check_llama_swap_config() -> None:
             f"leaked into config.yaml: {cmd!r}"
         )
         assert "$$" not in cmd, f"model {model_id!r} cmd was systemd-escaped: {cmd!r}"
-    # A group is how the cockpit says "resident". llama-swap v255 defaults a group to
+    # A group is how the cockpit says "pinned". llama-swap v255 defaults a group to
     # exclusive: true, persistent: false (internal/config/config.go:93-100), which lets any
     # ungrouped model evict the pool — so every flag must be explicit.
-    assert parsed.get("groups"), "fixture has no grouped models — the resident-group assertion below is vacuous"
+    assert parsed.get("groups"), "fixture has no grouped models — the pinned-group assertion below is vacuous"
     for name, group in parsed["groups"].items():
         flags = {k: group.get(k) for k in ("swap", "exclusive", "persistent")}
         assert flags == {"swap": False, "exclusive": False, "persistent": True}, (
-            f"group {name!r} is not a resident group: {flags} — ungrouped loads would evict it"
+            f"group {name!r} is not a pinned group: {flags} — ungrouped loads would evict it"
         )
     print(f"  config.yaml parses, carries all {len(parsed['models'])} models, keeps ${{PORT}} intact, "
           f"and emits every group as persistent/non-exclusive")

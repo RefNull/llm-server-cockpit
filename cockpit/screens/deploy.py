@@ -364,15 +364,15 @@ class EditModelModal(ModalScreen[dict | None]):
         editing_id: str | None,
         repo_root: Path,
         app_ref: Any,
-        resident: bool = False,
+        pinned: bool = False,
         staged: dict | None = None,
         staged_notes: list[str] | None = None,
     ) -> None:
         super().__init__()
         # Seeds the ttl field for a NEW binding: 0 is "never unload" (upstream llama-swap), so
-        # "Add Resident Model" prefills 0 and "Add Swappable" leaves it blank, which means
+        # "Add Pinned Model" prefills 0 and "Add Swappable" leaves it blank, which means
         # llama-swap's own default. Editing never re-seeds — the stored value wins.
-        self.resident_seed = resident
+        self.pinned_seed = pinned
         self.host_profile = host_profile
         self.manifest = manifest
         self.models = models
@@ -546,19 +546,19 @@ class EditModelModal(ModalScreen[dict | None]):
 
                 yield Label("ttl (idle seconds before unload; 0 = never, blank = llama-swap default)")
                 # Blank for a new binding, not "0": 0 means never unload, so defaulting the
-                # box to it would make every model created here resident. Only an explicit ttl
+                # box to it would make every model created here pinned. Only an explicit ttl
                 # already in models.yaml is prefilled.
                 yield Input(
                     id="f-ttl",
-                    value=("0" if m is None and self.resident_seed else "" if m is None or "ttl" not in m else str(m["ttl"])),
+                    value=("0" if m is None and self.pinned_seed else "" if m is None or "ttl" not in m else str(m["ttl"])),
                 )
-                # Group membership pairs with ttl 0 for true residency (DeployScreen._is_resident):
-                # every group is emitted persistent, so "Add Resident Model" seeds always-on.
-                yield Label("group (resists eviction from other models; pair with ttl 0 for resident)")
+                # Group membership pairs with ttl 0 for a true pin (DeployScreen._is_pinned):
+                # every group is emitted persistent, so "Add Pinned Model" seeds always-on.
+                yield Label("group (resists eviction from other models; pair with ttl 0 to pin)")
                 yield Input(
                     id="f-group",
                     placeholder="",
-                    value=("always-on" if m is None and self.resident_seed else m.get("group", "") if m else ""),
+                    value=("always-on" if m is None and self.pinned_seed else m.get("group", "") if m else ""),
                 )
 
                 yield Label("check endpoint (optional; path only, e.g. /health)")
@@ -1177,20 +1177,22 @@ class DeployScreen(CockpitScreenBase):
             yield Static("", id="swap-missing", classes="error-text")
 
             # Both tables below are llama-swap routes — every model here is started, health
-            # checked, and (for Swappable) evicted BY llama-swap. There is no direct,
-            # non-llama-swap launch path in this repo yet (AGENTS.md: "llama-swap reverse
-            # proxy managed via systemd" is the one inference supervisor); the split is only
-            # "pinned in VRAM forever" vs "loaded/unloaded on demand", both under llama-swap.
+            # checked, and (for Swappable) evicted BY llama-swap. "Pinned" replaces what this
+            # screen used to call "Resident": that word is reserved for a not-yet-built
+            # direct-launch table (a model run by the cockpit's own systemd unit, no
+            # llama-swap in front — see plans/10-direct-launch-inventory.md), so it no longer
+            # doubles as "pinned within llama-swap" here.
             yield Static(
-                "Both tables run under llama-swap — pinned vs. evictable, not "
-                "llama-swap-managed vs. direct. Direct (non-llama-swap) launch isn't built.",
+                "Both tables run under llama-swap — pinned (never unloaded) vs. swappable "
+                "(evicted on demand or idle). A direct, non-llama-swap launch path isn't "
+                "built yet.",
                 classes="subtitle",
             )
 
-            yield Static("Resident (never unloaded from vRAM)", classes="section-title")
-            yield SingleClickDataTable(id="models-resident", classes="data-table")
+            yield Static("Pinned (llama-swap, never unloaded)", classes="section-title")
+            yield SingleClickDataTable(id="models-pinned", classes="data-table")
             with Horizontal(classes="action-row-secondary"):
-                yield Button("Add Resident Model", id="btn-add-resident", classes="thin-button")
+                yield Button("Add Pinned Model", id="btn-add-pinned", classes="thin-button")
 
             yield Static("Swappable (evicted when another model loads, or after ttl idle)", classes="section-title")
             yield SingleClickDataTable(id="models-swappable", classes="data-table")
@@ -1205,19 +1207,19 @@ class DeployScreen(CockpitScreenBase):
             yield Static("", id="status-message", classes="status-text")
 
     def on_mount(self) -> None:
-        # The two tables carry different columns now. Resident drops TTL — it is 0 or group
+        # The two tables carry different columns now. Pinned drops TTL — it is 0 or group
         # membership by definition — to pay for the Start/Stop toggle; Swappable keeps TTL
         # because there the number is the whole point. Budgets: 96 + 2*8 = 112 and
         # 97 + 2*8 = 113, both inside 115 (DESIGN.md §4).
-        resident = self.query_one("#models-resident", SingleClickDataTable)
-        resident.cursor_type = "row"
-        resident.add_column("ID", width=22)
-        resident.add_column("Engine", width=10)
-        resident.add_column("GPU", width=9)
-        resident.add_column("Backend", width=9)
-        resident.add_column("Group", width=10)
-        resident.add_column("Status", width=9)
-        resident.add_action_column(
+        pinned = self.query_one("#models-pinned", SingleClickDataTable)
+        pinned.cursor_type = "row"
+        pinned.add_column("ID", width=22)
+        pinned.add_column("Engine", width=10)
+        pinned.add_column("GPU", width=9)
+        pinned.add_column("Backend", width=9)
+        pinned.add_column("Group", width=10)
+        pinned.add_column("Status", width=9)
+        pinned.add_action_column(
             TableAction(
                 "run",
                 lambda mid: "Stop" if self._running_models.get(mid) else "Start",
@@ -1225,8 +1227,8 @@ class DeployScreen(CockpitScreenBase):
                 confirm="{action} {row}?",
             )
         )
-        resident.add_action_column(TableAction("edit", "Edit"))
-        resident.add_action_column(
+        pinned.add_action_column(TableAction("edit", "Edit"))
+        pinned.add_action_column(
             TableAction("delete", "Delete", destructive=True, confirm="Delete model {row} from models.yaml?")
         )
 
@@ -1246,7 +1248,7 @@ class DeployScreen(CockpitScreenBase):
         self._populate_table()
 
     @staticmethod
-    def _is_resident(model: dict) -> bool:
+    def _is_pinned(model: dict) -> bool:
         """True when this model, once loaded, stays in VRAM permanently.
 
         Requires BOTH:
@@ -1287,13 +1289,13 @@ class DeployScreen(CockpitScreenBase):
 
     def _populate_table(self) -> None:
         self._refresh_swap_notice()
-        resident = self.query_one("#models-resident", SingleClickDataTable)
+        pinned = self.query_one("#models-pinned", SingleClickDataTable)
         swappable = self.query_one("#models-swappable", SingleClickDataTable)
-        resident.clear()
+        pinned.clear()
         swappable.clear()
         for m in self.models.get("models", []):
-            is_resident = self._is_resident(m)
-            table = resident if is_resident else swappable
+            is_pinned = self._is_pinned(m)
+            table = pinned if is_pinned else swappable
             if m["engine"] == "llama-cpp":
                 gpu = m.get("bind", {}).get("gpu", "")
                 backend = m.get("bind", {}).get("backend", "")
@@ -1312,7 +1314,7 @@ class DeployScreen(CockpitScreenBase):
                 Text(m.get("group", "")),
                 *(
                     (status_cell,)
-                    if is_resident
+                    if is_pinned
                     else (
                         Text("never" if m.get("ttl") == 0 else str(m.get("ttl", "default"))),
                         status_cell,
@@ -1337,7 +1339,7 @@ class DeployScreen(CockpitScreenBase):
     # -- Actions ---------------------------------------------------------------
 
     @work
-    async def _on_add_model(self, resident: bool = False) -> None:
+    async def _on_add_model(self, pinned: bool = False) -> None:
         saved = await self.app.push_screen_wait(
             EditModelModal(
                 host_profile=self.host_profile,
@@ -1346,7 +1348,7 @@ class DeployScreen(CockpitScreenBase):
                 editing_id=None,
                 repo_root=self.repo_root,
                 app_ref=self.app_ref,
-                resident=resident,
+                pinned=pinned,
             )
         )
         if saved:
@@ -1498,10 +1500,10 @@ class DeployScreen(CockpitScreenBase):
         bid = event.button.id
         if bid == "btn-apply":
             self._confirm_and_apply()
-        elif bid in ("btn-add-resident", "btn-add-swappable"):
+        elif bid in ("btn-add-pinned", "btn-add-swappable"):
             # Which button was pressed seeds the new binding's residency, so "Add" under a
             # table puts the model in that table rather than wherever the ttl default lands.
-            self._on_add_model(resident=bid == "btn-add-resident")
+            self._on_add_model(pinned=bid == "btn-add-pinned")
         elif bid == "btn-import-toggle":
             self._on_import_toggle()
         elif bid == "btn-preview-yaml":

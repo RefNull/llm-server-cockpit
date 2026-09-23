@@ -466,7 +466,7 @@ def _generate_config(host_profile: dict[str, Any], models: dict[str, Any]) -> st
         if group:
             groups.setdefault(group, []).append(model["id"])
 
-    # One group shape, and it means "resident" (cockpit DeployScreen._is_resident): upstream's
+    # One group shape, and it means "pinned" (cockpit DeployScreen._is_pinned): upstream's
     # "forever" group. All three flags are load-bearing — v255 defaults a group to
     # swap: true, exclusive: true, persistent: false (internal/config/config.go:93-100), and
     # this used to emit only swap: false. That left exclusive: true, so loading a group member
