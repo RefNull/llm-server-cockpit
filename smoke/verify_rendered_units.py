@@ -115,6 +115,10 @@ def check_systemd_units() -> None:
         {"id": "demo", "path": "/opt/demo/serve.py", "args": ["--port", "9000"], "restart_policy": "always"},
         host_profile, _REPO_ROOT, runner,
     )
+    scripts_step.install_unit(
+        {"id": "demo-bash", "type": "bash", "path": "/opt/demo/run.sh", "args": ["--clean"], "restart_policy": "on-failure"},
+        host_profile, _REPO_ROOT, runner,
+    )
     wol_iface = host_profile["network"]["wol"]["interface"]
     wol_unit_name = f"wol-{wol_iface}.service"
     runner.write_file(pathlib.Path("/etc/systemd/system") / wol_unit_name, wol._unit_content(wol_iface, _REPO_ROOT))
@@ -126,6 +130,7 @@ def check_systemd_units() -> None:
         "llm-server-cockpit-update-check.service": ("Unit", "Service"),
         "llm-server-cockpit-update-check.timer": ("Unit", "Timer", "Install"),
         "cockpit-script-demo.service": ("Unit", "Service", "Install"),
+        "cockpit-script-demo-bash.service": ("Unit", "Service", "Install"),
         wol_unit_name: ("Unit", "Service", "Install"),
     }
     missing = set(expected) - set(runner.written)

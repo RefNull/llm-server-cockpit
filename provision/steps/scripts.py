@@ -23,20 +23,33 @@ _JOURNAL_TIMEOUT_S = 15
 matches provision/steps/docker.py::read_logs's own 15s for the same reason (a bigger read)."""
 
 
-def _unit_name(script_id: str) -> str:
+def unit_name(script_id: str) -> str:
+    """The systemd service unit name for `script_id`."""
     return f"cockpit-script-{script_id}.service"
 
 
+_unit_name = unit_name
+
+
 def _unit_path(script_id: str) -> Path:
-    return _UNIT_DIR / _unit_name(script_id)
+    return _UNIT_DIR / unit_name(script_id)
+
+
+def unit_installed(script_id: str) -> bool:
+    """Check if the systemd unit file exists on disk."""
+    return _unit_path(script_id).exists()
 
 
 def _build_exec_start(script: dict[str, Any]) -> str:
     """The single, already-quoted argument that follows `sh -c` in the unit's ExecStart= line
     (see systemd/python-script.service.tmpl) — one POSIX-shell quoting pass here rather than
     trusting systemd's own ExecStart= word-splitting to agree with it."""
-    python = script.get("python") or "python3"
-    argv = [python, script["path"], *script.get("args", [])]
+    stype = script.get("type", "python")
+    if stype == "bash":
+        binary = script.get("interpreter") or script.get("bash") or "/bin/bash"
+    else:
+        binary = script.get("python") or "python3"
+    argv = [binary, script["path"], *script.get("args", [])]
     return shlex.quote(shlex.join(argv))
 
 
@@ -59,7 +72,10 @@ def install_unit(script: dict[str, Any], host_profile: dict[str, Any], repo_root
     )
 
     unit_path = _unit_path(script["id"])
-    existing = unit_path.read_text() if unit_path.exists() else None
+    try:
+        existing = unit_path.read_text() if unit_path.exists() else None
+    except OSError:
+        existing = None
     changed = existing != content
     runner.write_file(unit_path, content)
     if changed:

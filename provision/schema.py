@@ -215,8 +215,15 @@ def validate_scripts_dict(data: dict, source: str = "scripts.yaml") -> dict:
         if sid in seen_ids:
             raise ValidationError(f"{source}: duplicate script id {sid!r}")
         seen_ids.add(sid)
+        stype = s.get("type", "python")
+        if stype not in ("python", "bash"):
+            raise ValidationError(f"{source}.scripts[{i}] ({sid}).type: invalid value {stype!r} (allowed: 'python', 'bash')")
         if "args" in s and not isinstance(s["args"], list):
             raise ValidationError(f"{source}.scripts[{i}] ({sid}).args: must be a list")
+        if "python" in s and not isinstance(s["python"], str):
+            raise ValidationError(f"{source}.scripts[{i}] ({sid}).python: must be a string")
+        if "interpreter" in s and not isinstance(s["interpreter"], str):
+            raise ValidationError(f"{source}.scripts[{i}] ({sid}).interpreter: must be a string")
         restart_policy = s.get("restart_policy", "on-failure")
         if restart_policy not in ("on-failure", "always", "no"):
             raise ValidationError(f"{source}.scripts[{i}] ({sid}).restart_policy: invalid value {restart_policy!r}")

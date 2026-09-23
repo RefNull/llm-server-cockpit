@@ -19,8 +19,8 @@ from textual.widgets import Button, DataTable, Input, Label, Select, Static, Swi
 from provision import schema
 from provision.common import Runner
 from provision.steps import scripts as scripts_step
-
-from cockpit.widgets import CockpitScreenBase, ConfirmModal, SingleClickDataTable, TableAction
+from cockpit.screens.deploy import _args_lines_to_tokens, _args_tokens_to_lines
+from cockpit.widgets import CockpitScreenBase, ConfirmModal, InfoModal, SingleClickDataTable, TableAction
 
 _RESTART_POLICY_OPTIONS = [("on-failure", "on-failure"), ("always", "always"), ("no", "no")]
 
@@ -81,6 +81,7 @@ class EditScriptModal(ModalScreen[bool]):
         editing_id: str | None,
         repo_root: Path,
         cockpit_app: Any,
+        script_type: str = "python",
     ) -> None:
         super().__init__()
         self.host_profile = host_profile
@@ -94,12 +95,29 @@ class EditScriptModal(ModalScreen[bool]):
             if editing_id
             else None
         )
+        self.script_type = self._script.get("type", script_type) if self._script else script_type
 
     def compose(self) -> ComposeResult:
-        title = f"Edit Script — {self.editing_id}" if self.editing_id else "Add Script"
+        if self.editing_id:
+            title = f"Edit Script — {self.editing_id}"
+        else:
+            title = f"Add {'Python' if self.script_type == 'python' else 'Bash'} Script"
         s = self._script
         restart_policy = s.get("restart_policy", "on-failure") if s else "on-failure"
         enabled_val = bool(s.get("enabled", False)) if s else False
+
+        if self.script_type == "python":
+            path_label = "path (absolute path to the .py file)"
+            path_placeholder = "/opt/myservice/serve.py"
+            interp_label = "python (optional — defaults to python3)"
+            interp_placeholder = "python3 (or /path/to/venv/bin/python)"
+            interp_val = s.get("python", "") if s else ""
+        else:
+            path_label = "path (absolute path to the .sh file)"
+            path_placeholder = "/opt/myservice/run.sh"
+            interp_label = "interpreter (optional — defaults to /bin/bash)"
+            interp_placeholder = "/bin/bash (or /bin/sh)"
+            interp_val = (s.get("interpreter") or s.get("bash", "")) if s else ""
 
         with Vertical(id="edit-script-dialog"):
             yield Static(title, id="edit-script-title")
@@ -111,10 +129,10 @@ class EditScriptModal(ModalScreen[bool]):
                     value=s["id"] if s else "",
                     disabled=bool(self.editing_id),
                 )
-                yield Label("path (absolute path to the .py file)")
+                yield Label(path_label)
                 yield Input(
                     id="f-script-path",
-                    placeholder="/opt/myservice/serve.py",
+                    placeholder=path_placeholder,
                     value=s["path"] if s else "",
                 )
                 yield Label("working_dir (optional — defaults to path's directory)")
@@ -123,15 +141,15 @@ class EditScriptModal(ModalScreen[bool]):
                     placeholder="",
                     value=s.get("working_dir", "") if s else "",
                 )
-                yield Label("python (optional — defaults to python3)")
+                yield Label(interp_label)
                 yield Input(
                     id="f-script-python",
-                    placeholder="",
-                    value=s.get("python", "") if s else "",
+                    placeholder=interp_placeholder,
+                    value=interp_val,
                 )
-                yield Label("args (one per line)")
+                yield Label("args — one flag (and its value) per line, e.g. --model Qwen3-ASR-1.7B")
                 yield TextArea(
-                    "\n".join(s.get("args", [])) if s else "",
+                    _args_tokens_to_lines(s.get("args", [])) if s else "",
                     id="f-script-args",
                 )
                 yield Label("restart_policy")
@@ -163,16 +181,29 @@ class EditScriptModal(ModalScreen[bool]):
         if not path:
             return None, "path is required"
         working_dir = self.query_one("#f-script-working-dir", Input).value.strip()
-        python = self.query_one("#f-script-python", Input).value.strip()
-        args = [line.strip() for line in self.query_one("#f-script-args", TextArea).text.splitlines() if line.strip()]
+        interp = self.query_one("#f-script-python", Input).value.strip()
+        raw_args = self.query_one("#f-script-args", TextArea).text
+        try:
+            args = _args_lines_to_tokens(raw_args)
+        except ValueError as e:
+            return None, f"args {e}"
         restart_policy = str(self.query_one("#f-script-restart-policy", Select).value)
         enabled = self.query_one("#f-script-enabled", Switch).value
 
-        script: dict[str, Any] = {"id": script_id, "path": path, "restart_policy": restart_policy, "enabled": enabled}
+        script: dict[str, Any] = {
+            "id": script_id,
+            "type": self.script_type,
+            "path": path,
+            "restart_policy": restart_policy,
+            "enabled": enabled,
+        }
         if working_dir:
             script["working_dir"] = working_dir
-        if python:
-            script["python"] = python
+        if interp:
+            if self.script_type == "python":
+                script["python"] = interp
+            else:
+                script["interpreter"] = interp
         if args:
             script["args"] = args
         return script, None
@@ -263,19 +294,20 @@ class ScriptsScreen(CockpitScreenBase):
             table.cursor_type = "row"
             yield table
             with Horizontal(classes="action-row-primary"):
-                # The only screen-level action left: every per-script operation is an in-table
-                # action column on its own row, so there is no selection to act on.
-                yield Button("Add Script", id="btn-new-script", variant="primary", classes="thin-button")
+                # Two primary action buttons: add python script or bash script
+                yield Button("Add Python Script", id="btn-new-python-script", variant="primary", classes="thin-button")
+                yield Button("Add Bash Script", id="btn-new-bash-script", classes="thin-button")
             yield Static("", id="status-message", classes="status-text")
 
     def on_mount(self) -> None:
         table = self.query_one("#scripts-table", SingleClickDataTable)
         # Column budget (DESIGN.md §4): content + 2 padding per column against the 115-cell
-        # usable viewport at 121x30. Data 16+27+20 = 63, actions 9+11+8+10 = 38, 7 columns →
-        # 101 + 14 = 115.
-        table.add_column("ID", width=16)
-        table.add_column("Path", width=27)
-        table.add_column("Status", width=20)
+        # usable viewport at 121x30. Data 14+7+17+13 = 51, actions 9+8+11+8+10 = 46, 9 columns →
+        # 97 + 18 = 115.
+        table.add_column("ID", width=14)
+        table.add_column("Type", width=7)
+        table.add_column("Path", width=17)
+        table.add_column("Status", width=13)
         # Start/Stop and Enable/Disable are one toggle column each, not two static ones: six
         # static action columns need 56 content cells and blow the budget above, and only one
         # of each pair is ever applicable to a given row anyway.
@@ -288,6 +320,7 @@ class ScriptsScreen(CockpitScreenBase):
                 requires_root=True,
             )
         )
+        table.add_action_column(TableAction("logs", "Logs", width=8, requires_root=True))
         table.add_action_column(
             TableAction(
                 "boot",
@@ -318,25 +351,35 @@ class ScriptsScreen(CockpitScreenBase):
         # than on an operator action.
         rows = []
         for script in self.scripts.get("scripts", []):
+            stype = script.get("type", "python")
             try:
-                st = scripts_step.status(script["id"])
-                status_text = f"{'active' if st['unit_active'] else 'stopped'}, {'enabled' if st['unit_enabled'] else 'disabled'}"
+                if not scripts_step.unit_installed(script["id"]):
+                    st = {"unit_active": False, "unit_enabled": False}
+                    status_text = "not installed"
+                else:
+                    st = scripts_step.status(script["id"])
+                    status_text = "active" if st.get("unit_active") else "stopped"
             except Exception as e:
                 st = {"unit_active": False, "unit_enabled": False}
-                status_text = f"error checking status ({e})"
-            rows.append((script, st, status_text))
+                status_text = f"error ({e})"
+            rows.append((script, st, stype, status_text))
         self.app.call_from_thread(self._apply_rows, rows)
 
-    def _apply_rows(self, rows: list[tuple[dict, dict[str, bool], str]]) -> None:
+    def _apply_rows(self, rows: list[tuple]) -> None:
         if not self.is_mounted:
             return
         table = self.query_one("#scripts-table", SingleClickDataTable)
         table.clear()
         # Before any action_cells() call below: the Run/Boot columns read their labels here.
-        self._status_by_id = {script["id"]: st for script, st, _ in rows}
+        self._status_by_id = {item[0]["id"]: item[1] for item in rows}
         if self._cursor_script_id not in self._status_by_id:
             self._cursor_script_id = None
-        for script, _st, status_text in rows:
+        for item in rows:
+            if len(item) == 4:
+                script, _st, stype, status_text = item
+            else:
+                script, _st, status_text = item
+                stype = script.get("type", "python")
             sid = script["id"]
             # rich.text.Text, not raw str (DESIGN.md §4.6 / Phase 0a.6): the app console has
             # markup=True, so an operator-chosen script path, or a status string embedding an
@@ -344,6 +387,7 @@ class ScriptsScreen(CockpitScreenBase):
             # Rich as a markup tag.
             table.add_row(
                 Text(sid),
+                Text(stype),
                 Text(script["path"]),
                 Text(status_text),
                 *table.action_cells(sid),
@@ -366,7 +410,7 @@ class ScriptsScreen(CockpitScreenBase):
     # ------------------------------------------------------------------ modal open
 
     @work
-    async def _open_modal_for_add(self) -> None:
+    async def _open_modal_for_add(self, script_type: str = "python") -> None:
         saved = await self.app.push_screen_wait(
             EditScriptModal(
                 host_profile=self.host_profile,
@@ -375,15 +419,18 @@ class ScriptsScreen(CockpitScreenBase):
                 editing_id=None,
                 repo_root=self.repo_root,
                 cockpit_app=self.cockpit_app,
+                script_type=script_type,
             )
         )
         if saved:
             self.scripts = getattr(self.cockpit_app, "scripts", self.scripts)
             self._refresh_table()
-            self._set_status("script added — scripts.yaml written")
+            self._set_status(f"{script_type} script added — scripts.yaml written")
 
     @work
     async def _open_modal_for_edit(self, script_id: str) -> None:
+        script = next((s for s in self.scripts.get("scripts", []) if s["id"] == script_id), None)
+        script_type = script.get("type", "python") if script else "python"
         saved = await self.app.push_screen_wait(
             EditScriptModal(
                 host_profile=self.host_profile,
@@ -392,6 +439,7 @@ class ScriptsScreen(CockpitScreenBase):
                 editing_id=script_id,
                 repo_root=self.repo_root,
                 cockpit_app=self.cockpit_app,
+                script_type=script_type,
             )
         )
         if saved:
@@ -417,6 +465,8 @@ class ScriptsScreen(CockpitScreenBase):
         elif action_id == "run":
             active = self._status_by_id.get(row_key, {}).get("unit_active")
             self._run_unit_action("stop" if active else "start", row_key)
+        elif action_id == "logs":
+            self._view_logs(row_key)
         elif action_id == "boot":
             enabled = self._status_by_id.get(row_key, {}).get("unit_enabled")
             self._run_unit_action("disable" if enabled else "enable", row_key)
@@ -430,16 +480,26 @@ class ScriptsScreen(CockpitScreenBase):
             "disable": scripts_step.disable,
         }[verb]
         try:
+            if verb in ("start", "enable"):
+                script = next((s for s in self.scripts.get("scripts", []) if s["id"] == script_id), None)
+                if script is not None:
+                    scripts_step.install_unit(script, self.host_profile, self.repo_root, self.privileged_runner)
             action(script_id, self.privileged_runner)
         except Exception as e:
             self.app.call_from_thread(
-                self.app.notify, f"{script_id}: {verb} failed — {e}", severity="error"
+                self.app.notify, f"{script_id}: {verb} failed — {e}", severity="error", markup=False
             )
         else:
             # Not f"{verb}ed" — that produced "stoped"/"enableed". The verb is already the
             # right word; it just isn't a regular past tense.
-            self.app.call_from_thread(self.app.notify, f"{script_id}: {verb} complete")
+            self.app.call_from_thread(self.app.notify, f"{script_id}: {verb} complete", markup=False)
         self.app.call_from_thread(self._refresh_table)
+
+    @work(thread=True)
+    def _view_logs(self, script_id: str) -> None:
+        unit = scripts_step.unit_name(script_id)
+        content = scripts_step.journal_tail(unit, runner=self.privileged_runner)
+        self.app.call_from_thread(self.app.push_screen, InfoModal(f"journalctl -u {unit}", content))
 
     # ------------------------------------------------------------------ button dispatch
 
@@ -447,8 +507,11 @@ class ScriptsScreen(CockpitScreenBase):
         # No `await` on a @work method: the decorator returns a Worker, which is not
         # awaitable — awaiting one raises TypeError and takes down the app. The worker is
         # already running by the time the call returns; there is nothing to wait for here.
-        if (event.button.id or "") == "btn-new-script":
-            self._open_modal_for_add()
+        btn_id = event.button.id or ""
+        if btn_id == "btn-new-python-script":
+            self._open_modal_for_add("python")
+        elif btn_id == "btn-new-bash-script":
+            self._open_modal_for_add("bash")
 
     # ------------------------------------------------------------------ remove
 

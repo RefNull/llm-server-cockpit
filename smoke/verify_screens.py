@@ -63,16 +63,22 @@ def _assert_script_toggle_labels(app: CockpitApp, context: str) -> None:
     screen = app.query_one(ScriptsScreen)
     screen._apply_rows(
         [
-            ({"id": "running", "path": "/opt/a.py"}, {"unit_active": True, "unit_enabled": True}, "active, enabled"),
-            ({"id": "stopped", "path": "/opt/b.py"}, {"unit_active": False, "unit_enabled": False}, "stopped, disabled"),
+            ({"id": "running", "type": "python", "path": "/opt/a.py"}, {"unit_active": True, "unit_enabled": True}, "python", "active"),
+            ({"id": "stopped", "type": "bash", "path": "/opt/b.sh"}, {"unit_active": False, "unit_enabled": False}, "bash", "stopped"),
+            ({"id": "uninstalled", "type": "python", "path": "/opt/c.py"}, {"unit_active": False, "unit_enabled": False}, "python", "not installed"),
         ]
     )
     table = app.query_one("#scripts-table", CockpitDataTable)
     expected = {
         ("run", "running"): "Stop",
         ("run", "stopped"): "Start",
+        ("run", "uninstalled"): "Start",
+        ("logs", "running"): "Logs",
+        ("logs", "stopped"): "Logs",
+        ("logs", "uninstalled"): "Logs",
         ("boot", "running"): "Disable",
         ("boot", "stopped"): "Enable",
+        ("boot", "uninstalled"): "Enable",
     }
     for (action_id, row_key), want in expected.items():
         got = table._actions[action_id].resolve_label(row_key)

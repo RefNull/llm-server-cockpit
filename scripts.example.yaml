@@ -10,6 +10,7 @@
 
 scripts:
   - id: example-reranker-shim
+    type: python
     path: /opt/example-reranker-shim/serve.py
     # working_dir defaults to path's directory if omitted.
     working_dir: /opt/example-reranker-shim
@@ -24,4 +25,14 @@ scripts:
     restart_policy: on-failure
     # enabled controls systemd `enable` (start on boot), not whether it's currently running —
     # start/stop from the Scripts tab is independent of this.
+    enabled: false
+
+  - id: example-sync-job
+    type: bash
+    path: /opt/scripts/sync-data.sh
+    # interpreter defaults to "/bin/bash" if omitted.
+    interpreter: /bin/bash
+    args:
+      - "--dry-run"
+    restart_policy: on-failure
     enabled: false
