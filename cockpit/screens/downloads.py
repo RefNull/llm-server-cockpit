@@ -182,8 +182,8 @@ class DownloadsScreen(CockpitScreenBase):
             yield table
 
             with Horizontal(classes="action-row-secondary"):
-                yield Static("", id="disk-usage")
-                yield Label("", id="download-status", classes="status-text")
+                yield Static("", id="disk-usage", markup=False)
+                yield Label("", id="download-status", classes="status-text", markup=False)
 
     def on_mount(self) -> None:
         table = self.query_one("#files-table", SingleClickDataTable)
@@ -281,9 +281,9 @@ class DownloadsScreen(CockpitScreenBase):
         try:
             (self._models_dir() / row_key).unlink()
         except OSError as e:
-            self.notify(f"could not delete {row_key}: {e}", severity="error")
+            self.notify(f"could not delete {row_key}: {e}", severity="error", markup=False)
             return
-        self.notify(f"deleted {row_key}")
+        self.notify(f"deleted {row_key}", markup=False)
         self._refresh_files()
         self._refresh_disk_usage()
 
@@ -351,7 +351,7 @@ class DownloadsScreen(CockpitScreenBase):
             return
         repo_id, quant_file = parsed
         if quant_file in self._files:
-            self.notify(f"{quant_file} is already in the models folder", severity="warning")
+            self.notify(f"{quant_file} is already in the models folder", severity="warning", markup=False)
             return
         if not await self._ensure_hf_auth():
             return
@@ -384,10 +384,12 @@ class DownloadsScreen(CockpitScreenBase):
             )
         except BaseException as exc:  # noqa: BLE001 — a failed download must not kill the TUI
             self.app.call_from_thread(status.update, f"Download failed: {exc}")
-            self.app.call_from_thread(self.app.notify, f"{quant_file}: download failed — {exc}", severity="error")
+            self.app.call_from_thread(
+                self.app.notify, f"{quant_file}: download failed — {exc}", severity="error", markup=False
+            )
         else:
             self.app.call_from_thread(status.update, f"Downloaded {quant_file}.")
-            self.app.call_from_thread(self.app.notify, f"{quant_file}: download complete")
+            self.app.call_from_thread(self.app.notify, f"{quant_file}: download complete", markup=False)
             self.app.call_from_thread(self.query_one("#fetch-input", Input).clear)
         finally:
             self.app.call_from_thread(self._refresh_files)

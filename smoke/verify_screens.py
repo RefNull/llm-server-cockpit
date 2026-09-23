@@ -229,6 +229,59 @@ async def _assert_markup_escaping_survives_textual() -> None:
     print("bracketed vendor/operator data survives Textual's markup parser")
 
 
+async def _assert_download_status_and_toasts_survive_brackets() -> None:
+    """Download status and notifications must not fail on bracketed exception/file strings."""
+    from textual.app import App
+    from textual.widgets import Label, Static
+
+    from provision.steps.hf import _extract_error_detail
+
+    # 1. Test error detail extractor
+    sample_tb = (
+        "Traceback (most recent call last):\n"
+        "  File \"<string>\", line 3, in <module>\n"
+        "huggingface_hub.errors.GatedRepoError: 403 Client Error: Cannot access gated repo\n"
+    )
+    extracted = _extract_error_detail(sample_tb)
+    assert "GatedRepoError" in extracted and "403" in extracted, f"unexpected extract: {extracted!r}"
+
+    # 2. Test exact traceback string from the user's report against Label and notify
+    content = (
+        "Download failed: Command '['/home/haupe/llm/state/venv-hf/bin/python', '-c', "
+        "\"import os\\nfrom huggingface_hub import hf_hub_download\\n"
+        "hf_hub_download(repo_id='google/medgemma', filename='medgemma-1.5-4b-it-Q8_0.gguf', "
+        "local_dir='/home/haupe/llm/models/gguf', token=os.environ['HF_TOKEN_TO_USE'])\\n\"]' "
+        "returned non-zero exit status 1."
+    )
+
+    class _DownloadProbe(App):
+        def compose(self):
+            yield Static("", id="disk-usage", markup=False)
+            yield Label("", id="download-status", classes="status-text", markup=False)
+
+    probe = _DownloadProbe()
+    async with probe.run_test(size=(100, 10)) as pilot:
+        lbl = probe.query_one("#download-status", Label)
+        assert lbl._render_markup is False, "download-status must have markup=False"
+        disk = probe.query_one("#disk-usage", Static)
+        assert disk._render_markup is False, "disk-usage must have markup=False"
+
+        lbl.update(content)
+        probe.notify(content, severity="error", markup=False)
+        await pilot.pause(0.1)
+
+    print("download status and toast notifications survive bracketed exception strings")
+
+
+def _assert_downloads_screen_widgets(app: CockpitApp, context: str) -> None:
+    from textual.widgets import Label, Static
+
+    lbl = app.query_one("#download-status", Label)
+    assert lbl._render_markup is False, f"{context}: #download-status must have markup=False"
+    disk = app.query_one("#disk-usage", Static)
+    assert disk._render_markup is False, f"{context}: #disk-usage must have markup=False"
+
+
 def _assert_apply_service_ignores_wol() -> None:
     """Saving a WOL interface must not go through "Apply Service Settings".
 
@@ -878,6 +931,7 @@ async def verify_geometry_and_export_screenshots() -> None:
     print("Apply Service Settings does not read the WOL fields.")
     await _assert_launch_defers_hidden_tabs()
     await _assert_markup_escaping_survives_textual()
+    await _assert_download_status_and_toasts_survive_brackets()
     _assert_view_check_ttl_cache()
     print("Backends per-view check: TTL-cached, both directions.")
 
@@ -943,6 +997,8 @@ async def verify_geometry_and_export_screenshots() -> None:
                 await pilot.pause(0.2)
                 _assert_buttons_in_bounds(app, f"{name} @ {w}x{h}")
                 _assert_table_widths_in_budget(app, f"{name} @ {w}x{h}")
+                if name == "downloads":
+                    _assert_downloads_screen_widgets(app, f"{name} @ {w}x{h}")
                 if name == "scripts":
                     _assert_script_toggle_labels(app, f"{name} @ {w}x{h}")
                     await pilot.pause(0.1)

@@ -50,6 +50,20 @@ def _ensure_hub_pinned(venv_path: Path, pinned_version: str, runner: Runner) -> 
     runner.run([str(venv_path / "bin" / "pip"), "install", f"huggingface_hub[cli]=={pinned_version}"])
 
 
+def _extract_error_detail(output: str | None) -> str:
+    """Extract a concise exception summary from captured subprocess output."""
+    if not output:
+        return "process exited with non-zero status"
+    lines = [line.strip() for line in output.strip().splitlines() if line.strip()]
+    if not lines:
+        return "process exited with non-zero status"
+    for i in range(len(lines) - 1, -1, -1):
+        line = lines[i]
+        if any(term in line for term in ("Error:", "Exception:", "HTTPError", "GatedRepoError", "RepositoryNotFoundError", "EntryNotFoundError")):
+            return " ".join(lines[i:])
+    return lines[-1]
+
+
 def _check_auth(venv_path: Path, token: str, runner: Runner) -> None:
     # whoami(token=...) rather than login(token=...): login() persists the token to
     # $HF_HOME/token on disk (that's its whole job) — a real, if repo-external, violation of
@@ -64,7 +78,11 @@ def _check_auth(venv_path: Path, token: str, runner: Runner) -> None:
         "whoami(token=os.environ['HF_TOKEN_TO_USE'])\n"
     )
     env = {**os.environ, "HF_TOKEN_TO_USE": token}
-    runner.run([str(_venv_python(venv_path)), "-c", snippet], env=env)
+    try:
+        runner.run([str(_venv_python(venv_path)), "-c", snippet], env=env, capture=True)
+    except subprocess.CalledProcessError as e:
+        detail = _extract_error_detail(e.output)
+        raise RuntimeError(f"Hugging Face authentication failed: {detail}") from e
 
 
 def _download(venv_path: Path, repo_id: str, filename: str, local_dir: str, token: str, runner: Runner) -> None:
@@ -77,7 +95,11 @@ def _download(venv_path: Path, repo_id: str, filename: str, local_dir: str, toke
     env = {**os.environ, "HF_TOKEN_TO_USE": token}
     # hf_hub_download is itself idempotent (skips re-download of a matching local copy);
     # runner.run's own dry-run gating covers "log what would be downloaded, don't invoke it".
-    runner.run([str(_venv_python(venv_path)), "-c", snippet], env=env)
+    try:
+        runner.run([str(_venv_python(venv_path)), "-c", snippet], env=env, capture=True)
+    except subprocess.CalledProcessError as e:
+        detail = _extract_error_detail(e.output)
+        raise RuntimeError(f"Download failed for {repo_id}/{filename}: {detail}") from e
 
 
 def auth_configured(host_profile: dict[str, Any]) -> bool:
@@ -104,7 +126,7 @@ def download_model(model: dict[str, Any], host_profile: dict[str, Any], runner: 
     token_env = host_profile["hf"]["token_env"]
     token = os.environ.get(token_env)
     if not token:
-        sys.exit(f"hf: environment variable {token_env!r} is not set — export it with a Hugging Face token first")
+        raise RuntimeError(f"hf: environment variable {token_env!r} is not set — export it with a Hugging Face token first")
     venv_path = Path(host_profile["paths"]["state_dir"]) / "venv-hf"
     models_dir = host_profile["paths"]["models_dir"]
     repo_id = model["repo_id"]
