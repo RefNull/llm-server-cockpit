@@ -200,12 +200,12 @@ class ExamplesModal(ModalScreen[str | None]):
         self.dismiss(None)
 
 
-class ConfigPasteModal(ModalScreen[list | None]):
+class ConfigPasteModal(ModalScreen[tuple[list, int | None] | None]):
     """First step of "Import from llama-swap": paste another instance's config.yaml.
 
     Parses in place and stays open on failure, so a bad paste is fixed where it was made
-    instead of surfacing as an empty review table. Dismisses with parse_config_for_import's
-    results, or None on cancel.
+    instead of surfacing as an empty review table. Dismisses with
+    `(results, health_check_timeout)` from `parse_config_for_import`, or None on cancel.
     """
 
     def __init__(self, host_profile: dict) -> None:
@@ -246,22 +246,36 @@ class ConfigPasteModal(ModalScreen[list | None]):
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "btn-parse":
-            error = self.query_one("#paste-error", Static)
             text = self.query_one("#paste-text", TextArea).text
             if not text.strip():
-                error.update("paste a config.yaml first")
+                self.query_one("#paste-error", Static).update("paste a config.yaml first")
                 return
-            try:
-                proposed = swap.parse_config_for_import(text, self.host_profile)
-            except ValueError as e:
-                error.update(f"parse failed: {e}")
-                return
-            if not proposed:
-                error.update("no models found in pasted config.yaml")
-                return
-            self.dismiss(proposed)
+            self._parse_in_background(text)
         elif event.button.id == "btn-paste-cancel":
             self.dismiss(None)
+
+    @work(thread=True)
+    def _parse_in_background(self, text: str) -> None:
+        """Off the main thread: a real config.yaml can have dozens of multi-line `cmd` blocks,
+        and parse_config_for_import does YAML parsing, per-line shlex tokenizing, and a GPU
+        scan per model — enough to visibly freeze the UI on the main thread with no way to
+        cancel, unlike everything else in this file that does comparable work (e.g.
+        DeployScreen._apply_in_background, same @work(thread=True) + call_from_thread shape)."""
+        try:
+            proposed, health_check_timeout = swap.parse_config_for_import(text, self.host_profile)
+        except ValueError as e:
+            self.app.call_from_thread(self._finish_parse, None, None, f"parse failed: {e}")
+            return
+        if not proposed:
+            self.app.call_from_thread(self._finish_parse, None, None, "no models found in pasted config.yaml")
+            return
+        self.app.call_from_thread(self._finish_parse, proposed, health_check_timeout, None)
+
+    def _finish_parse(self, proposed: list | None, health_check_timeout: int | None, error_message: str | None) -> None:
+        if error_message is not None:
+            self.query_one("#paste-error", Static).update(error_message)
+            return
+        self.dismiss((proposed, health_check_timeout))
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -367,6 +381,8 @@ class EditModelModal(ModalScreen[dict | None]):
         pinned: bool = False,
         staged: dict | None = None,
         staged_notes: list[str] | None = None,
+        staged_sibling_ids: frozenset[str] = frozenset(),
+        files_on_disk: list[str] | None = None,
     ) -> None:
         super().__init__()
         # Seeds the ttl field for a NEW binding: 0 is "never unload" (upstream llama-swap), so
@@ -381,10 +397,14 @@ class EditModelModal(ModalScreen[dict | None]):
         self.app_ref = app_ref
         # staged (plans/09 Phase 4, Decision 6): a not-yet-saved import candidate. Save then
         # validates {"models": [model]} alone and dismisses with the dict — no ConfirmModal, no
-        # write to models.yaml (ImportModelsModal owns the actual write, at import time, after
-        # cross-entry collision checks the single-model validate here can't do).
+        # write to models.yaml (ImportModelsModal owns the actual write, at import time).
+        # staged_sibling_ids: every OTHER staged candidate's id in the same review batch —
+        # checked here too, not deferred to import time as the comment above used to say
+        # (cockpit/screens/deploy.py, _edit_candidate had no such check: retyping one
+        # candidate's id to match another silently overwrote it in ImportModelsModal's dict).
         self.staged = staged
         self.staged_notes = staged_notes or []
+        self.staged_sibling_ids = staged_sibling_ids
         # #f-id autofill (Decision 5): touched once the operator types in it themselves, so a
         # later file pick no longer overwrites a chosen id. Always touched when editing OR
         # staged — both already carry a concrete id (looked up / parsed) that a later file pick
@@ -408,7 +428,13 @@ class EditModelModal(ModalScreen[dict | None]):
         # it isn't on disk — otherwise the Select silently drops back to blank for a staged or
         # edited entry whose weights aren't downloaded (yet) on this host, and Save wrongly
         # blocks with "pick a model file" for a file that WAS picked (plans/09 Phase 4 item 2).
-        self._files_on_disk = [f["name"] for f in list_model_files(Path(host_profile["paths"]["models_dir"]))]
+        # files_on_disk lets a caller that opens many of these in a row (ImportModelsModal
+        # reviewing N staged candidates) scan models_dir once instead of once per Edit click —
+        # rglob + a stat() per file, repeated for data that hasn't changed between clicks.
+        if files_on_disk is not None:
+            self._files_on_disk = list(files_on_disk)
+        else:
+            self._files_on_disk = [f["name"] for f in list_model_files(Path(host_profile["paths"]["models_dir"]))]
         self._files = list(self._files_on_disk)
         for key in ("quant_file", "mmproj_file"):
             val = (self._model or {}).get(key)
@@ -718,6 +744,14 @@ class EditModelModal(ModalScreen[dict | None]):
     def action_cancel(self) -> None:
         self.dismiss(None)
 
+    def _parse_args_field(self) -> tuple[list[str] | None, str | None]:
+        """`#f-args` parsed to tokens, shared by the llama-cpp and python branches of
+        `_build_model_from_form` — same field, same parser, same error shape (Decision 4)."""
+        try:
+            return _args_lines_to_tokens(self.query_one("#f-args", TextArea).text), None
+        except ValueError as e:
+            return None, f"could not parse arguments — {e}"
+
     def _build_model_from_form(self) -> tuple[dict | None, str | None]:
         engine = self.query_one("#f-engine", Select).value
         if engine is Select.NULL:
@@ -768,10 +802,9 @@ class EditModelModal(ModalScreen[dict | None]):
             if mmproj_sel is not Select.NULL and str(mmproj_sel) != quant_file:
                 model["mmproj_file"] = str(mmproj_sel)
             model["bind"] = {"gpu": str(gpu), "backend": str(backend)}
-            try:
-                args_tokens = _args_lines_to_tokens(self.query_one("#f-args", TextArea).text)
-            except ValueError as e:
-                return None, f"could not parse arguments — {e}"
+            args_tokens, error = self._parse_args_field()
+            if error:
+                return None, error
             if args_tokens:
                 model["llama_server_args"] = args_tokens
         elif engine == "python":
@@ -781,10 +814,9 @@ class EditModelModal(ModalScreen[dict | None]):
                 return None, "python interpreter path and script path are required for python models"
             model["python"] = python_path
             model["script"] = script_path
-            try:
-                args_tokens = _args_lines_to_tokens(self.query_one("#f-args", TextArea).text)
-            except ValueError as e:
-                return None, f"could not parse arguments — {e}"
+            args_tokens, error = self._parse_args_field()
+            if error:
+                return None, error
             if args_tokens:
                 model["args"] = args_tokens
         else:  # unmanaged
@@ -831,9 +863,15 @@ class EditModelModal(ModalScreen[dict | None]):
 
         if self.staged is not None:
             # Staged review (plans/09 Phase 4, Decision 6): validate this one model in
-            # isolation and hand the dict back to ImportModelsModal — cross-entry collisions
-            # (with models.yaml or with other candidates) are its job at actual import time,
-            # not this modal's. Never writes models.yaml.
+            # isolation and hand the dict back to ImportModelsModal, which owns the actual
+            # write at import time (against models.yaml). Collision against a SIBLING staged
+            # candidate has to be caught here, though — ImportModelsModal only ever sees the
+            # returned dict, not what id it used to be, so it has no way to detect "this now
+            # collides with another row" after the fact; without this check it would just
+            # overwrite that row's dict-key silently.
+            if model["id"] in self.staged_sibling_ids:
+                self._set_form_error(f"id {model['id']!r} is already used by another row in this import — pick a different id")
+                return
             try:
                 schema.validate_models_dict({"models": [model]}, self.host_profile, self.manifest, source="staged import")
             except schema.ValidationError as e:
@@ -915,6 +953,7 @@ class ImportModelsModal(ModalScreen[bool]):
         repo_root: Path,
         app_ref: Any,
         candidates: list[dict[str, Any]] | None = None,
+        health_check_timeout: int | None = None,
     ) -> None:
         super().__init__()
         self.host_profile = host_profile
@@ -925,7 +964,15 @@ class ImportModelsModal(ModalScreen[bool]):
         # model id -> the parser's full {"model", "notes", "status"} result.
         self._import_candidates: dict[str, dict[str, Any]] = {}
         self._import_selected: set[str] = set()
-        self.health_check_timeout: int | None = getattr(candidates, "health_check_timeout", None)
+        # An explicit constructor param, not a sideband attribute on `candidates` (that was
+        # `ImportResult(list)`, removed — every caller now passes the tuple
+        # parse_config_for_import returns apart instead of a list a future caller could build
+        # by hand and silently lose this).
+        self.health_check_timeout = health_check_timeout
+        # Scanned once here, not once per staged Edit click — ImportModelsModal._edit_candidate
+        # passes this into every EditModelModal it opens instead of each one re-walking
+        # models_dir for a listing that can't have changed mid-review.
+        self._files_on_disk = [f["name"] for f in list_model_files(Path(host_profile["paths"]["models_dir"]))]
         self._load_candidates(candidates or [])
 
     def compose(self) -> ComposeResult:
@@ -952,10 +999,14 @@ class ImportModelsModal(ModalScreen[bool]):
     def on_mount(self) -> None:
         table = self.query_one("#import-table", SingleClickDataTable)
         table.add_column("", width=3, key="tick")
-        table.add_column("ID", width=24)
-        table.add_column("Engine", width=12)
+        table.add_column("ID", width=20)
+        table.add_column("Engine", width=10)
         table.add_column("Status", width=8)
-        table.add_column("Notes", width=40)
+        # Command preview restored (it was on the table this replaced) — an "ok" row with no
+        # parser notes gave zero visibility into what would actually run, notably for an
+        # unmanaged/docker entry, before Import.
+        table.add_column("Cmd", width=34)
+        table.add_column("Notes", width=28)
         # Declared last, after every data column (DESIGN.md §9): opens a staged EditModelModal
         # on the clicked row — available on ok AND review rows, not just review, since a
         # candidate the operator wants to tweak before import (e.g. add check_endpoint) doesn't
@@ -972,6 +1023,21 @@ class ImportModelsModal(ModalScreen[bool]):
         self._import_candidates = {r["model"]["id"]: r for r in proposed}
         self._import_selected = {mid for mid, r in self._import_candidates.items() if r["status"] == "ok"}
 
+    @staticmethod
+    def _cmd_preview(model: dict[str, Any]) -> str:
+        """What this candidate will actually run, without needing host_profile (bind.gpu/
+        backend may not even be resolved yet on a "review" row) — the same information the
+        pre-review table used to show as a raw `cmd` column, reconstructed per engine since
+        only `unmanaged` still carries a literal `cmd` string on the model dict."""
+        engine = model.get("engine", "unmanaged")
+        if engine == "unmanaged":
+            return model.get("cmd", "")
+        if engine == "python":
+            return " ".join([model.get("python", "?"), model.get("script", "?"), *model.get("args", [])])
+        # llama-cpp
+        parts = ["llama-server", "--model", model.get("quant_file", "?"), *model.get("llama_server_args", [])]
+        return " ".join(parts)
+
     def _refresh_import_table(self) -> None:
         table = self.query_one("#import-table", SingleClickDataTable)
         table.clear()
@@ -980,7 +1046,9 @@ class ImportModelsModal(ModalScreen[bool]):
             notes = entry.get("notes") or []
             status = entry.get("status", "review")
             first_note = notes[0] if notes else ""
-            note_preview = first_note[:80] + ("…" if len(first_note) > 80 else "")
+            note_preview = first_note[:60] + ("…" if len(first_note) > 60 else "")
+            cmd_preview = self._cmd_preview(model)
+            cmd_preview = cmd_preview[:70] + ("…" if len(cmd_preview) > 70 else "")
             # rich.text.Text, not raw str (DESIGN.md §4.6 / Phase 0a.6): the app console has
             # markup=True, and both cmd previews and free-text parser notes can carry brackets
             # that markup would otherwise try to parse.
@@ -989,6 +1057,7 @@ class ImportModelsModal(ModalScreen[bool]):
                 Text(model_id),
                 Text(model.get("engine", "unmanaged")),
                 Text(status, style="green" if status == "ok" else "bold yellow"),
+                Text(cmd_preview),
                 Text(note_preview),
                 *table.action_cells(model_id),
                 key=model_id,
@@ -1030,6 +1099,8 @@ class ImportModelsModal(ModalScreen[bool]):
                 app_ref=self.app_ref,
                 staged=dict(entry["model"]),
                 staged_notes=entry["notes"],
+                staged_sibling_ids=frozenset(self._import_candidates) - {row_key},
+                files_on_disk=self._files_on_disk,
             )
         )
         if result is None:
@@ -1116,6 +1187,12 @@ class ImportModelsModal(ModalScreen[bool]):
                 try:
                     hp_data = yaml.safe_load(hp_path.read_text(encoding="utf-8")) or {}
                     hp_data.setdefault("network", {}).setdefault("gateway", {})["health_check_timeout"] = self.health_check_timeout
+                    # Same convention as every other host-profile writer (e.g.
+                    # SettingsScreen._confirm_and_save_wol) — validate the candidate before it
+                    # touches disk, not just before this one field is set. A schema.ValidationError
+                    # is an Exception, so it lands in the same warning notify below; nothing here
+                    # silently writes a structurally-invalid hosts/<hostname>.yaml.
+                    schema.validate_host_profile_dict(hp_data, known_backends=self.manifest["backends"].keys())
                     hp_path.write_text(yaml.safe_dump(hp_data, sort_keys=False), encoding="utf-8")
                     self.app_ref.reload_host_profile()
                     self.host_profile = getattr(self.app_ref, "host_profile", self.host_profile)
@@ -1394,9 +1471,10 @@ class DeployScreen(CockpitScreenBase):
     @work
     async def _on_import_toggle(self) -> None:
         # Paste first: the review table has nothing to show until there is a config to parse.
-        candidates = await self.app.push_screen_wait(ConfigPasteModal(self.host_profile))
-        if not candidates:
+        result = await self.app.push_screen_wait(ConfigPasteModal(self.host_profile))
+        if not result:
             return
+        candidates, health_check_timeout = result
         imported = await self.app.push_screen_wait(
             ImportModelsModal(
                 host_profile=self.host_profile,
@@ -1405,6 +1483,7 @@ class DeployScreen(CockpitScreenBase):
                 repo_root=self.repo_root,
                 app_ref=self.app_ref,
                 candidates=candidates,
+                health_check_timeout=health_check_timeout,
             )
         )
         if imported:

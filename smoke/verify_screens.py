@@ -555,6 +555,7 @@ async def _assert_import_models_modal(app: CockpitApp, pilot, context: str) -> N
     from provision.steps import swap
 
     fixture_text = (_REPO_ROOT / "smoke" / "fixtures" / "llama-swap-import.yaml").read_text(encoding="utf-8")
+    candidates, health_check_timeout = swap.parse_config_for_import(fixture_text, app.host_profile)
 
     modal = ImportModelsModal(
         host_profile=app.host_profile,
@@ -562,7 +563,8 @@ async def _assert_import_models_modal(app: CockpitApp, pilot, context: str) -> N
         models=app.models,
         repo_root=app.repo_root,
         app_ref=app,
-        candidates=swap.parse_config_for_import(fixture_text, app.host_profile),
+        candidates=candidates,
+        health_check_timeout=health_check_timeout,
     )
     app.push_screen(modal)
     await pilot.pause(0.2)
@@ -600,6 +602,43 @@ async def _assert_import_models_modal(app: CockpitApp, pilot, context: str) -> N
     await pilot.pause(0.1)
     assert table.cursor_row == 3, f"[{context}] tick toggle moved the cursor to row {table.cursor_row}, expected 3"
     assert row_key.value not in modal._import_selected, f"[{context}] row 3 did not untick"
+
+    # Regression: editing a staged candidate's id to collide with a sibling candidate must be
+    # rejected, not silently overwrite the sibling (cockpit/screens/deploy.py, EditModelModal's
+    # staged-Save path + staged_sibling_ids).
+    from textual.widgets import Input, Static
+
+    from cockpit.screens.deploy import EditModelModal
+
+    before_ids = set(modal._import_candidates)
+    edit_modal = EditModelModal(
+        host_profile=modal.host_profile,
+        manifest=modal.manifest,
+        models=modal.models,
+        editing_id=None,
+        repo_root=modal.repo_root,
+        app_ref=modal.app_ref,
+        staged=dict(modal._import_candidates["chat-vision"]["model"]),
+        staged_notes=modal._import_candidates["chat-vision"]["notes"],
+        staged_sibling_ids=frozenset(modal._import_candidates) - {"chat-vision"},
+    )
+    app.push_screen(edit_modal)
+    await pilot.pause(0.2)
+    id_input = edit_modal.query_one("#f-id", Input)
+    id_input.value = "chat-main"
+    edit_modal.on_button_pressed(Button.Pressed(edit_modal.query_one("#btn-save", Button)))
+    await pilot.pause(0.2)
+    assert app.screen is edit_modal, f"[{context}] colliding staged id was accepted instead of rejected — modal dismissed"
+    error_text = str(edit_modal.query_one("#form-error", Static).render())
+    assert "already used by another row" in error_text, (
+        f"[{context}] expected a sibling-id-collision error, got: {error_text!r}"
+    )
+    app.pop_screen()
+    await pilot.pause(0.1)
+    assert set(modal._import_candidates) == before_ids, (
+        f"[{context}] sibling candidate set changed despite the rejected edit: "
+        f"{sorted(before_ids)} -> {sorted(modal._import_candidates)}"
+    )
 
     app.pop_screen()
     await pilot.pause(0.1)

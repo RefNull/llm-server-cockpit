@@ -32,16 +32,16 @@ from provision.steps import swap  # noqa: E402
 _FIXTURE = _REPO_ROOT / "smoke" / "fixtures" / "llama-swap-import.yaml"
 
 
-def _load_results() -> tuple[dict, dict, list[dict]]:
+def _load_results() -> tuple[dict, dict, list[dict], int | None]:
     manifest = schema.load_manifest(_REPO_ROOT / "manifest.example.yaml")
     host_profile = schema.load_host_profile(_REPO_ROOT / "hosts" / "example.yaml", manifest)
     text = _FIXTURE.read_text(encoding="utf-8")
-    results = swap.parse_config_for_import(text, host_profile)
-    return host_profile, manifest, results
+    results, health_check_timeout = swap.parse_config_for_import(text, host_profile)
+    return host_profile, manifest, results, health_check_timeout
 
 
 def check_classification_and_status() -> list[dict]:
-    host_profile, manifest, results = _load_results()
+    host_profile, manifest, results, health_check_timeout = _load_results()
     by_id = {r["model"]["id"]: r for r in results}
 
     expected_llama_cpp = {
@@ -121,8 +121,8 @@ def check_classification_and_status() -> list[dict]:
         f"tts-docker: cmd carries a quote character not present in the source: {docker_entry['model']['cmd']!r}"
     )
 
-    assert getattr(results, "health_check_timeout", None) == 120, (
-        f"expected health_check_timeout 120 from fixture, got {getattr(results, 'health_check_timeout', None)}"
+    assert health_check_timeout == 120, (
+        f"expected health_check_timeout 120 from fixture, got {health_check_timeout}"
     )
 
     print(f"  {len(by_id)} entries classified correctly (4 llama-cpp, 2 python, 1 unmanaged), notes present for relocated paths and dropped healthCheckTimeout, top-level healthCheckTimeout preserved, unmanaged cmd not re-quoted")
@@ -191,7 +191,7 @@ def check_self_reimport(results: list[dict]) -> None:
     validated = schema.validate_models_dict({"models": ok_models}, host_profile, manifest, source="smoke/verify_swap_import.py")
     text = swap._generate_config(host_profile, validated)
 
-    reimported = swap.parse_config_for_import(text, host_profile)
+    reimported, reimported_timeout = swap.parse_config_for_import(text, host_profile)
     reimported_by_id = {r["model"]["id"]: r for r in reimported}
     original_engine = {m["id"]: m["engine"] for m in ok_models}
 
@@ -202,9 +202,7 @@ def check_self_reimport(results: list[dict]) -> None:
         got = reimported_by_id[model_id]["model"]["engine"]
         assert got == engine, f"{model_id}: self-reimport changed engine {engine!r} -> {got!r}"
 
-    assert getattr(reimported, "health_check_timeout", None) == 120, (
-        f"expected reimported health_check_timeout 120, got {getattr(reimported, 'health_check_timeout', None)}"
-    )
+    assert reimported_timeout == 120, f"expected reimported health_check_timeout 120, got {reimported_timeout}"
 
     print(f"  {len(original_engine)} 'ok' entries round-trip through _generate_config -> parse_config_for_import with the same engine and healthCheckTimeout")
 
@@ -240,8 +238,8 @@ groups:
     members:
       - bge-grouped
 """
-    parsed = swap.parse_config_for_import(grouped_ttl_fixture, host_profile)
-    assert parsed.health_check_timeout == 90
+    parsed, parsed_timeout = swap.parse_config_for_import(grouped_ttl_fixture, host_profile)
+    assert parsed_timeout == 90
     m = parsed[0]
     assert m["model"]["group"] == "always-on"
     assert m["model"]["ttl"] == 600
@@ -252,12 +250,41 @@ groups:
     print("  Residency truth table verified: group + ttl > 0 correctly routes to Swappable, and import note warns about idle unload")
 
 
+def check_malformed_entry_does_not_abort_import() -> None:
+    """A single malformed entry (here, `cmd:` holding a non-string) must not crash the whole
+    parse — the rest of the config still comes back, and the bad one lands as `review` with a
+    note, instead of an uncaught AttributeError from `_sanitize_cmd`'s `raw_cmd.splitlines()`.
+
+    Regression: caught live against a pasted config where a stray YAML value (`cmd: 123`)
+    took the whole "Import from llama-swap" dialog down with the app.
+    """
+    manifest = schema.load_manifest(_REPO_ROOT / "manifest.example.yaml")
+    host_profile = schema.load_host_profile(_REPO_ROOT / "hosts" / "example.yaml", manifest)
+    text = """
+models:
+  bad:
+    cmd: 123
+  good:
+    cmd: |
+      /srv/llm/builds/cuda/current/bin/llama-server
+      --model /srv/models/gguf/x.gguf
+      --port ${PORT}
+"""
+    results, _ = swap.parse_config_for_import(text, host_profile)
+    by_id = {r["model"]["id"]: r for r in results}
+    assert set(by_id) == {"bad", "good"}, f"malformed entry took a sibling entry down with it: {sorted(by_id)}"
+    assert by_id["bad"]["status"] == "review", f"malformed entry should be 'review', got {by_id['bad']['status']!r}"
+    assert by_id["good"]["status"] == "ok", f"sibling entry should still parse fine, got {by_id['good']['status']!r}"
+    print("  a malformed entry (non-string cmd) degrades to 'review' instead of crashing the whole import")
+
+
 def main() -> None:
     results = check_classification_and_status()
     check_args_roundtrip(results)
     check_validate_and_regenerate(results)
     check_self_reimport(results)
     check_residency_and_ttl_behavior()
+    check_malformed_entry_does_not_abort_import()
     print("Swap import verification PASSED.")
 
 

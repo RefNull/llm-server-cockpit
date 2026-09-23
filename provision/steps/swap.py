@@ -333,29 +333,16 @@ def _classify_llama_cpp(
     return model, status
 
 
-class ImportResult(list):
-    """Result of parse_config_for_import.
-
-    Subclasses list[dict[str, Any]] to preserve full backwards-compatibility with
-    callers and smoke tests expecting a list of model candidates, while also exposing
-    discovered global settings (such as top-level healthCheckTimeout).
-    """
-
-    def __init__(
-        self,
-        candidates: list[dict[str, Any]],
-        *,
-        health_check_timeout: int | None = None,
-    ) -> None:
-        super().__init__(candidates)
-        self.health_check_timeout = health_check_timeout
-
-
-def parse_config_for_import(yaml_text: str, host_profile: dict[str, Any]) -> ImportResult:
+def parse_config_for_import(
+    yaml_text: str, host_profile: dict[str, Any]
+) -> tuple[list[dict[str, Any]], int | None]:
     """Reverse of _generate_config(), for the cockpit's Models tab "Import from config.yaml"
-    shortcut. Each result is `{"model": <models.yaml entry>, "notes": [...], "status": "ok" |
-    "review"}` — the operator reviews (and can edit) every proposed entry before anything is
-    merged (see deploy.py); nothing here is written to disk.
+    shortcut. Returns `(results, health_check_timeout)`: `results` entries are
+    `{"model": <models.yaml entry>, "notes": [...], "status": "ok" | "review"}` — the operator
+    reviews (and can edit) every proposed entry before anything is merged (see deploy.py);
+    nothing here is written to disk. `health_check_timeout` is the pasted config's top-level
+    value, or None if it had none — a plain tuple, not a `list` subclass carrying a sideband
+    attribute, so every consumer gets it by unpacking rather than a defensive `getattr`.
 
     Classification is by argv[0]'s basename after `_sanitize_cmd` (llama-server -> llama-cpp,
     python/python3/python3.N -> python, anything else -> unmanaged, cmd reconstructed).
@@ -384,72 +371,92 @@ def parse_config_for_import(yaml_text: str, host_profile: dict[str, Any]) -> Imp
     for model_id, entry in data["models"].items():
         if not isinstance(entry, dict) or "cmd" not in entry:
             continue
-        notes: list[str] = []
-        status = "ok"
         try:
-            argv, cleaned_text = _sanitize_cmd(entry["cmd"], notes)
-        except ValueError as e:
-            # One malformed entry (unbalanced quote) must not abort the whole import.
-            argv = None
-            status = "review"
-            notes.append(f"cmd does not tokenize ({e}) — kept verbatim")
-            model = {"engine": "unmanaged", "cmd": entry["cmd"]}
+            results.append(_import_one_model(model_id, entry, host_profile, group_of))
+        except Exception as e:
+            # One malformed entry (a non-string cmd, a field of the wrong shape, anything
+            # this function didn't anticipate) must not abort the whole import — the docstring
+            # above already promises that for the unbalanced-quote case; this covers the rest.
+            # Caught against a real bug: `cmd: 123` in a pasted config.yaml raised AttributeError
+            # out of _sanitize_cmd's raw_cmd.splitlines(), uncaught, and crashed the app.
+            results.append({
+                "model": {"id": model_id, "engine": "unmanaged", "cmd": str(entry.get("cmd", ""))},
+                "notes": [f"could not import this entry ({type(e).__name__}: {e}) — needs manual review"],
+                "status": "review",
+            })
+    return results, health_check_timeout
 
-        if argv is None:
-            pass
-        elif not argv:
-            status = "review"
-            notes.append("empty command after stripping comments")
-            model: dict[str, Any] = {"engine": "unmanaged", "cmd": ""}
-        else:
-            base = argv[0].rsplit("/", 1)[-1]
-            if base == "llama-server":
-                model, engine_status = _classify_llama_cpp(argv, host_profile, notes)
-                if engine_status == "review":
-                    status = "review"
-            elif _PYTHON_BASENAME_RE.match(base):
-                if len(argv) < 2:
-                    status = "review"
-                    notes.append("python interpreter with no script argument")
-                    model = {"engine": "unmanaged", "cmd": cleaned_text}
-                else:
-                    model = {"engine": "python", "python": argv[0], "script": argv[1]}
-                    if argv[2:]:
-                        model["args"] = argv[2:]
-            else:
+
+def _import_one_model(
+    model_id: str, entry: dict[str, Any], host_profile: dict[str, Any], group_of: dict[str, str]
+) -> dict[str, Any]:
+    """One entry of `parse_config_for_import`'s per-model loop, split out so the caller can
+    wrap it in one `try/except` per entry (see there) rather than scattering recovery logic
+    through the loop body."""
+    notes: list[str] = []
+    status = "ok"
+    try:
+        argv, cleaned_text = _sanitize_cmd(entry["cmd"], notes)
+    except ValueError as e:
+        # Unbalanced quote — the one case _sanitize_cmd itself can raise on well-formed input.
+        return {
+            "model": {"id": model_id, "engine": "unmanaged", "cmd": entry["cmd"]},
+            "notes": [f"cmd does not tokenize ({e}) — kept verbatim"],
+            "status": "review",
+        }
+
+    if not argv:
+        status = "review"
+        notes.append("empty command after stripping comments")
+        model: dict[str, Any] = {"engine": "unmanaged", "cmd": ""}
+    else:
+        base = argv[0].rsplit("/", 1)[-1]
+        if base == "llama-server":
+            model, engine_status = _classify_llama_cpp(argv, host_profile, notes)
+            if engine_status == "review":
+                status = "review"
+        elif _PYTHON_BASENAME_RE.match(base):
+            if len(argv) < 2:
+                status = "review"
+                notes.append("python interpreter with no script argument")
                 model = {"engine": "unmanaged", "cmd": cleaned_text}
+            else:
+                model = {"engine": "python", "python": argv[0], "script": argv[1]}
+                if argv[2:]:
+                    model["args"] = argv[2:]
+        else:
+            model = {"engine": "unmanaged", "cmd": cleaned_text}
 
-        model = {"id": model_id, **model}
+    model = {"id": model_id, **model}
 
-        if entry.get("env"):
-            model["env"] = list(entry["env"])
-        # `in`, not truthiness: ttl 0 is meaningful ("never unload"), so a falsy check dropped
-        # exactly the setting an operator was most deliberate about when importing a config.
-        if "ttl" in entry:
-            model["ttl"] = entry["ttl"]
-        if "checkEndpoint" in entry:
-            model["check_endpoint"] = entry["checkEndpoint"]
-        if "healthCheckTimeout" in entry:
+    if entry.get("env"):
+        model["env"] = list(entry["env"])
+    # `in`, not truthiness: ttl 0 is meaningful ("never unload"), so a falsy check dropped
+    # exactly the setting an operator was most deliberate about when importing a config.
+    if "ttl" in entry:
+        model["ttl"] = entry["ttl"]
+    if "checkEndpoint" in entry:
+        model["check_endpoint"] = entry["checkEndpoint"]
+    if "healthCheckTimeout" in entry:
+        notes.append(
+            f"healthCheckTimeout {entry['healthCheckTimeout']} dropped — llama-swap only "
+            "supports it globally (Settings > gateway)"
+        )
+    if model_id in group_of:
+        group_name = group_of[model_id]
+        model["group"] = group_name
+        # If the model has a positive ttl, llama-swap will still idle-unload it after
+        # that timeout despite group persistence (which only resists cross-group evictions).
+        if entry.get("ttl", 0) > 0:
             notes.append(
-                f"healthCheckTimeout {entry['healthCheckTimeout']} dropped — llama-swap only "
-                "supports it globally (Settings > gateway)"
+                f"in group {group_name!r} with ttl {entry['ttl']}s: idle-unloads after "
+                "timeout (set ttl 0 for permanent residency)"
             )
-        if model_id in group_of:
-            group_name = group_of[model_id]
-            model["group"] = group_name
-            # If the model has a positive ttl, llama-swap will still idle-unload it after
-            # that timeout despite group persistence (which only resists cross-group evictions).
-            if entry.get("ttl", 0) > 0:
-                notes.append(
-                    f"in group {group_name!r} with ttl {entry['ttl']}s: idle-unloads after "
-                    "timeout (set ttl 0 for permanent residency)"
-                )
-        for key in entry:
-            if key not in _KNOWN_PER_MODEL_KEYS:
-                notes.append(f"unsupported key {key!r} dropped")
+    for key in entry:
+        if key not in _KNOWN_PER_MODEL_KEYS:
+            notes.append(f"unsupported key {key!r} dropped")
 
-        results.append({"model": model, "notes": notes, "status": status})
-    return ImportResult(results, health_check_timeout=health_check_timeout)
+    return {"model": model, "notes": notes, "status": status}
 
 
 def _generate_config(host_profile: dict[str, Any], models: dict[str, Any]) -> str:
