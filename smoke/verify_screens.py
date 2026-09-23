@@ -469,6 +469,62 @@ async def _assert_edit_model_modal(app: CockpitApp, pilot, context: str) -> None
         _assert_buttons_in_bounds(app, f"{context} engine={engine_value} EditModelModal")
 
 
+async def _assert_import_models_modal(app: CockpitApp, pilot, context: str) -> None:
+    """plans/09-swap-import-and-python-engine.md Phase 4: pushes ImportModelsModal and feeds it
+    the fixture via _load_candidates — the same code path _paste_config uses once it has text,
+    without a real ConfigPasteModal round-trip. Asserts the row count, the status the fixture
+    actually resolves to against hosts/example.yaml (this host has real vulkan+cuda backends,
+    so every llama-cpp row comes back "ok" here — the operator's real "review" bug needs a
+    host with an unconfigured backend, which is what the scratchpad pilot reproduces, not this
+    smoke fixture), and that the dialog fits the screen at the 80x24 floor.
+    """
+    from cockpit.screens.deploy import ImportModelsModal
+    from provision.steps import swap
+
+    fixture_text = (_REPO_ROOT / "smoke" / "fixtures" / "llama-swap-import.yaml").read_text(encoding="utf-8")
+
+    modal = ImportModelsModal(
+        host_profile=app.host_profile,
+        manifest=app.manifest,
+        models=app.models,
+        repo_root=app.repo_root,
+        app_ref=app,
+    )
+    app.push_screen(modal)
+    await pilot.pause(0.2)
+
+    proposed = swap.parse_config_for_import(fixture_text, app.host_profile)
+    modal._load_candidates(proposed)
+    modal._refresh_import_table()
+    await pilot.pause(0.2)
+
+    table = modal.query_one("#import-table", CockpitDataTable)
+    assert table.row_count == 6, f"[{context}] expected 6 import rows from the fixture, got {table.row_count}"
+
+    expected_ids = {"chat-main", "chat-vision", "embed-bge", "rerank-qwen", "asr-python", "tts-python"}
+    assert set(modal._import_candidates) == expected_ids, (
+        f"[{context}] unexpected candidate id set: {sorted(modal._import_candidates)}"
+    )
+    status = {mid: r["status"] for mid, r in modal._import_candidates.items()}
+    for model_id in ("chat-main", "chat-vision", "embed-bge", "rerank-qwen", "asr-python", "tts-python"):
+        assert status[model_id] == "ok", (
+            f"[{context}] {model_id}: expected status ok against hosts/example.yaml's real "
+            f"backends, got {status[model_id]!r}"
+        )
+    # ok rows are ticked by default (Decision 6 / Phase 4 item 4).
+    assert modal._import_selected == expected_ids, (
+        f"[{context}] expected all-ok rows ticked by default, got {sorted(modal._import_selected)}"
+    )
+
+    dialog = modal.query_one("#import-dialog")
+    assert app.screen.region.contains_region(dialog.region), (
+        f"[{context}] ImportModelsModal dialog {dialog.region} is not fully inside the screen {app.screen.region}"
+    )
+
+    app.pop_screen()
+    await pilot.pause(0.1)
+
+
 async def _assert_builds_list_modal(app: CockpitApp, pilot, context: str) -> None:
     """BuildsListModal's table is budgeted against its own dialog, not the 115-cell screen
     (DESIGN.md §4.4). Nothing else checks that: _assert_table_widths_in_budget only sees
@@ -799,6 +855,8 @@ async def verify_geometry_and_export_screenshots() -> None:
                     await pilot.pause(0.1)
                 if name == "deploy":
                     await _assert_edit_model_modal(app, pilot, f"{name} @ {w}x{h}")
+                    if w == 80:
+                        await _assert_import_models_modal(app, pilot, f"{name} @ {w}x{h}")
                 if name == "builds":
                     if expected_class == "-wide":
                         _print_backends_sections_height(app, f"{name} @ {w}x{h}")

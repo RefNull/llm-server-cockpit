@@ -30,6 +30,7 @@ from cockpit.widgets import (
     InfoModal,
     SingleClickDataTable,
     TableAction,
+    TableActionInvoked,
     selection_marker,
 )
 from provision import schema
@@ -243,10 +244,14 @@ class ConfigPasteModal(ModalScreen[str | None]):
         self.dismiss(None)
 
 
-class EditModelModal(ModalScreen[bool]):
-    """Modal dialog for adding or editing a model in models.yaml.
+class EditModelModal(ModalScreen[dict | None]):
+    """Modal dialog for adding, editing, or reviewing a staged import candidate.
 
-    Validates candidate configuration against schema.validate_models_dict before writing.
+    Non-staged Save validates the full candidate set against schema.validate_models_dict,
+    writes models.yaml, and dismisses with the saved model dict. Staged Save (plans/09 Phase 4,
+    Decision 6) validates only {"models": [model]} and dismisses with the dict — never writes
+    models.yaml; ImportModelsModal owns that write, once, after all ticked candidates pass
+    their own cross-entry checks. Either way, dismiss(None) means cancelled.
     """
 
     BINDINGS = [("escape", "cancel", "Cancel")]
@@ -337,6 +342,8 @@ class EditModelModal(ModalScreen[bool]):
         repo_root: Path,
         app_ref: Any,
         resident: bool = False,
+        staged: dict | None = None,
+        staged_notes: list[str] | None = None,
     ) -> None:
         super().__init__()
         # Seeds the ttl field for a NEW binding: 0 is "never unload" (upstream llama-swap), so
@@ -349,24 +356,69 @@ class EditModelModal(ModalScreen[bool]):
         self.editing_id = editing_id
         self.repo_root = repo_root
         self.app_ref = app_ref
+        # staged (plans/09 Phase 4, Decision 6): a not-yet-saved import candidate. Save then
+        # validates {"models": [model]} alone and dismisses with the dict — no ConfirmModal, no
+        # write to models.yaml (ImportModelsModal owns the actual write, at import time, after
+        # cross-entry collision checks the single-model validate here can't do).
+        self.staged = staged
+        self.staged_notes = staged_notes or []
         # #f-id autofill (Decision 5): touched once the operator types in it themselves, so a
-        # later file pick no longer overwrites a chosen id. Always touched when editing — the
-        # id is disabled there and never autofilled. _autofilling_id guards the reentrant
-        # Input.Changed our own programmatic writes fire (on_input_changed must not mistake
-        # that for the operator typing).
-        self._id_touched = editing_id is not None
+        # later file pick no longer overwrites a chosen id. Always touched when editing OR
+        # staged — both already carry a concrete id (looked up / parsed) that a later file pick
+        # must not silently overwrite. _autofilling_id guards the reentrant Input.Changed our
+        # own programmatic writes fire (on_input_changed must not mistake that for the operator
+        # typing).
+        self._id_touched = editing_id is not None or staged is not None
         self._autofilling_id = False
-        self._model = (
-            next((m for m in self.models.get("models", []) if m["id"] == editing_id), None)
-            if editing_id
-            else None
-        )
+        if staged is not None:
+            self._model = staged
+        else:
+            self._model = (
+                next((m for m in self.models.get("models", []) if m["id"] == editing_id), None)
+                if editing_id
+                else None
+            )
         # Filenames on disk, relative to models_dir — the same shape models.yaml stores in
-        # quant_file, so a selection can be written straight through.
-        self._files = [f["name"] for f in list_model_files(Path(host_profile["paths"]["models_dir"]))]
+        # quant_file, so a selection can be written straight through. _files_on_disk is the
+        # ground truth used for the missing-file warning below; _files is what the Select
+        # actually offers, extended with this model's own stored quant_file/mmproj_file even if
+        # it isn't on disk — otherwise the Select silently drops back to blank for a staged or
+        # edited entry whose weights aren't downloaded (yet) on this host, and Save wrongly
+        # blocks with "pick a model file" for a file that WAS picked (plans/09 Phase 4 item 2).
+        self._files_on_disk = [f["name"] for f in list_model_files(Path(host_profile["paths"]["models_dir"]))]
+        self._files = list(self._files_on_disk)
+        for key in ("quant_file", "mmproj_file"):
+            val = (self._model or {}).get(key)
+            if val and val not in self._files:
+                self._files.append(val)
 
     def _file_options(self) -> list[tuple[str, str]]:
         return [(name, name) for name in self._files]
+
+    def _missing_file_warning(self) -> str:
+        """Advisory only (plans/09 Phase 4 item 2) — never blocks Save. A staged/edited entry's
+        quant_file/mmproj_file may legitimately not be downloaded yet on this host."""
+        missing = []
+        for sel_id in ("#f-quant-file", "#f-mmproj-file"):
+            val = self.query_one(sel_id, Select).value
+            if val is not Select.NULL and str(val) not in self._files_on_disk:
+                missing.append(str(val))
+        if not missing:
+            return ""
+        return f"{', '.join(missing)} not found in models_dir — download it or pick another file"
+
+    def _refresh_form_hints(self) -> None:
+        """#form-error doubles as a hints line outside of a failed Save: the staged import
+        notes (so the operator sees the full list, not just the table's first-note-truncated
+        preview) and the missing-file warning, whichever apply. A real validation error from
+        Save overwrites this — that is more urgent and the modal is about to close either way."""
+        parts = []
+        if self.staged_notes:
+            parts.append("import notes: " + "; ".join(self.staged_notes))
+        missing = self._missing_file_warning()
+        if missing:
+            parts.append(missing)
+        self._set_form_error(" | ".join(parts))
 
     def _derived_id(self) -> str:
         """The llama-swap route name, from the chosen filename.
@@ -376,7 +428,7 @@ class EditModelModal(ModalScreen[bool]):
         Downloads scan used to do it.
         """
         selection = self.query_one("#f-quant-file", Select).value
-        if selection is Select.BLANK:
+        if selection is Select.NULL:
             return ""
         stem = Path(str(selection)).stem
         clean = re.sub(r"[^a-zA-Z0-9_\.\-]", "-", stem).lower().strip("-") or "model"
@@ -388,7 +440,12 @@ class EditModelModal(ModalScreen[bool]):
         return candidate
 
     def compose(self) -> ComposeResult:
-        title = f"Edit Model: {self.editing_id}" if self.editing_id else "Add Model"
+        if self.staged is not None:
+            title = f"Review import: {self.staged.get('id') or 'new model'}"
+        elif self.editing_id:
+            title = f"Edit Model: {self.editing_id}"
+        else:
+            title = "Add Model"
         m = self._model
         engine_val = m.get("engine", "llama-cpp") if m else "llama-cpp"
         # Args box holds llama_server_args for llama-cpp, args for python — same slot, same
@@ -412,7 +469,7 @@ class EditModelModal(ModalScreen[bool]):
                 yield Input(
                     id="f-id",
                     placeholder="letters, numbers, '_', '.', '-'",
-                    value=self.editing_id or "",
+                    value=(m.get("id", "") if m else ""),
                     disabled=self.editing_id is not None,
                 )
                 yield Label("engine")
@@ -424,9 +481,17 @@ class EditModelModal(ModalScreen[bool]):
                     # a binding is created (HF Downloads tab), so the Hub id is provenance
                     # rather than something to retype. It is preserved when editing and
                     # recorded as "local" for a new binding.
-                    # No value= here: Select.BLANK is literally `False` in Textual 8.2.8, and
-                    # passing it to the constructor trips _validate_value ("Illegal select
-                    # value False"). A blank Select is made by omitting value entirely; an
+                    # No value= here: passing Widget.BLANK (`False`) to the constructor trips
+                    # _validate_value ("Illegal select value False") — and it would be the wrong
+                    # sentinel anyway. Select's own "nothing selected" value is Select.NULL, not
+                    # Select.BLANK: BLANK is inherited from Widget (an unrelated constant that
+                    # happens to share the name), never overridden on Select, and is `False` —
+                    # a real mounted, untouched Select's `.value` is `Select.NULL`
+                    # (`NoSelection()`), which is truthy and `is not False`. Confirmed live
+                    # (plans/09 Phase 4 pilot): every `is Select.BLANK` check below was a
+                    # silent no-op, so a genuinely blank Select passed every "was something
+                    # picked?" gate and got str()'d into the model as the literal text
+                    # "Select.NULL". A blank Select is made by omitting value entirely; an
                     # existing selection is assigned in on_mount, the same way f-gpu already is.
                     yield Label("model file")
                     yield Select(self._file_options(), id="f-quant-file", allow_blank=True)
@@ -525,6 +590,8 @@ class EditModelModal(ModalScreen[bool]):
             selected_backend = m.get("bind", {}).get("backend") if m else None
             self._refresh_backend_options(str(self.query_one("#f-gpu", Select).value), selected=selected_backend)
 
+        self._refresh_form_hints()
+
     def _gpu_options(self) -> list[tuple[str, str]]:
         """Label carries the product name, value stays the configured id.
 
@@ -562,7 +629,7 @@ class EditModelModal(ModalScreen[bool]):
         elif options:
             backend_select.value = options[0][1]
         else:
-            backend_select.value = Select.BLANK
+            backend_select.value = Select.NULL
 
     def _toggle_engine_fields(self, engine: str) -> None:
         is_llama = engine == "llama-cpp"
@@ -609,6 +676,8 @@ class EditModelModal(ModalScreen[bool]):
             self._refresh_backend_options(str(event.value))
         elif event.select.id == "f-quant-file":
             self._maybe_autofill_id()
+        if event.select.id in ("f-quant-file", "f-mmproj-file"):
+            self._refresh_form_hints()
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "f-id" and not self._autofilling_id:
@@ -618,11 +687,11 @@ class EditModelModal(ModalScreen[bool]):
         self.query_one("#form-error", Static).update(text)
 
     def action_cancel(self) -> None:
-        self.dismiss(False)
+        self.dismiss(None)
 
     def _build_model_from_form(self) -> tuple[dict | None, str | None]:
         engine = self.query_one("#f-engine", Select).value
-        if engine is Select.BLANK:
+        if engine is Select.NULL:
             return None, "engine is required"
         engine = str(engine)
 
@@ -656,16 +725,18 @@ class EditModelModal(ModalScreen[bool]):
             mmproj_sel = self.query_one("#f-mmproj-file", Select).value
             gpu = self.query_one("#f-gpu", Select).value
             backend = self.query_one("#f-backend", Select).value
-            if quant_sel is Select.BLANK:
+            if quant_sel is Select.NULL:
                 return None, "pick a model file — download one on the HF Downloads tab first"
-            if gpu is Select.BLANK or backend is Select.BLANK:
+            if gpu is Select.NULL or backend is Select.NULL:
+                if gpu is not Select.NULL and not self._backend_options_for_gpu(str(gpu)):
+                    return None, f"no backend enabled for bind.gpu {gpu!r} — enable one on the Backends tab first"
                 return None, "bind.gpu and bind.backend are required for llama-cpp models"
             quant_file = str(quant_sel)
             # repo_id stays required by the schema but is no longer typed: preserved when
             # editing, "local" for a new binding whose weights are simply already on disk.
             model["repo_id"] = (self._model or {}).get("repo_id") or "local"
             model["quant_file"] = quant_file
-            if mmproj_sel is not Select.BLANK and str(mmproj_sel) != quant_file:
+            if mmproj_sel is not Select.NULL and str(mmproj_sel) != quant_file:
                 model["mmproj_file"] = str(mmproj_sel)
             model["bind"] = {"gpu": str(gpu), "backend": str(backend)}
             try:
@@ -713,7 +784,7 @@ class EditModelModal(ModalScreen[bool]):
     @work
     async def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "btn-cancel":
-            self.dismiss(False)
+            self.dismiss(None)
             return
         if event.button.id == "btn-args-examples":
             await self._insert_example("args", "#f-args")
@@ -727,6 +798,19 @@ class EditModelModal(ModalScreen[bool]):
         model, error = self._build_model_from_form()
         if error:
             self._set_form_error(error)
+            return
+
+        if self.staged is not None:
+            # Staged review (plans/09 Phase 4, Decision 6): validate this one model in
+            # isolation and hand the dict back to ImportModelsModal — cross-entry collisions
+            # (with models.yaml or with other candidates) are its job at actual import time,
+            # not this modal's. Never writes models.yaml.
+            try:
+                schema.validate_models_dict({"models": [model]}, self.host_profile, self.manifest, source="staged import")
+            except schema.ValidationError as e:
+                self._set_form_error(str(e))
+                return
+            self.dismiss(model)
             return
 
         existing_models = self.models.get("models", [])
@@ -753,11 +837,19 @@ class EditModelModal(ModalScreen[bool]):
         target.write_text(yaml.safe_dump(validated, sort_keys=False), encoding="utf-8")
         self.app_ref.reload_models()
         self.app.notify(f"saved model {model['id']!r}")
-        self.dismiss(True)
+        self.dismiss(model)
 
 
 class ImportModelsModal(ModalScreen[bool]):
-    """Modal dialog for importing discovered or pasted models into models.yaml."""
+    """Modal dialog for importing discovered or pasted models into models.yaml.
+
+    Staged review (plans/09 Phase 4, Decision 6): candidates are the parser's full
+    {"model", "notes", "status"} result, not just the model — status "review" means the parser
+    couldn't resolve something (an ambiguous/absent GPU-backend match, most often) and the
+    operator must open Edit before it can be ticked into an import; "ok" rows are ticked by
+    default. Nothing reaches models.yaml until Import is pressed here — a staged EditModelModal
+    never writes it itself (see that class's docstring).
+    """
 
     BINDINGS = [("escape", "cancel", "Cancel")]
 
@@ -766,7 +858,7 @@ class ImportModelsModal(ModalScreen[bool]):
         align: center middle;
     }
     #import-dialog {
-        width: 85;
+        width: 90%;
         height: 85%;
         border: thick $background 80%;
         background: $surface;
@@ -800,6 +892,7 @@ class ImportModelsModal(ModalScreen[bool]):
         self.models = models
         self.repo_root = repo_root
         self.app_ref = app_ref
+        # model id -> the parser's full {"model", "notes", "status"} result.
         self._import_candidates: dict[str, dict[str, Any]] = {}
         self._import_selected: set[str] = set()
 
@@ -823,7 +916,13 @@ class ImportModelsModal(ModalScreen[bool]):
         table.add_column("", width=3)
         table.add_column("ID", width=24)
         table.add_column("Engine", width=12)
-        table.add_column("cmd", width=60)
+        table.add_column("Status", width=8)
+        table.add_column("Notes", width=40)
+        # Declared last, after every data column (DESIGN.md §9): opens a staged EditModelModal
+        # on the clicked row — available on ok AND review rows, not just review, since a
+        # candidate the operator wants to tweak before import (e.g. add check_endpoint) doesn't
+        # have to be "broken" first.
+        table.add_action_column(TableAction("edit", "Edit"))
 
         # Discover from state_dir config.yaml if present
         state_dir = self.host_profile.get("paths", {}).get("state_dir")
@@ -832,25 +931,36 @@ class ImportModelsModal(ModalScreen[bool]):
             if config_path.exists():
                 try:
                     content = config_path.read_text(encoding="utf-8")
-                    proposed = swap.parse_config_for_import(content, self.host_profile)
-                    self._import_candidates = {r["model"]["id"]: r["model"] for r in proposed}
+                    self._load_candidates(swap.parse_config_for_import(content, self.host_profile))
                 except Exception:
                     pass
         self._refresh_import_table()
 
+    def _load_candidates(self, proposed: list[dict[str, Any]]) -> None:
+        """Shared by on_mount's discovery and _paste_config — also the entry point
+        smoke/verify_screens.py uses to feed the fixture without a real ConfigPasteModal."""
+        self._import_candidates = {r["model"]["id"]: r for r in proposed}
+        self._import_selected = {mid for mid, r in self._import_candidates.items() if r["status"] == "ok"}
+
     def _refresh_import_table(self) -> None:
         table = self.query_one("#import-table", SingleClickDataTable)
         table.clear()
-        for model_id, model in self._import_candidates.items():
-            cmd_preview = model.get("cmd", "")[:80] + ("…" if len(model.get("cmd", "")) > 80 else "")
+        for model_id, entry in self._import_candidates.items():
+            model = entry["model"]
+            notes = entry.get("notes") or []
+            status = entry.get("status", "review")
+            first_note = notes[0] if notes else ""
+            note_preview = first_note[:80] + ("…" if len(first_note) > 80 else "")
             # rich.text.Text, not raw str (DESIGN.md §4.6 / Phase 0a.6): the app console has
-            # markup=True, so an unmanaged engine's cmd line (very likely to contain brackets)
-            # would have that span silently eaten by Rich as a markup tag.
+            # markup=True, and both cmd previews and free-text parser notes can carry brackets
+            # that markup would otherwise try to parse.
             table.add_row(
                 selection_marker(model_id in self._import_selected),
                 Text(model_id),
                 Text(model.get("engine", "unmanaged")),
-                Text(cmd_preview),
+                Text(status, style="green" if status == "ok" else "bold yellow"),
+                Text(note_preview),
+                *table.action_cells(model_id),
                 key=model_id,
             )
 
@@ -862,6 +972,45 @@ class ImportModelsModal(ModalScreen[bool]):
             self._import_selected.discard(model_id)
         else:
             self._import_selected.add(model_id)
+        self._refresh_import_table()
+
+    @work
+    async def _on_table_action_invoked(self, event: TableActionInvoked) -> None:
+        """Not a CockpitScreenBase (a ModalScreen is a different widget-tree root, same reason
+        as BuildsListModal) — Edit needs no confirmation (non-destructive, nothing written
+        until Import), so this dispatches straight to the handler rather than routing through
+        CockpitScreenBase.confirm."""
+        event.stop()
+        if event.action.id == "edit":
+            await self._edit_candidate(event.row_key)
+
+    async def _edit_candidate(self, row_key: str) -> None:
+        entry = self._import_candidates.get(row_key)
+        if entry is None:
+            return
+        result = await self.app.push_screen_wait(
+            EditModelModal(
+                host_profile=self.host_profile,
+                manifest=self.manifest,
+                models=self.models,
+                editing_id=None,
+                repo_root=self.repo_root,
+                app_ref=self.app_ref,
+                staged=dict(entry["model"]),
+                staged_notes=entry["notes"],
+            )
+        )
+        if result is None:
+            return
+        new_id = result["id"]
+        if new_id != row_key:
+            del self._import_candidates[row_key]
+            self._import_selected.discard(row_key)
+        # A successful staged Save already passed schema.validate_models_dict — status ok
+        # (plans/09 Phase 4, coordinator decision), notes kept for the record even though the
+        # operator has now addressed whatever they flagged.
+        self._import_candidates[new_id] = {"model": result, "notes": entry["notes"], "status": "ok"}
+        self._import_selected.add(new_id)
         self._refresh_import_table()
 
     def action_cancel(self) -> None:
@@ -890,8 +1039,7 @@ class ImportModelsModal(ModalScreen[bool]):
             self.query_one("#import-error", Static).update("no models found in pasted config.yaml")
             return
         self.query_one("#import-error", Static).update("")
-        self._import_candidates = {r["model"]["id"]: r["model"] for r in proposed}
-        self._import_selected = set()
+        self._load_candidates(proposed)
         self._refresh_import_table()
 
     async def _confirm_and_import(self) -> None:
@@ -901,13 +1049,21 @@ class ImportModelsModal(ModalScreen[bool]):
             error_widget.update("tick at least one row to import")
             return
 
+        reviewing = sorted(
+            mid for mid in self._import_selected if self._import_candidates[mid]["status"] == "review"
+        )
+        if reviewing:
+            n = len(reviewing)
+            error_widget.update(f"edit {n} entr{'y' if n == 1 else 'ies'} first: {', '.join(reviewing)}")
+            return
+
         existing_ids = {m["id"] for m in self.models.get("models", [])}
         colliding = sorted(self._import_selected & existing_ids)
         if colliding:
             error_widget.update(f"id(s) already exist in models.yaml: {', '.join(colliding)}")
             return
 
-        to_import = [self._import_candidates[mid] for mid in sorted(self._import_selected)]
+        to_import = [self._import_candidates[mid]["model"] for mid in sorted(self._import_selected)]
         candidate = {"models": list(self.models.get("models", [])) + to_import}
         try:
             validated = schema.validate_models_dict(candidate, self.host_profile, self.manifest, source="models.yaml")

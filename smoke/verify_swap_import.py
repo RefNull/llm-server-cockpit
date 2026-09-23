@@ -153,10 +153,40 @@ def check_validate_and_regenerate(results: list[dict]) -> None:
     print(f"  {len(ok_models)} 'ok' entries validate; regenerated config rebinds every llama-cpp cmd under this host's prefix_root/models_dir and keeps ${{PORT}}")
 
 
+def check_self_reimport(results: list[dict]) -> None:
+    """plans/09-swap-import-and-python-engine.md Phase 4 item 5: 'Our own generated config
+    re-imports as llama-cpp/python — confirm.' Regenerates config.yaml from the fixture's own
+    'ok' entries, then re-runs parse_config_for_import on THAT output (not just inspecting its
+    text, the way check_validate_and_regenerate does) and asserts every entry keeps its engine.
+    This is the loop ImportModelsModal.on_mount's own discovery would go through against a
+    real state_dir/llama-swap/config.yaml this cockpit generated.
+    """
+    manifest = schema.load_manifest(_REPO_ROOT / "manifest.example.yaml")
+    host_profile = schema.load_host_profile(_REPO_ROOT / "hosts" / "example.yaml", manifest)
+
+    ok_models = [r["model"] for r in results if r["status"] == "ok"]
+    validated = schema.validate_models_dict({"models": ok_models}, host_profile, manifest, source="smoke/verify_swap_import.py")
+    text = swap._generate_config(host_profile, validated)
+
+    reimported = swap.parse_config_for_import(text, host_profile)
+    reimported_by_id = {r["model"]["id"]: r for r in reimported}
+    original_engine = {m["id"]: m["engine"] for m in ok_models}
+
+    assert set(reimported_by_id) == set(original_engine), (
+        f"self-reimport lost or gained ids: had {sorted(original_engine)}, got {sorted(reimported_by_id)}"
+    )
+    for model_id, engine in original_engine.items():
+        got = reimported_by_id[model_id]["model"]["engine"]
+        assert got == engine, f"{model_id}: self-reimport changed engine {engine!r} -> {got!r}"
+
+    print(f"  {len(original_engine)} 'ok' entries round-trip through _generate_config -> parse_config_for_import with the same engine")
+
+
 def main() -> None:
     results = check_classification_and_status()
     check_args_roundtrip(results)
     check_validate_and_regenerate(results)
+    check_self_reimport(results)
     print("Swap import verification PASSED.")
 
 
