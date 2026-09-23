@@ -324,7 +324,25 @@ def _classify_llama_cpp(
     return model, status
 
 
-def parse_config_for_import(yaml_text: str, host_profile: dict[str, Any]) -> list[dict[str, Any]]:
+class ImportResult(list):
+    """Result of parse_config_for_import.
+
+    Subclasses list[dict[str, Any]] to preserve full backwards-compatibility with
+    callers and smoke tests expecting a list of model candidates, while also exposing
+    discovered global settings (such as top-level healthCheckTimeout).
+    """
+
+    def __init__(
+        self,
+        candidates: list[dict[str, Any]],
+        *,
+        health_check_timeout: int | None = None,
+    ) -> None:
+        super().__init__(candidates)
+        self.health_check_timeout = health_check_timeout
+
+
+def parse_config_for_import(yaml_text: str, host_profile: dict[str, Any]) -> ImportResult:
     """Reverse of _generate_config(), for the cockpit's Models tab "Import from config.yaml"
     shortcut. Each result is `{"model": <models.yaml entry>, "notes": [...], "status": "ok" |
     "review"}` — the operator reviews (and can edit) every proposed entry before anything is
@@ -339,6 +357,14 @@ def parse_config_for_import(yaml_text: str, host_profile: dict[str, Any]) -> lis
         raise ValueError(f"invalid YAML: {e}") from e
     if not isinstance(data, dict) or not isinstance(data.get("models"), dict):
         raise ValueError("expected a top-level 'models' mapping (a llama-swap config.yaml)")
+
+    raw_timeout = data.get("healthCheckTimeout")
+    health_check_timeout: int | None = None
+    if raw_timeout is not None:
+        try:
+            health_check_timeout = int(raw_timeout)
+        except (ValueError, TypeError):
+            health_check_timeout = None
 
     group_of: dict[str, str] = {}
     _collect_group_members(data.get("groups"), group_of)
@@ -400,13 +426,21 @@ def parse_config_for_import(yaml_text: str, host_profile: dict[str, Any]) -> lis
                 "supports it globally (Settings > gateway)"
             )
         if model_id in group_of:
-            model["group"] = group_of[model_id]
+            group_name = group_of[model_id]
+            model["group"] = group_name
+            # If the model has a positive ttl, llama-swap will still idle-unload it after
+            # that timeout despite group persistence (which only resists cross-group evictions).
+            if entry.get("ttl", 0) > 0:
+                notes.append(
+                    f"in group {group_name!r} with ttl {entry['ttl']}s: idle-unloads after "
+                    "timeout (set ttl 0 for permanent residency)"
+                )
         for key in entry:
             if key not in _KNOWN_PER_MODEL_KEYS:
                 notes.append(f"unsupported key {key!r} dropped")
 
         results.append({"model": model, "notes": notes, "status": status})
-    return results
+    return ImportResult(results, health_check_timeout=health_check_timeout)
 
 
 def _generate_config(host_profile: dict[str, Any], models: dict[str, Any]) -> str:

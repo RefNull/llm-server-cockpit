@@ -102,7 +102,11 @@ def check_classification_and_status() -> list[dict]:
     assert by_id["embed-bge"]["model"].get("group") == "always-on", "embed-bge: top-level groups.always-on.members not applied"
     assert by_id["rerank-qwen"]["model"].get("group") == "always-on", "rerank-qwen: top-level groups.always-on.members not applied"
 
-    print(f"  {len(by_id)} entries classified correctly (4 llama-cpp, 2 python), notes present for relocated paths and dropped healthCheckTimeout")
+    assert getattr(results, "health_check_timeout", None) == 120, (
+        f"expected health_check_timeout 120 from fixture, got {getattr(results, 'health_check_timeout', None)}"
+    )
+
+    print(f"  {len(by_id)} entries classified correctly (4 llama-cpp, 2 python), notes present for relocated paths and dropped healthCheckTimeout, top-level healthCheckTimeout preserved")
     return results
 
 
@@ -179,7 +183,54 @@ def check_self_reimport(results: list[dict]) -> None:
         got = reimported_by_id[model_id]["model"]["engine"]
         assert got == engine, f"{model_id}: self-reimport changed engine {engine!r} -> {got!r}"
 
-    print(f"  {len(original_engine)} 'ok' entries round-trip through _generate_config -> parse_config_for_import with the same engine")
+    assert getattr(reimported, "health_check_timeout", None) == 120, (
+        f"expected reimported health_check_timeout 120, got {getattr(reimported, 'health_check_timeout', None)}"
+    )
+
+    print(f"  {len(original_engine)} 'ok' entries round-trip through _generate_config -> parse_config_for_import with the same engine and healthCheckTimeout")
+
+
+def check_residency_and_ttl_behavior() -> None:
+    from cockpit.screens.deploy import DeployScreen
+
+    # Truth table for DeployScreen._is_resident:
+    # 1. Group membership + ttl 0 -> True (Resident: never evicted, never idle-unloaded)
+    assert DeployScreen._is_resident({"id": "m1", "group": "always-on", "ttl": 0}) is True
+    # 2. Group membership + unspecified ttl -> True (Resident: defaults to 0 in llama-swap)
+    assert DeployScreen._is_resident({"id": "m2", "group": "always-on"}) is True
+    # 3. Group membership + positive ttl -> False (Swappable: idle-unloads after ttl seconds!)
+    assert DeployScreen._is_resident({"id": "m3", "group": "always-on", "ttl": 600}) is False
+    # 4. No group + ttl 0 -> False (Swappable: gets evicted whenever another model is requested)
+    assert DeployScreen._is_resident({"id": "m4", "ttl": 0}) is False
+    # 5. No group + positive ttl -> False (Swappable)
+    assert DeployScreen._is_resident({"id": "m5", "ttl": 600}) is False
+    # 6. No group + unspecified ttl -> False (Swappable)
+    assert DeployScreen._is_resident({"id": "m6"}) is False
+
+    # Check that grouped model with ttl > 0 gets an informative note on import
+    manifest = schema.load_manifest(_REPO_ROOT / "manifest.example.yaml")
+    host_profile = schema.load_host_profile(_REPO_ROOT / "hosts" / "example.yaml", manifest)
+    grouped_ttl_fixture = """
+healthCheckTimeout: 90
+models:
+  bge-grouped:
+    cmd: /srv/llm/builds/cuda/current/bin/llama-server --model /srv/llm/models/gguf/bge-m3-Q8_0.gguf --port ${PORT}
+    ttl: 600
+groups:
+  always-on:
+    members:
+      - bge-grouped
+"""
+    parsed = swap.parse_config_for_import(grouped_ttl_fixture, host_profile)
+    assert parsed.health_check_timeout == 90
+    m = parsed[0]
+    assert m["model"]["group"] == "always-on"
+    assert m["model"]["ttl"] == 600
+    assert any("idle-unloads after timeout" in n for n in m["notes"]), (
+        f"expected idle-unload note for grouped model with ttl 600, got notes: {m['notes']}"
+    )
+
+    print("  Residency truth table verified: group + ttl > 0 correctly routes to Swappable, and import note warns about idle unload")
 
 
 def main() -> None:
@@ -187,6 +238,7 @@ def main() -> None:
     check_args_roundtrip(results)
     check_validate_and_regenerate(results)
     check_self_reimport(results)
+    check_residency_and_ttl_behavior()
     print("Swap import verification PASSED.")
 
 

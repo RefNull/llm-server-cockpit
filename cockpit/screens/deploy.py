@@ -552,9 +552,9 @@ class EditModelModal(ModalScreen[dict | None]):
                     id="f-ttl",
                     value=("0" if m is None and self.resident_seed else "" if m is None or "ttl" not in m else str(m["ttl"])),
                 )
-                # Group membership is what makes a model resident (DeployScreen._is_resident):
+                # Group membership pairs with ttl 0 for true residency (DeployScreen._is_resident):
                 # every group is emitted persistent, so "Add Resident Model" seeds always-on.
-                yield Label("group (any group = resident, never evicted; blank = swappable)")
+                yield Label("group (resists eviction from other models; pair with ttl 0 for resident)")
                 yield Input(
                     id="f-group",
                     placeholder="",
@@ -925,11 +925,19 @@ class ImportModelsModal(ModalScreen[bool]):
         # model id -> the parser's full {"model", "notes", "status"} result.
         self._import_candidates: dict[str, dict[str, Any]] = {}
         self._import_selected: set[str] = set()
+        self.health_check_timeout: int | None = getattr(candidates, "health_check_timeout", None)
         self._load_candidates(candidates or [])
 
     def compose(self) -> ComposeResult:
         with Vertical(id="import-dialog"):
             yield Static("Import Models from Llama-Swap", id="import-title")
+            if self.health_check_timeout is not None:
+                current_gw = (self.host_profile or {}).get("network", {}).get("gateway", {}).get("health_check_timeout")
+                diff = f" (current host setting: {current_gw}s)" if current_gw != self.health_check_timeout else ""
+                yield Static(
+                    f"Config declares global healthCheckTimeout: {self.health_check_timeout}s{diff}",
+                    classes="form-hint",
+                )
             with VerticalScroll(id="import-scroll"):
                 table = SingleClickDataTable(
                     id="import-table", zebra_stripes=True, classes="data-table"
@@ -1077,9 +1085,20 @@ class ImportModelsModal(ModalScreen[bool]):
             error_widget.update(str(e))
             return
 
+        timeout_msg = ""
+        current_gw = (self.host_profile or {}).get("network", {}).get("gateway", {}).get("health_check_timeout")
+        host_name = getattr(self.app_ref, "host_name", None) if self.app_ref else None
+        update_timeout = (
+            self.health_check_timeout is not None
+            and self.health_check_timeout != current_gw
+            and host_name is not None
+        )
+        if update_timeout:
+            timeout_msg = f"\nAlso set gateway healthCheckTimeout to {self.health_check_timeout}s in hosts/{host_name}.yaml?"
+
         confirmed = await self.app.push_screen_wait(
             ConfirmModal(
-                f"Import {len(to_import)} model(s) into models.yaml?\n{', '.join(m['id'] for m in to_import)}",
+                f"Import {len(to_import)} model(s) into models.yaml?{timeout_msg}\n{', '.join(m['id'] for m in to_import)}",
                 confirm_label="Import",
                 danger=True,
             )
@@ -1090,6 +1109,19 @@ class ImportModelsModal(ModalScreen[bool]):
         target = self.repo_root / "models.yaml"
         target.write_text(yaml.safe_dump(validated, sort_keys=False), encoding="utf-8")
         self.app_ref.reload_models()
+
+        if update_timeout and host_name:
+            hp_path = self.repo_root / "hosts" / f"{host_name}.yaml"
+            if hp_path.exists():
+                try:
+                    hp_data = yaml.safe_load(hp_path.read_text(encoding="utf-8")) or {}
+                    hp_data.setdefault("network", {}).setdefault("gateway", {})["health_check_timeout"] = self.health_check_timeout
+                    hp_path.write_text(yaml.safe_dump(hp_data, sort_keys=False), encoding="utf-8")
+                    self.app_ref.reload_host_profile()
+                    self.host_profile = getattr(self.app_ref, "host_profile", self.host_profile)
+                except Exception as e:
+                    self.app.notify(f"could not update host profile timeout: {e}", severity="warning")
+
         self.app.notify(f"imported {len(to_import)} model(s)")
         self.dismiss(True)
 
@@ -1204,20 +1236,22 @@ class DeployScreen(CockpitScreenBase):
 
     @staticmethod
     def _is_resident(model: dict) -> bool:
-        """True when this model, once requested, stays in VRAM.
+        """True when this model, once loaded, stays in VRAM permanently.
 
-        Group membership only. swap.py::_generate_config emits every group as
-        `swap: false, exclusive: false, persistent: true` — upstream's "forever" group, which
-        no other load can evict. Ungrouped models land in llama-swap's default group
-        (swap: true, exclusive: true; v255 internal/config/config.go:295-305), so loading any
-        one of them evicts the previous one.
+        Requires BOTH:
+        1. Group membership (emitted as swap: false, exclusive: false, persistent: true),
+           preventing eviction when other models are loaded.
+        2. ttl == 0 (or unspecified, defaulting to 0 in llama-swap), preventing
+           automatic idle unloading.
 
-        `ttl: 0` is NOT residency, which is what this used to test: ttl only governs *idle*
-        unloading ("0 will mean never unload"). A ttl-0 model outside a group still gets
-        evicted by the next swap (v255 internal/router/group.go:84-96) — it belongs in the
-        Swappable table with "0 (no idle unload)" in its TTL column.
+        A model with ttl > 0 will idle-unload after its timeout even if grouped,
+        so it belongs in the Swappable table. An ungrouped model with ttl == 0
+        will still be evicted by the next swap, so it also belongs in Swappable.
         """
-        return bool(model.get("group"))
+        has_group = bool(model.get("group"))
+        ttl = model.get("ttl")
+        no_idle_unload = (ttl == 0 or ttl is None)
+        return has_group and no_idle_unload
 
     def action_open_swap_repo(self) -> None:
         self.app.open_url(self.manifest.get("llama_swap", {}).get("repo", "https://github.com/mostlygeek/llama-swap"))
@@ -1362,6 +1396,7 @@ class DeployScreen(CockpitScreenBase):
         )
         if imported:
             self.models = self.app_ref.models
+            self.host_profile = getattr(self.app_ref, "host_profile", self.host_profile)
             self._populate_table()
             self._set_status("imported models — models.yaml written")
 
