@@ -1,0 +1,95 @@
+# Genericized fixture mirroring a real llama-swap config.yaml (Phase 1,
+# plans/09-swap-import-and-python-engine.md). Paths point at /srv/llm and
+# /opt/services — deliberately NOT the importing host's own hosts/example.yaml paths
+# (prefix_root /opt/llm-server-cockpit/builds, models_dir /srv/models/gguf) — this is what a
+# real cross-host import looks like, and exercises the "binary path rewritten to prefix_root"
+# / "relocated from <dir>" notes that produces.
+
+healthCheckTimeout: 120
+
+models:
+  chat-main:
+    cmd: |
+      /srv/llm/builds/vulkan/current/bin/llama-server
+      --model /srv/llm/models/gguf/chat-main-Q4_K_M.gguf
+      --port ${PORT}
+      --ctx-size 262144
+      --cache-type-k q4_0
+      --cache-type-v q4_0
+      --jinja
+      --chat-template-kwargs '{"reasoning_effort":"medium","preserve_thinking":true}'
+      --flash-attn
+    env:
+      - "VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/intel_icd.x86_64.json"
+    ttl: 0
+
+  chat-vision:
+    cmd: |
+      /srv/llm/builds/cuda/current/bin/llama-server
+      --model /srv/llm/models/gguf/chat-vision-Q4_K_M.gguf
+      # --mmproj /srv/llm/models/gguf/mmproj-chat-vision.gguf
+      # ^ needed for vision; not downloaded yet
+      --port ${PORT}
+      --flash-attn
+    env:
+      - "CUDA_VISIBLE_DEVICES=0"
+    ttl: 0
+
+  embed-bge:
+    cmd: |
+      /srv/llm/builds/cuda/current/bin/llama-server
+      --model /srv/llm/models/gguf/bge-m3-Q8_0.gguf
+      --port ${PORT}
+      --embedding
+      --pooling cls
+    env:
+      - "CUDA_VISIBLE_DEVICES=0"
+    ttl: 0
+
+  rerank-qwen:
+    cmd: |
+      /srv/llm/builds/cuda/current/bin/llama-server
+      --model /srv/llm/models/gguf/qwen3-reranker-4b-Q4_K_M.gguf
+      --port ${PORT}
+      --reranking
+      --pooling rank
+      --embedding
+    env:
+      - "CUDA_VISIBLE_DEVICES=0"
+    ttl: 0
+
+  asr-python:
+    cmd: |
+      /opt/services/asr/.venv/bin/python
+      /opt/services/asr/asr_server.py
+      --port ${PORT}
+      --model Qwen3-ASR-0.6B
+      --device cuda
+    env:
+      - "CUDA_VISIBLE_DEVICES=0"
+    ttl: 0
+    healthCheckTimeout: 120
+    checkEndpoint: /health
+
+  tts-python:
+    cmd: |
+      /opt/services/tts/.venv/bin/python
+      /opt/services/tts/tts_server.py
+      --port ${PORT}
+    ttl: 0
+    healthCheckTimeout: 180
+    checkEndpoint: /health
+
+  # old-chat-superseded:
+  #   cmd: |
+  #     /srv/llm/builds/cuda/current/bin/llama-server
+  #     --model /srv/llm/models/gguf/old-chat-Q4_K_M.gguf
+  #     --port ${PORT}
+  #   ttl: 0
+
+groups:
+  always-on:
+    swap: false
+    members:
+      - embed-bge
+      - rerank-qwen

@@ -654,8 +654,8 @@ class ImportModelsModal(ModalScreen[bool]):
             if config_path.exists():
                 try:
                     content = config_path.read_text(encoding="utf-8")
-                    proposed = swap.parse_config_for_import(content)
-                    self._import_candidates = {m["id"]: m for m in proposed}
+                    proposed = swap.parse_config_for_import(content, self.host_profile)
+                    self._import_candidates = {r["model"]["id"]: r["model"] for r in proposed}
                 except Exception:
                     pass
         self._refresh_import_table()
@@ -704,7 +704,7 @@ class ImportModelsModal(ModalScreen[bool]):
         if text is None or not text.strip():
             return
         try:
-            proposed = swap.parse_config_for_import(text)
+            proposed = swap.parse_config_for_import(text, self.host_profile)
         except ValueError as e:
             self.query_one("#import-error", Static).update(f"parse failed: {e}")
             return
@@ -712,7 +712,7 @@ class ImportModelsModal(ModalScreen[bool]):
             self.query_one("#import-error", Static).update("no models found in pasted config.yaml")
             return
         self.query_one("#import-error", Static).update("")
-        self._import_candidates = {m["id"]: m for m in proposed}
+        self._import_candidates = {r["model"]["id"]: r["model"] for r in proposed}
         self._import_selected = set()
         self._refresh_import_table()
 

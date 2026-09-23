@@ -64,6 +64,10 @@ below, never mixed into the routing above.
   ```bash
   .venv/bin/python smoke/verify_rendered_units.py
   ```
+- **llama-swap config.yaml import verification** (parse a fixture config into models.yaml entries, classify llama-cpp/python/unmanaged, validate and regenerate):
+  ```bash
+  .venv/bin/python smoke/verify_swap_import.py
+  ```
 - **GPU fan-ramp non-regression** (launch must not wake any GPU):
   ```bash
   .venv/bin/python smoke/verify_no_gpu_wake.py

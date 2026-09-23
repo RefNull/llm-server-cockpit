@@ -198,11 +198,19 @@ def _build_model_entry(model: dict[str, Any], host_profile: dict[str, Any]) -> d
         # round-trips fine: llama-swap's macro substitution is a plain text replace over the
         # whole string, quoted or not, before the shell ever sees it.
         entry: dict[str, Any] = {"cmd": " ".join(shlex.quote(p) for p in parts)}
+    elif model["engine"] == "python":
+        parts = [model["python"], model["script"], *model.get("args", [])]
+        # Same quoting convention as the llama-cpp branch above (and for the same reason:
+        # cmd is not run through a shell — SanitizeCommand shlex.splits it, so a
+        # shlex.quote'd token round-trips whether or not it actually needed quoting).
+        entry = {"cmd": " ".join(shlex.quote(p) for p in parts)}
     else:  # unmanaged
         entry = {"cmd": model["cmd"]}
 
     if model.get("env"):
         entry["env"] = list(model["env"])
+    if model.get("check_endpoint"):
+        entry["checkEndpoint"] = model["check_endpoint"]
     # Only written when models.yaml actually specifies it. `ttl` is optional in this repo's
     # schema, and it was defaulted to 0 here — but upstream llama-swap documents "a ttl of 0
     # will mean never unload", with its own default being "-1 (use global default)". So an
@@ -214,16 +222,117 @@ def _build_model_entry(model: dict[str, Any], host_profile: dict[str, Any]) -> d
     return entry
 
 
-def parse_config_for_import(yaml_text: str) -> list[dict[str, Any]]:
-    """Best-effort reverse of _generate_config(), for the cockpit's Models tab "Import from
-    config.yaml" shortcut. Every entry comes back as engine: "unmanaged" with its cmd preserved
-    verbatim, never as a reconstructed engine: "llama-cpp" entry — a llama-swap config's cmd
-    string never carries the repo_id a real llama-cpp models.yaml entry requires (repo_id only
-    matters at download time; by the time a model is running, the served file is already local
-    and nothing in the command line says what Hugging Face repo it came from), so a confident
-    llama-cpp/GPU reconstruction from this alone isn't possible. The operator reviews every
-    proposed entry before anything is merged (see deploy.py) and can hand-convert one to
-    engine: "llama-cpp" afterward if they want that, using the imported cmd as a reference."""
+_KNOWN_PER_MODEL_KEYS = frozenset({"cmd", "env", "ttl", "checkEndpoint", "healthCheckTimeout"})
+_PYTHON_BASENAME_RE = re.compile(r"^python3?(\.\d+)?$")
+_BACKEND_DIR_RE = re.compile(r"/([^/]+)/current/bin/llama-server$")
+
+
+def _collect_group_members(groups: Any, group_of: dict[str, str]) -> None:
+    for group_name, group in (groups or {}).items():
+        if not isinstance(group, dict):
+            continue
+        for member_id in group.get("members", []) or []:
+            group_of[member_id] = group_name
+
+
+def _sanitize_cmd(raw_cmd: str, notes: list[str]) -> list[str]:
+    """Mirror llama-swap v255's SanitizeCommand (internal/config/commands.go:11-45) exactly:
+    drop lines whose stripped text starts with '#', turn a trailing '\\' into a space, then
+    shlex.split (POSIX) the result. `cmd` is never run through a shell (§0e) — this must match
+    that mechanism, not approximate it."""
+    lines = raw_cmd.splitlines()
+    kept: list[str] = []
+    dropped: list[str] = []
+    for line in lines:
+        if line.strip().startswith("#"):
+            dropped.append(line.strip())
+        else:
+            trimmed = line.strip()
+            kept.append(trimmed[:-1] + " " if trimmed.endswith("\\") else line)
+    if dropped:
+        mmproj_lines = [d for d in dropped if "--mmproj" in d]
+        note = f"{len(dropped)} comment line(s) dropped"
+        if mmproj_lines:
+            note += f" ({'; '.join(mmproj_lines)})"
+        notes.append(note)
+    return shlex.split("\n".join(kept))
+
+
+def _classify_llama_cpp(
+    argv: list[str], host_profile: dict[str, Any], notes: list[str]
+) -> tuple[dict[str, Any], str]:
+    prefix_root = host_profile["paths"]["prefix_root"]
+    models_dir = host_profile["paths"]["models_dir"]
+    status = "ok"
+
+    prog = argv[0]
+    m = _BACKEND_DIR_RE.search(prog)
+    backend: str | None = None
+    if m is None:
+        status = "review"
+        notes.append("could not determine backend from binary path (expected .../<backend>/current/bin/llama-server)")
+    else:
+        backend = m.group(1)
+        if not prog.startswith(prefix_root):
+            notes.append("binary path rewritten to prefix_root")
+
+    gpu: str | None = None
+    if backend is not None:
+        matches = sorted(g["id"] for g in host_profile.get("gpus", []) if backend in g.get("backends", []))
+        if len(matches) == 1:
+            gpu = matches[0]
+        else:
+            status = "review"
+            if not matches:
+                notes.append(f"no host GPU has backend {backend!r}")
+            else:
+                notes.append(f"backend {backend!r} matches multiple GPUs: {', '.join(matches)}")
+
+    model: dict[str, Any] = {"engine": "llama-cpp", "repo_id": "local"}
+    llama_server_args: list[str] = []
+    quant_file: str | None = None
+    i = 1
+    while i < len(argv):
+        tok = argv[i]
+        if tok in ("--model", "--mmproj") and i + 1 < len(argv):
+            p = argv[i + 1]
+            basename = p.rsplit("/", 1)[-1]
+            dirname = p.rsplit("/", 1)[0] if "/" in p else ""
+            if dirname and dirname != models_dir:
+                notes.append(f"relocated from {dirname}")
+            if tok == "--model":
+                quant_file = basename
+            else:
+                model["mmproj_file"] = basename
+            i += 2
+            continue
+        if tok == "--port" and i + 1 < len(argv):
+            i += 2
+            continue
+        llama_server_args.append(tok)
+        i += 1
+
+    if quant_file is None:
+        status = "review"
+        notes.append("no --model argument found")
+    else:
+        model["quant_file"] = quant_file
+    if backend is not None and gpu is not None:
+        model["bind"] = {"gpu": gpu, "backend": backend}
+    if llama_server_args:
+        model["llama_server_args"] = llama_server_args
+    return model, status
+
+
+def parse_config_for_import(yaml_text: str, host_profile: dict[str, Any]) -> list[dict[str, Any]]:
+    """Reverse of _generate_config(), for the cockpit's Models tab "Import from config.yaml"
+    shortcut. Each result is `{"model": <models.yaml entry>, "notes": [...], "status": "ok" |
+    "review"}` — the operator reviews (and can edit) every proposed entry before anything is
+    merged (see deploy.py); nothing here is written to disk.
+
+    Classification is by argv[0]'s basename after `_sanitize_cmd` (llama-server -> llama-cpp,
+    python/python3/python3.N -> python, anything else -> unmanaged, cmd reconstructed).
+    Never stats a path — the cockpit may run off the host the config came from."""
     try:
         data = yaml.safe_load(yaml_text) or {}
     except yaml.YAMLError as e:
@@ -232,27 +341,72 @@ def parse_config_for_import(yaml_text: str) -> list[dict[str, Any]]:
         raise ValueError("expected a top-level 'models' mapping (a llama-swap config.yaml)")
 
     group_of: dict[str, str] = {}
-    for group_name, group in (data.get("groups") or {}).items():
-        if not isinstance(group, dict):
-            continue
-        for member_id in group.get("members", []) or []:
-            group_of[member_id] = group_name
+    _collect_group_members(data.get("groups"), group_of)
+    routing_groups = (((data.get("routing") or {}).get("router") or {}).get("settings") or {}).get("groups")
+    _collect_group_members(routing_groups, group_of)
 
-    proposed: list[dict[str, Any]] = []
+    results: list[dict[str, Any]] = []
     for model_id, entry in data["models"].items():
         if not isinstance(entry, dict) or "cmd" not in entry:
             continue
-        model: dict[str, Any] = {"id": model_id, "engine": "unmanaged", "cmd": entry["cmd"]}
+        notes: list[str] = []
+        status = "ok"
+        try:
+            argv = _sanitize_cmd(entry["cmd"], notes)
+        except ValueError as e:
+            # One malformed entry (unbalanced quote) must not abort the whole import.
+            argv = None
+            status = "review"
+            notes.append(f"cmd does not tokenize ({e}) — kept verbatim")
+            model = {"engine": "unmanaged", "cmd": entry["cmd"]}
+
+        if argv is None:
+            pass
+        elif not argv:
+            status = "review"
+            notes.append("empty command after stripping comments")
+            model: dict[str, Any] = {"engine": "unmanaged", "cmd": ""}
+        else:
+            base = argv[0].rsplit("/", 1)[-1]
+            if base == "llama-server":
+                model, engine_status = _classify_llama_cpp(argv, host_profile, notes)
+                if engine_status == "review":
+                    status = "review"
+            elif _PYTHON_BASENAME_RE.match(base):
+                if len(argv) < 2:
+                    status = "review"
+                    notes.append("python interpreter with no script argument")
+                    model = {"engine": "unmanaged", "cmd": shlex.join(argv)}
+                else:
+                    model = {"engine": "python", "python": argv[0], "script": argv[1]}
+                    if argv[2:]:
+                        model["args"] = argv[2:]
+            else:
+                model = {"engine": "unmanaged", "cmd": shlex.join(argv)}
+
+        model = {"id": model_id, **model}
+
         if entry.get("env"):
             model["env"] = list(entry["env"])
         # `in`, not truthiness: ttl 0 is meaningful ("never unload"), so a falsy check dropped
         # exactly the setting an operator was most deliberate about when importing a config.
         if "ttl" in entry:
             model["ttl"] = entry["ttl"]
+        if "checkEndpoint" in entry:
+            model["check_endpoint"] = entry["checkEndpoint"]
+        if "healthCheckTimeout" in entry:
+            notes.append(
+                f"healthCheckTimeout {entry['healthCheckTimeout']} dropped — llama-swap only "
+                "supports it globally (Settings > gateway)"
+            )
         if model_id in group_of:
             model["group"] = group_of[model_id]
-        proposed.append(model)
-    return proposed
+        for key in entry:
+            if key not in _KNOWN_PER_MODEL_KEYS:
+                notes.append(f"unsupported key {key!r} dropped")
+
+        results.append({"model": model, "notes": notes, "status": status})
+    return results
 
 
 def _generate_config(host_profile: dict[str, Any], models: dict[str, Any]) -> str:

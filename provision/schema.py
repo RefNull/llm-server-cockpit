@@ -169,10 +169,16 @@ def validate_models_dict(data: dict, host_profile: dict, manifest: dict, source:
                     f"{source}: model {mid!r} uses backend {backend!r} not defined in manifest.yaml "
                     f"(manifest defines: {sorted(known_backends)})"
                 )
+        elif engine == "python":
+            _require(m, ["python", "script"], f"{source}.models[{i}] ({mid})")
+            if "args" in m:
+                args = m["args"]
+                if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+                    raise ValidationError(f"{source}.models[{i}] ({mid}).args: must be a list of strings")
         elif engine == "unmanaged":
             _require(m, ["cmd"], f"{source}.models[{i}] ({mid})")
         else:
-            raise ValidationError(f"{source}.models[{i}] ({mid}): unknown engine {engine!r} (allowed: 'llama-cpp', 'unmanaged')")
+            raise ValidationError(f"{source}.models[{i}] ({mid}): unknown engine {engine!r} (allowed: 'llama-cpp', 'python', 'unmanaged')")
 
         # env is passed straight through to llama-swap's env: (provision/steps/swap.py
         # _build_model_entry) as a list of "KEY=VALUE" strings — a dict passes no check here
@@ -182,6 +188,15 @@ def validate_models_dict(data: dict, host_profile: dict, manifest: dict, source:
             if not isinstance(env, list) or not all(isinstance(e, str) and "=" in e for e in env):
                 raise ValidationError(
                     f"{source}.models[{i}] ({mid}).env: must be a list of 'KEY=VALUE' strings"
+                )
+
+        # check_endpoint applies to every engine (emitted as llama-swap's checkEndpoint,
+        # provision/steps/swap.py _build_model_entry) — upstream expects a path, not a URL.
+        if "check_endpoint" in m:
+            check_endpoint = m["check_endpoint"]
+            if not isinstance(check_endpoint, str) or not check_endpoint.startswith("/"):
+                raise ValidationError(
+                    f"{source}.models[{i}] ({mid}).check_endpoint: must be a string starting with '/'"
                 )
 
     return data

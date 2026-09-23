@@ -91,3 +91,23 @@ models:
       -v /srv/models/speaches-cache:/home/ubuntu/.cache/huggingface/hub
       speaches-ai/speaches:latest-cuda
     group: always-on
+
+  # engine: "python" — a Python venv script run as a llama-swap route: started on demand on
+  # ${PORT}, health-checked, swappable/groupable — not a permanent systemd unit (that is the
+  # Scripts tab; see AGENTS.md and plans/09-swap-import-and-python-engine.md §0h for why the
+  # two are not interchangeable).
+  - id: asr-server
+    engine: python
+    python: /srv/services/asr/.venv/bin/python
+    script: /srv/services/asr/asr_server.py
+    args:
+      - "--port"
+      - "${PORT}"
+      - "--model"
+      - "Qwen3-ASR-0.6B"
+      - "--device"
+      - "cuda"
+    check_endpoint: /health
+    env:
+      - "CUDA_VISIBLE_DEVICES=0"
+    group: always-on
