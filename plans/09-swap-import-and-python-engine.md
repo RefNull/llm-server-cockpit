@@ -1,5 +1,7 @@
 # Plan: Deploy tab — real config import, a Python engine, and a form that works
 
+**Status: Phases 1–4 done** (`c083534`, `9f28073`, `0a76e39`). Phase 5 item 6 (live host) open.
+
 Baseline: HEAD `e62b2e8`. Source: operator, 2026-09-23, before first live llama-swap tests.
 Reference config: the operator's own llama-swap `config.yaml` (4 × llama-server, 2 × Python
 venv scripts, one `always-on` group). It is private and not in the repo — Phase 1 turns its
@@ -122,8 +124,10 @@ the two will be confused.
 ### 0i. Allowed APIs (use these, invent nothing)
 
 - Textual (pinned in `requirements.txt`): `DataTable`, `Select`, `Input`, `TextArea`,
-  `ModalScreen[T]`, `push_screen_wait`, `Select.BLANK` (is `False` — never pass it to a
-  constructor, see `deploy.py:333-336`).
+  `ModalScreen[T]`, `push_screen_wait`. **Correction found in Phase 4:** an unset `Select`
+  holds `Select.NULL` (truthy); `Select.BLANK` is `Widget.BLANK` (`False`) and never equals
+  a Select's value. Compare against `Select.NULL`. Fixed in `deploy.py` (`0a76e39`); still
+  wrong in `builds.py` and `settings.py`.
 - Repo: `SingleClickDataTable`, `TableAction`, `add_action_column`, `action_cells`,
   `selection_marker` (`cockpit/widgets.py`); `ConfirmModal`, `InfoModal`.
 - `schema.validate_models_dict(data, host_profile, manifest, source=)` — the only validator.
