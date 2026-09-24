@@ -140,7 +140,7 @@ class ExamplesModal(ModalScreen[str | None]):
         ("Context window", "--ctx-size 262144"),
         ("KV cache K type", "--cache-type-k q4_0"),
         ("KV cache V type", "--cache-type-v q4_0"),
-        ("Flash attention", "--flash-attn"),
+        ("Flash attention", "--flash-attn on"),
         ("Jinja chat template", "--jinja"),
         ("Chat template kwargs", '--chat-template-kwargs \'{"reasoning_effort":"medium","preserve_thinking":true}\''),
         ("Reasoning budget", "--reasoning-budget 5000"),
@@ -154,7 +154,7 @@ class ExamplesModal(ModalScreen[str | None]):
         ("Pooling (reranker)", "--pooling rank"),
     ]
     ENV_EXAMPLES: list[tuple[str, str]] = [
-        ("Intel Vulkan ICD", "VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/intel_icd.x86_64.json"),
+        ("Intel Vulkan ICD", "VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/intel_icd.json"),
         ("Pin CUDA device", "CUDA_VISIBLE_DEVICES=0"),
     ]
 

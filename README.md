@@ -249,8 +249,9 @@ models:
       - "--cache-type-k"
       - "q4_0"
       - "--flash-attn"
+      - "on"
     env:
-      - "VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/intel_icd.x86_64.json"
+      - "VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/intel_icd.json"
     ttl: 0
 
   # Unmanaged Docker container service
