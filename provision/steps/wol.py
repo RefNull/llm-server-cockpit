@@ -94,19 +94,10 @@ def list_interfaces() -> list[dict[str, str]]:
     return interfaces
 
 
-def _read_wake_flags(iface: str, ethtool_path: str | None = None) -> str | None:
-    """Read ethtool's Wake-on flags for `iface`.
-
-    `ethtool_path` lets a caller that already resolved the binary (run(), to guarantee the
-    same absolute path used for a subsequent mutation) reuse that resolution; status() has no
-    mutation to keep consistent with, so it resolves fresh each call.
-    """
-    if ethtool_path is None:
-        ethtool_path = _resolve_tool("ethtool")  # often not preinstalled on minimal Debian images
-    if ethtool_path is None:
-        return None
+def _run_ethtool_wake(ethtool_path: str, iface: str, sudo_path: str | None = None) -> str | None:
+    cmd = [sudo_path, "-n", ethtool_path, iface] if sudo_path else [ethtool_path, iface]
     result = subprocess.run(
-        [ethtool_path, iface],
+        cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -116,6 +107,39 @@ def _read_wake_flags(iface: str, ethtool_path: str | None = None) -> str | None:
         return None
     m = re.search(r"Wake-on:\s*(\S+)", result.stdout)
     return m.group(1) if m else None
+
+
+def _read_wake_flags(iface: str, ethtool_path: str | None = None) -> str | None:
+    """Read ethtool's Wake-on flags for `iface`.
+
+    `ethtool_path` lets a caller that already resolved the binary (run(), to guarantee the
+    same absolute path used for a subsequent mutation) reuse that resolution; status() has no
+    mutation to keep consistent with, so it resolves fresh each call.
+
+    Modern ethtool (6.x, observed on this project's own dev host) queries Wake-on-LAN state
+    over netlink instead of the old ioctl, and the kernel restricts that query to
+    CAP_NET_ADMIN — it can carry the SecureOn password. An unprivileged read still exits 0 and
+    prints every other field, it just silently omits the whole "Wake-on:" line, which is
+    indistinguishable here from "this driver doesn't report it" except by retrying elevated.
+    So on a plain miss, retry once via `sudo -n`: instant and silent if a credential is already
+    cached — which it always is by the time run() reaches here, since the cockpit's
+    `requires_root=True` confirm (cockpit.widgets.acquire_sudo) runs `sudo -v` before calling
+    wol.run() at all — and an equally-fast no-op if it isn't (no interactive prompt gets
+    spawned from inside the TUI, same convention as Runner._elevate). No Runner is threaded
+    through for this: dry-run must not suppress a read, and the sudo ticket is process-global
+    state, not something a caller needs to hand in.
+    """
+    if ethtool_path is None:
+        ethtool_path = _resolve_tool("ethtool")  # often not preinstalled on minimal Debian images
+    if ethtool_path is None:
+        return None
+    flags = _run_ethtool_wake(ethtool_path, iface)
+    if flags is not None:
+        return flags
+    sudo_path = shutil.which("sudo")
+    if sudo_path is None:
+        return None
+    return _run_ethtool_wake(ethtool_path, iface, sudo_path=sudo_path)
 
 
 def _is_enabled(unit: str) -> bool:
@@ -384,7 +408,12 @@ def run(host_profile: dict[str, Any], manifest: dict[str, Any], models: dict[str
         sys.exit(f"wol: ethtool not found in {_SBIN_DIRS} or PATH — cannot verify or arm {iface!r}. Nothing has been changed.")
     wake_flags_before = _read_wake_flags(iface, ethtool_path)
     if wake_flags_before is None:
-        sys.exit(f"wol: ethtool found at {ethtool_path} but reading Wake-on-LAN state for {iface!r} failed. Nothing has been changed.")
+        sys.exit(
+            f"wol: ethtool found at {ethtool_path} but reading Wake-on-LAN state for {iface!r} failed, "
+            "even retried via `sudo -n` (modern ethtool needs CAP_NET_ADMIN just to read WoL state, "
+            f"not only to set it). Run `sudo ethtool {iface}` by hand and check its output for the "
+            "real cause. Nothing has been changed."
+        )
 
     tlp_mutated = _fix_tlp(iface, runner)
     nm_mutated = _arm_networkmanager(iface, runner)
