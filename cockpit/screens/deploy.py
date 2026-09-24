@@ -378,17 +378,12 @@ class EditModelModal(ModalScreen[dict | None]):
         editing_id: str | None,
         repo_root: Path,
         app_ref: Any,
-        pinned: bool = False,
         staged: dict | None = None,
         staged_notes: list[str] | None = None,
         staged_sibling_ids: frozenset[str] = frozenset(),
         files_on_disk: list[str] | None = None,
     ) -> None:
         super().__init__()
-        # Seeds the ttl field for a NEW binding: 0 is "never unload" (upstream llama-swap), so
-        # "Add Pinned Model" prefills 0 and "Add Swappable" leaves it blank, which means
-        # llama-swap's own default. Editing never re-seeds — the stored value wins.
-        self.pinned_seed = pinned
         self.host_profile = host_profile
         self.manifest = manifest
         self.models = models
@@ -571,21 +566,15 @@ class EditModelModal(ModalScreen[dict | None]):
                     )
 
                 yield Label("ttl (idle seconds before unload; 0 = never, blank = llama-swap default)")
-                # Blank for a new binding, not "0": 0 means never unload, so defaulting the
-                # box to it would make every model created here pinned. Only an explicit ttl
-                # already in models.yaml is prefilled.
-                yield Input(
-                    id="f-ttl",
-                    value=("0" if m is None and self.pinned_seed else "" if m is None or "ttl" not in m else str(m["ttl"])),
-                )
-                # Group membership pairs with ttl 0 for a true pin (DeployScreen._is_pinned):
-                # every group is emitted persistent, so "Add Pinned Model" seeds always-on.
+                # Blank for a new binding, not "0": 0 means never unload (llama-swap docs), so
+                # defaulting the box to it would pin every new model in VRAM. Only an explicit
+                # ttl already in models.yaml is prefilled. No pinned-seed convenience any more
+                # (plans/11 Decision 3) — one "Add Model" button, ordinary blank field.
+                yield Input(id="f-ttl", value=("" if m is None or "ttl" not in m else str(m["ttl"])))
+                # Group membership pairs with ttl 0 for a true pin (never evicted at all, not
+                # just never idle-unloaded) — see the TTL column's comment in DeployScreen.
                 yield Label("group (resists eviction from other models; pair with ttl 0 to pin)")
-                yield Input(
-                    id="f-group",
-                    placeholder="",
-                    value=("always-on" if m is None and self.pinned_seed else m.get("group", "") if m else ""),
-                )
+                yield Input(id="f-group", placeholder="", value=(m.get("group", "") if m else ""))
 
                 yield Label("check endpoint (optional; path only, e.g. /health)")
                 yield Input(
@@ -1246,35 +1235,14 @@ class DeployScreen(CockpitScreenBase):
 
     def compose(self) -> ComposeResult:
         with VerticalScroll():
-            # Split by what each row costs at rest, which is the question an operator actually
-            # has about a model catalogue: "what is pinned in my VRAM right now?" Both tables
-            # carry identical columns and actions — the split is the information.
-            # Shown only when llama-swap is absent: every row in both tables is a route it
-            # serves, so without it this whole tab describes something that cannot run.
+            # Shown only when llama-swap is absent: every row below is a route it serves, so
+            # without it this whole tab describes something that cannot run.
             yield Static("", id="swap-missing", classes="error-text")
 
-            # Both tables below are llama-swap routes — every model here is started, health
-            # checked, and (for Swappable) evicted BY llama-swap. "Pinned" replaces what this
-            # screen used to call "Resident": that word is reserved for a not-yet-built
-            # direct-launch table (a model run by the cockpit's own systemd unit, no
-            # llama-swap in front — see plans/10-direct-launch-inventory.md), so it no longer
-            # doubles as "pinned within llama-swap" here.
-            yield Static(
-                "Both tables run under llama-swap — pinned (never unloaded) vs. swappable "
-                "(evicted on demand or idle). A direct, non-llama-swap launch path isn't "
-                "built yet.",
-                classes="subtitle",
-            )
-
-            yield Static("Pinned (llama-swap, never unloaded)", classes="section-title")
-            yield SingleClickDataTable(id="models-pinned", classes="data-table")
+            yield Static("Models (llama-swap)", classes="section-title")
+            yield SingleClickDataTable(id="models-swap", classes="data-table")
             with Horizontal(classes="action-row-secondary"):
-                yield Button("Add Pinned Model", id="btn-add-pinned", classes="thin-button")
-
-            yield Static("Swappable (evicted when another model loads, or after ttl idle)", classes="section-title")
-            yield SingleClickDataTable(id="models-swappable", classes="data-table")
-            with Horizontal(classes="action-row-secondary"):
-                yield Button("Add Swappable Model", id="btn-add-swappable", classes="thin-button")
+                yield Button("Add Model", id="btn-add-model", classes="thin-button")
 
             with Horizontal(classes="action-row-primary"):
                 yield Button("Apply & Restart llama-swap", id="btn-apply", variant="primary", classes="thin-button")
@@ -1284,19 +1252,30 @@ class DeployScreen(CockpitScreenBase):
             yield Static("", id="status-message", classes="status-text")
 
     def on_mount(self) -> None:
-        # The two tables carry different columns now. Pinned drops TTL — it is 0 or group
-        # membership by definition — to pay for the Start/Stop toggle; Swappable keeps TTL
-        # because there the number is the whole point. Budgets: 96 + 2*8 = 112 and
-        # 97 + 2*8 = 113, both inside 115 (DESIGN.md §4).
-        pinned = self.query_one("#models-pinned", SingleClickDataTable)
-        pinned.cursor_type = "row"
-        pinned.add_column("ID", width=22)
-        pinned.add_column("Engine", width=10)
-        pinned.add_column("GPU", width=9)
-        pinned.add_column("Backend", width=9)
-        pinned.add_column("Group", width=10)
-        pinned.add_column("Status", width=9)
-        pinned.add_action_column(
+        # One table, one column set (plans/11 — collapses the old Pinned/Swappable split;
+        # "pinned" is now just a model with ttl: 0 shown plainly in the TTL column, not a
+        # second table). Adding both the TTL column AND the run action column (the old
+        # Pinned table had run but no TTL; Swappable had TTL but no run) pushes past
+        # DESIGN.md §4's 115-cell budget at the old per-column widths, so several columns are
+        # trimmed to their actual content: ID to the longest real id seen so far
+        # (qwen3-reranker-4b, 17 chars) + 1, TTL to a few digits (llama-swap ttl values are
+        # seconds, not the kind of number that needs more than 5-6), Engine/Group to their
+        # longest real value (llama-cpp/unmanaged, always-on) + 0. GPU/Backend/Status
+        # untouched, same as before this plan. 18+9+9+8+9+6+9 = 68 data + 27 action = 95,
+        # +2*10 = 115 exactly — verified by smoke/verify_screens.py's own budget check.
+        table = self.query_one("#models-swap", SingleClickDataTable)
+        table.cursor_type = "row"
+        table.add_column("ID", width=18)
+        table.add_column("Engine", width=9)
+        table.add_column("GPU", width=9)
+        table.add_column("Backend", width=8)
+        table.add_column("Group", width=9)
+        table.add_column("TTL", width=6)
+        table.add_column("Status", width=9)
+        # Available on every row, not just a formerly-"Pinned" subset: swap.load_model/
+        # unload_model never checked pinned status — Start/Stop was only ever missing here
+        # because Swappable used to be a separate table with its own column set.
+        table.add_action_column(
             TableAction(
                 "run",
                 lambda mid: "Stop" if self._running_models.get(mid) else "Start",
@@ -1304,44 +1283,11 @@ class DeployScreen(CockpitScreenBase):
                 confirm="{action} {row}?",
             )
         )
-        pinned.add_action_column(TableAction("edit", "Edit"))
-        pinned.add_action_column(
-            TableAction("delete", "Delete", destructive=True, confirm="Delete model {row} from models.yaml?")
-        )
-
-        swappable = self.query_one("#models-swappable", SingleClickDataTable)
-        swappable.cursor_type = "row"
-        swappable.add_column("ID", width=22)
-        swappable.add_column("Engine", width=10)
-        swappable.add_column("GPU", width=9)
-        swappable.add_column("Backend", width=9)
-        swappable.add_column("Group", width=10)
-        swappable.add_column("TTL", width=10)
-        swappable.add_column("Status", width=9)
-        swappable.add_action_column(TableAction("edit", "Edit"))
-        swappable.add_action_column(
+        table.add_action_column(TableAction("edit", "Edit"))
+        table.add_action_column(
             TableAction("delete", "Delete", destructive=True, confirm="Delete model {row} from models.yaml?")
         )
         self._populate_table()
-
-    @staticmethod
-    def _is_pinned(model: dict) -> bool:
-        """True when this model, once loaded, stays in VRAM permanently.
-
-        Requires BOTH:
-        1. Group membership (emitted as swap: false, exclusive: false, persistent: true),
-           preventing eviction when other models are loaded.
-        2. ttl == 0 (or unspecified, defaulting to 0 in llama-swap), preventing
-           automatic idle unloading.
-
-        A model with ttl > 0 will idle-unload after its timeout even if grouped,
-        so it belongs in the Swappable table. An ungrouped model with ttl == 0
-        will still be evicted by the next swap, so it also belongs in Swappable.
-        """
-        has_group = bool(model.get("group"))
-        ttl = model.get("ttl")
-        no_idle_unload = (ttl == 0 or ttl is None)
-        return has_group and no_idle_unload
 
     def action_open_swap_repo(self) -> None:
         self.app.open_url(self.manifest.get("llama_swap", {}).get("repo", "https://github.com/mostlygeek/llama-swap"))
@@ -1366,13 +1312,9 @@ class DeployScreen(CockpitScreenBase):
 
     def _populate_table(self) -> None:
         self._refresh_swap_notice()
-        pinned = self.query_one("#models-pinned", SingleClickDataTable)
-        swappable = self.query_one("#models-swappable", SingleClickDataTable)
-        pinned.clear()
-        swappable.clear()
+        table = self.query_one("#models-swap", SingleClickDataTable)
+        table.clear()
         for m in self.models.get("models", []):
-            is_pinned = self._is_pinned(m)
-            table = pinned if is_pinned else swappable
             if m["engine"] == "llama-cpp":
                 gpu = m.get("bind", {}).get("gpu", "")
                 backend = m.get("bind", {}).get("backend", "")
@@ -1389,14 +1331,11 @@ class DeployScreen(CockpitScreenBase):
                 Text(gpu),
                 Text(backend),
                 Text(m.get("group", "")),
-                *(
-                    (status_cell,)
-                    if is_pinned
-                    else (
-                        Text("never" if m.get("ttl") == 0 else str(m.get("ttl", "default"))),
-                        status_cell,
-                    )
-                ),
+                # Literal configured value (plans/11 Decision 2) — no "never"/"default"
+                # euphemism: ttl 0 means never idle-unloads, but only permanent-VRAM if the
+                # model is also in a persistent group, which the Group column already shows.
+                Text(str(m["ttl"]) if "ttl" in m else ""),
+                status_cell,
                 *table.action_cells(m["id"]),
                 key=m["id"],
             )
@@ -1416,7 +1355,7 @@ class DeployScreen(CockpitScreenBase):
     # -- Actions ---------------------------------------------------------------
 
     @work
-    async def _on_add_model(self, pinned: bool = False) -> None:
+    async def _on_add_model(self) -> None:
         saved = await self.app.push_screen_wait(
             EditModelModal(
                 host_profile=self.host_profile,
@@ -1425,7 +1364,6 @@ class DeployScreen(CockpitScreenBase):
                 editing_id=None,
                 repo_root=self.repo_root,
                 app_ref=self.app_ref,
-                pinned=pinned,
             )
         )
         if saved:
@@ -1579,10 +1517,8 @@ class DeployScreen(CockpitScreenBase):
         bid = event.button.id
         if bid == "btn-apply":
             self._confirm_and_apply()
-        elif bid in ("btn-add-pinned", "btn-add-swappable"):
-            # Which button was pressed seeds the new binding's residency, so "Add" under a
-            # table puts the model in that table rather than wherever the ttl default lands.
-            self._on_add_model(pinned=bid == "btn-add-pinned")
+        elif bid == "btn-add-model":
+            self._on_add_model()
         elif bid == "btn-import-toggle":
             self._on_import_toggle()
         elif bid == "btn-preview-yaml":

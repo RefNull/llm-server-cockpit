@@ -1,4 +1,4 @@
-# Plan: a third Deploy table for models launched directly, not via llama-swap
+# Plan: a second Deploy table for models launched directly, not via llama-swap
 
 Baseline: HEAD `e584c34`. Source: operator, 2026-09-23 — clarifying what "Resident" was
 supposed to mean: *"the first table is models that we load via directly calling for
@@ -7,8 +7,11 @@ example llama.cpp or ollama or whatever (this is not built)."*
 `plans/09`'s "Resident" table was renamed to **Pinned** (`e584c34`) precisely to free this
 word: the table this plan describes is what "Resident" should mean going forward — a model
 process the cockpit itself starts and supervises, with **no llama-swap in front of it at
-all**. Both existing Deploy tables (Pinned, Swappable) stay exactly as they are; this is a
-third one, fed by a model that was never in `models.yaml`.
+all**. **Superseded by `plans/11-single-swap-table.md`**: the operator's actual intent
+(2026-09-24) was one llama-swap table (Pinned/Swappable merged, TTL shown as an ordinary
+column) with this direct-launch table placed *above* it — not a third table alongside two
+existing ones. `plans/11` must land before this one is implemented; nothing else here
+changes because of that (Decisions 1-3 are independent of table count).
 
 **This plan is scoping only.** Nothing here is implemented. Phase 0's open decision must be
 confirmed with the operator before Phase 1 starts.
@@ -67,8 +70,8 @@ invisible to it. Two independent supervisors can schedule two models onto one GP
 neither aware of the other, and this repo cannot poll VRAM to catch it (that rule is
 load-bearing, not a gap to route around here). The only honest mitigation available is a
 **declared, static reservation** — the operator says "this GPU is spoken for by a direct
-launch," and the Deploy tab's `bind.gpu` picker for *both* other tables refuses that GPU
-(or warns) while the reservation stands. This needs a decision, not an assumption (Decision
+launch," and the Deploy tab's `bind.gpu` picker on the llama-swap table (`plans/11`) refuses
+that GPU (or warns) while the reservation stands. This needs a decision, not an assumption (Decision
 3 below).
 
 ### 0d. Allowed APIs / patterns to copy, not reinvent
@@ -85,7 +88,7 @@ launch," and the Deploy tab's `bind.gpu` picker for *both* other tables refuses 
   check today) vs `validate_models_dict` (has one, via `host_profile`/`manifest` — a direct
   entry needs the latter's shape, not the former's).
 - Table/tab pattern: `cockpit/DESIGN.md` Archetype B (Table-Driven Inventory) — this is
-  exactly that archetype a third time, not a new one.
+  exactly that archetype again, not a new one.
 
 ---
 
@@ -95,8 +98,9 @@ launch," and the Deploy tab's `bind.gpu` picker for *both* other tables refuses 
 `scripts.yaml`/`provision/steps/scripts.py`** with optional `bind: {gpu, backend}` and a
 required `port` when `bind` is present, rather than a fourth storage file and a near-copy of
 unit-generation code (`contract.md` "Cost of existing" — reuse before adding). The Deploy
-tab's third table would then be a *filtered view* of `scripts.yaml` (entries with `bind`
-set), the same way Pinned/Swappable are two filtered views of `models.yaml` — not a new
+tab's second table would then be a *filtered view* of `scripts.yaml` (entries with `bind`
+set) placed above the merged llama-swap table (`plans/11`), the same way Pinned/Swappable
+used to be two filtered views of `models.yaml` before that plan merged them — not a new
 data file. **Needs operator confirmation**: this measurably changes what "the Scripts tab"
 is for (general ad-hoc process supervision) by teaching it about GPUs, which a change of
 that shape to `AGENTS.md`'s stated scope deserves sign-off on.
@@ -111,7 +115,7 @@ calls it directly, with no proxy to discover it through).
 
 **Decision 3 — GPU reservation enforcement.** Recommended: a direct entry's `bind.gpu`
 removes that GPU from the options offered by `EditModelModal`'s own `_gpu_options()` (Deploy
-tab, for both Pinned/Swappable), with a form error if an operator forces it by hand-editing
+tab's one llama-swap table, `plans/11`), with a form error if an operator forces it by hand-editing
 YAML and then tries to save from the UI. Not a hard block on multiple direct entries sharing
 one GPU — that's a legitimate topology (two small models, one big GPU) and not this
 mechanism's business to police; the reservation is against llama-swap's own scheduling,
@@ -136,13 +140,12 @@ module) to build the launch command from `bind`-resolved binary path (same
 + fixed `--port`. Reuse `cockpit/screens/scripts.py`'s Start/Stop/Logs table actions rather
 than re-implementing them.
 
-## Phase 3: Deploy tab — third table
+## Phase 3: Deploy tab — second table, above the llama-swap one
 
-`DeployScreen` gains a "Direct" (or similar — bikeshed at execution time) section, same
-`SingleClickDataTable` pattern as Pinned/Swappable, sourced from the entries Decision 1
-selects. `EditModelModal`'s `_gpu_options()` filters out any GPU reserved by a direct entry
-(Decision 3). Update the subtitle static added in `182a23d` once this exists — it currently
-says the direct path "isn't built yet."
+`DeployScreen` gains a "Direct" (or similar — bikeshed at execution time) section, placed
+above the merged llama-swap table (`plans/11`), same `SingleClickDataTable` pattern, sourced
+from the entries Decision 1 selects. `EditModelModal`'s `_gpu_options()` filters out any GPU
+reserved by a direct entry (Decision 3).
 
 ## Phase 4: Verification
 

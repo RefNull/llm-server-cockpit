@@ -208,21 +208,11 @@ def check_self_reimport(results: list[dict]) -> None:
 
 
 def check_residency_and_ttl_behavior() -> None:
-    from cockpit.screens.deploy import DeployScreen
-
-    # Truth table for DeployScreen._is_pinned:
-    # 1. Group membership + ttl 0 -> True (Pinned: never evicted, never idle-unloaded)
-    assert DeployScreen._is_pinned({"id": "m1", "group": "always-on", "ttl": 0}) is True
-    # 2. Group membership + unspecified ttl -> True (Pinned: defaults to 0 in llama-swap)
-    assert DeployScreen._is_pinned({"id": "m2", "group": "always-on"}) is True
-    # 3. Group membership + positive ttl -> False (Swappable: idle-unloads after ttl seconds!)
-    assert DeployScreen._is_pinned({"id": "m3", "group": "always-on", "ttl": 600}) is False
-    # 4. No group + ttl 0 -> False (Swappable: gets evicted whenever another model is requested)
-    assert DeployScreen._is_pinned({"id": "m4", "ttl": 0}) is False
-    # 5. No group + positive ttl -> False (Swappable)
-    assert DeployScreen._is_pinned({"id": "m5", "ttl": 600}) is False
-    # 6. No group + unspecified ttl -> False (Swappable)
-    assert DeployScreen._is_pinned({"id": "m6"}) is False
+    # plans/11 removed DeployScreen._is_pinned along with the Pinned/Swappable table split —
+    # the Deploy tab's one table now just prints ttl literally (0 or a number), no predicate
+    # to test here any more. What's left: the import-time advisory note below, which is
+    # independent of the screen and still real (llama-swap idle-unloads a grouped model with
+    # a positive ttl regardless of what any UI calls it).
 
     # Check that grouped model with ttl > 0 gets an informative note on import
     manifest = schema.load_manifest(_REPO_ROOT / "manifest.example.yaml")
@@ -247,7 +237,7 @@ groups:
         f"expected idle-unload note for grouped model with ttl 600, got notes: {m['notes']}"
     )
 
-    print("  Residency truth table verified: group + ttl > 0 correctly routes to Swappable, and import note warns about idle unload")
+    print("  import note warns when a grouped model's positive ttl still means it idle-unloads")
 
 
 def check_malformed_entry_does_not_abort_import() -> None:
